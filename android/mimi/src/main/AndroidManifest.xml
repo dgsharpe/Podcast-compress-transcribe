@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+    <application android:extractNativeLibs="true">
+        <!-- FastRPC client for the Hexagon NPU; listed in the vendor public.libraries on Snapdragon
+             phones (verified on the Fold 8). Without it the decoder falls back to the CPU. -->
+        <uses-native-library android:name="libcdsprpc.so" android:required="false" />
+    </application>
+</manifest>

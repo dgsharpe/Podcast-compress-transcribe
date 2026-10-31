@@ -1,0 +1,8 @@
+.gradle/
+build/
+.cxx/
+local.properties
+# fetched by fetch_deps.sh (large / third-party binaries)
+third_party/litert/lib/
+mimi/src/main/jniLibs/
+mimi/src/main/assets/mimi/

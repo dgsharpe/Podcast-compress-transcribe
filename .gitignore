@@ -1,0 +1,7 @@
+data/
+outputs/
+.venv/
+pocket-casts-android/
+hub_data/
+__pycache__/
+*.pyc
