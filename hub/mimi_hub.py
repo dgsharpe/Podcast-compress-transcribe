@@ -201,17 +201,38 @@ def cues(seg, max_s=7.0, max_chars=110):
 # over-splitting is the lesser evil. 0.9 merged hosts; TitaNet over-split. ~115 s per 44 min on 8 threads. Speakers
 # are numbered by first appearance; ones with < 30 s in total are folded into their neighbours.
 
+# MIMI_HUB_DIARIZER=pyannote switches to pyannote's speaker-diarization-community-1 (VBx clustering): on the same
+# episode it split the hosts the same way (19.3 / 16.6 min) but took 931 s instead of ~115 s on CPU. Gated model:
+# fetch it once into the HF cache with a token (a Hugging Face token); the hub then
+# loads it from the cache, offline, with no token.
 MODELS_DIR = Path(os.environ.get("MIMI_HUB_MODELS", ROOT / "hub_models"))
-DIAR_NAME = "pyannote-seg-3.0 + wespeaker-resnet34 @0.6 (sherpa-onnx)"
+DIARIZER = os.environ.get("MIMI_HUB_DIARIZER", "sherpa")
+PYANNOTE_MODEL = "pyannote/speaker-diarization-community-1"
+DIAR_NAME = (PYANNOTE_MODEL if DIARIZER == "pyannote"
+             else "pyannote-seg-3.0 + wespeaker-resnet34 @0.6 (sherpa-onnx)")
 DIAR_THRESHOLD, DIAR_MIN_TALK_S = 0.6, 30.0
 _diar_lock = threading.Lock()
+
+
+def _pyannote_turns(wav16):
+    import torch
+    from huggingface_hub import snapshot_download
+    from pyannote.audio import Pipeline
+    if "diar_pyannote" not in _models:
+        path = snapshot_download(PYANNOTE_MODEL, local_files_only=True)  # cached; no token at runtime
+        _models["diar_pyannote"] = Pipeline.from_pretrained(path)
+    out = _models["diar_pyannote"]({"waveform": torch.from_numpy(wav16)[None], "sample_rate": 16000})
+    ann = getattr(out, "speaker_diarization", out)
+    return [(t.start, t.end, spk) for t, _, spk in ann.itertracks(yield_label=True)]
 
 
 def diarize(wav16):
     """[(start_s, end_s, speaker_number)], speakers numbered 1.. by first appearance."""
     import sherpa_onnx as so
     with _diar_lock:  # one diarizer, not shared across threads
-        if "diar" not in _models:
+        if DIARIZER == "pyannote":
+            segs = _pyannote_turns(wav16)
+        elif "diar" not in _models:
             cfg = so.OfflineSpeakerDiarizationConfig(
                 segmentation=so.OfflineSpeakerSegmentationModelConfig(
                     pyannote=so.OfflineSpeakerSegmentationPyannoteModelConfig(
@@ -224,7 +245,8 @@ def diarize(wav16):
             if not cfg.validate():
                 raise RuntimeError(f"diarization models missing under {MODELS_DIR}")
             _models["diar"] = so.OfflineSpeakerDiarization(cfg)
-        segs = [(s.start, s.end, s.speaker) for s in _models["diar"].process(wav16).sort_by_start_time()]
+        if DIARIZER != "pyannote":
+            segs = [(s.start, s.end, s.speaker) for s in _models["diar"].process(wav16).sort_by_start_time()]
     total = {}
     for a, b, k in segs:
         total[k] = total.get(k, 0.0) + b - a
