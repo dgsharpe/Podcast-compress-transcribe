@@ -43,17 +43,20 @@ def unpack(frames, nq, bits=BITS):
     return codes
 
 
-def write(path, codes, nq, meta):
-    F = codes.shape[0]
+def header(n_frames, nq, meta):
+    """Everything before frame 0 (fixed header, metadata JSON, zero padding) and the data offset."""
     fb = (nq * BITS + 7) // 8
     mj = json.dumps(meta, separators=(",", ":")).encode()
     data_offset = (64 + len(mj) + 63) // 64 * 64
-    hdr = HDR.pack(b"MIMI", 1, nq, BITS, 0, SR, FPS_NUM, FPS_DEN, F, fb, data_offset, len(mj),
+    hdr = HDR.pack(b"MIMI", 1, nq, BITS, 0, SR, FPS_NUM, FPS_DEN, n_frames, fb, data_offset, len(mj),
                    b"kyutai/mimi".ljust(32, b"\0"))
+    return hdr + mj + b"\0" * (data_offset - 64 - len(mj)), data_offset
+
+
+def write(path, codes, nq, meta):
+    head, _ = header(codes.shape[0], nq, meta)
     with open(path, "wb") as f:
-        f.write(hdr)
-        f.write(mj)
-        f.write(b"\0" * (data_offset - 64 - len(mj)))
+        f.write(head)
         f.write(pack(codes, nq).tobytes())
 
 

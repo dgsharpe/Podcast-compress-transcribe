@@ -5,12 +5,16 @@ Serve on the Tailscale address only, e.g.
 Optional auth: set MIMI_HUB_TOKEN; clients then send `Authorization: Bearer <token>`.
 
 API (JSON unless noted):
-  POST /v1/convert {"url": ...[, "id", "title"]}  enqueue. The URL may be a direct audio URL or a Pocket Casts
-                                                share link (pca.st / pocketcasts.com), which is resolved to the
-                                                episode's enclosure; the id is then the Pocket Casts episode UUID.
+  POST /v1/convert {"url": ...[, "id", "title", "priority"]}  enqueue (priority 0 = about to be streamed,
+                                                jumps the queue). The URL may be a direct audio URL or a Pocket
+                                                Casts share link (pca.st / pocketcasts.com), which is resolved to
+                                                the episode's enclosure; the id is then the Pocket Casts episode UUID.
   POST /v1/upload?title=...  (multipart "file")  enqueue an uploaded audio file
-  GET  /v1/episodes/{id}                        status: queued | downloading | encoding | transcribing | ready | failed
-  GET  /v1/episodes/{id}.mimi                   the audio (Range requests supported)
+  GET  /v1/episodes/{id}                        status: queued | starting | downloading | encoding | transcribing
+                                                | ready | failed
+  GET  /v1/episodes/{id}.mimi                   the audio, Range requests supported. Available from the moment the
+                                                job is "encoding": bytes are served as their chunk is encoded, so a
+                                                client can play (and seek in) a .mimi that is still being made.
   GET  /v1/episodes/{id}.vtt                    the transcript
   GET  /v1/episodes                             all jobs, newest first
 Files live in $MIMI_HUB_DATA (default neural_audio/hub_data/): <id>.mimi, <id>.vtt, <id>.json.
@@ -18,6 +22,7 @@ Files live in $MIMI_HUB_DATA (default neural_audio/hub_data/): <id>.mimi, <id>.v
 
 import gzip
 import hashlib
+import itertools
 import json
 import os
 import queue
@@ -33,8 +38,8 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 
-from fastapi import FastAPI, File, Header, HTTPException, UploadFile
-from fastapi.responses import FileResponse
+from fastapi import FastAPI, File, Header, HTTPException, Request, UploadFile
+from fastapi.responses import FileResponse, Response, StreamingResponse
 from pydantic import BaseModel
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -49,14 +54,13 @@ DATA = Path(os.environ.get("MIMI_HUB_DATA", ROOT / "hub_data"))
 TOKEN = os.environ.get("MIMI_HUB_TOKEN", "")
 ASR_MODEL = os.environ.get("MIMI_HUB_ASR", "nemo-parakeet-tdt-0.6b-v2")  # -v3 for multilingual
 THREADS = int(os.environ.get("MIMI_HUB_THREADS", "16"))
-MAX_BYTES = 1 << 30
 UA = {"User-Agent": "Mozilla/5.0 (mimi-hub)"}
 ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 PC_EPISODE = re.compile(r"pocketcasts\.com/podcast/[^/]+/([0-9a-f-]{36})/[^/]+/([0-9a-f-]{36})")
 
 DATA.mkdir(parents=True, exist_ok=True)
 app = FastAPI(title="mimi-hub")
-jobs: "queue.Queue[str]" = queue.Queue()
+jobs: "queue.PriorityQueue" = queue.PriorityQueue()  # (priority, seq, id); 0 = streaming
 lock = threading.Lock()
 
 
@@ -86,13 +90,18 @@ def update(i, **kw):
         return save(r)
 
 
-def enqueue(i, **fields):
+def enqueue(i, priority=1, **fields):
+    """Queue job i (priority 0 = someone is streaming it, 1 = download / background)."""
     with lock:
         r = load(i)
         if r and r["state"] != "failed":
+            if r["state"] == "queued" and priority < r.get("priority", 1):  # bump: re-queue at higher priority
+                r = save(dict(r, priority=priority))
+                jobs.put((priority, next(_seq), i))
             return r  # already queued, running or done
-        r = save(dict(id=i, state="queued", progress=0.0, error=None, created=time.time(), **fields))
-    jobs.put(i)
+        r = save(dict(id=i, state="queued", priority=priority, progress=0.0, error=None, created=time.time(),
+                      **fields))
+    jobs.put((priority, next(_seq), i))
     return r
 
 
@@ -161,39 +170,6 @@ def candidates(url):
             yield "https://" + "/".join(parts[k:])
 
 
-def download(url, dst):
-    err = None
-    for u in candidates(url):
-        try:
-            return _download(u, dst)
-        except (urllib.error.URLError, OSError) as e:
-            err = e
-    raise err
-
-
-def _download(url, dst):
-    req = urllib.request.Request(url, headers=UA)
-    with urllib.request.urlopen(req, timeout=60) as r, open(dst, "wb") as f:
-        n = 0
-        while chunk := r.read(1 << 20):
-            n += len(chunk)
-            if n > MAX_BYTES:
-                raise ValueError("source larger than 1 GiB")
-            f.write(chunk)
-
-
-def load_audio(path, sr):
-    """Mono float32 at `sr`. ffmpeg if available (any container), else soundfile (mp3/wav/flac/ogg)."""
-    import numpy as np
-    ff = shutil.which("ffmpeg")
-    if ff:
-        out = subprocess.run([ff, "-v", "error", "-i", str(path), "-map", "0:a:0", "-ac", "1", "-ar",
-                              str(sr), "-f", "f32le", "-"], capture_output=True, check=True).stdout
-        return np.frombuffer(out, np.float32).copy()
-    import librosa
-    return librosa.load(path, sr=sr, mono=True)[0]
-
-
 def cues(seg, max_s=7.0, max_chars=110):
     """Split one timestamped ASR segment into sentence-sized (start, end, text) cues.
 
@@ -223,28 +199,196 @@ def vtt_time(t):
     return f"{int(h):02d}:{int(m):02d}:{s:06.3f}"
 
 
+# ---------- progressive conversion ----------
+#
+# A job probes the source's duration, writes the .mimi header and preallocates the file at its final size,
+# then encodes it in chunks (10 s first for a fast start, then 60 s; each with 20 s of left context) while
+# ffmpeg is still decoding the source. Readers of <id>.mimi get bytes as their chunk lands; a chunk somebody
+# is waiting for (e.g. after a seek) is encoded next. Every byte's position is fixed (44-byte frames), so
+# Range requests work against the final file size from the start.
+
+FPS = 12.5
+FIRST_CHUNK, CHUNK, CTX = 125, 750, 250  # frames
+FRAME_BYTES = 44  # 32 codebooks x 11 bits
+WORKERS = int(os.environ.get("MIMI_HUB_WORKERS", "2"))
+STREAMABLE = ("encoding", "transcribing", "ready")
+FFMPEG, FFPROBE = shutil.which("ffmpeg"), shutil.which("ffprobe")
+
+
+def chunk_bounds(n_frames):
+    out, f, size = [], 0, FIRST_CHUNK
+    while f < n_frames:
+        out.append((f, min(n_frames, f + size)))
+        f, size = f + size, CHUNK
+    return out
+
+
+class Live:
+    """A conversion in progress; its .mimi on disk fills in chunk by chunk."""
+
+    def __init__(self, i, n_frames, header):
+        self.i, self.n_frames, self.header = i, n_frames, header
+        self.data_offset = len(header)
+        self.total = self.data_offset + n_frames * FRAME_BYTES
+        self.bounds = chunk_bounds(n_frames)
+        self.ready = [False] * len(self.bounds)
+        self.wanted = []  # chunks readers are waiting for, most recent first
+        self.cond = threading.Condition()
+        self.failed = False
+
+    def chunk_of(self, frame):
+        c = 0 if frame < FIRST_CHUNK else 1 + (frame - FIRST_CHUNK) // CHUNK
+        return min(c, len(self.bounds) - 1)
+
+    def wait_ready(self, c, timeout=300):
+        with self.cond:
+            if not self.ready[c]:
+                if c in self.wanted:
+                    self.wanted.remove(c)
+                self.wanted.insert(0, c)
+                self.cond.notify_all()
+            end = time.time() + timeout
+            while not self.ready[c] and not self.failed and time.time() < end:
+                self.cond.wait(1.0)
+            return self.ready[c]
+
+
+live: dict = {}
+
+
+class Pcm:
+    """24 kHz mono float32 decoded by ffmpeg in the background, usable as it arrives."""
+
+    def __init__(self, src, n_samples, cond):
+        import numpy as np
+        self.buf = np.zeros(n_samples, np.float32)
+        self.avail, self.done, self.error, self.cond = 0, False, None, cond
+        http = ["-user_agent", UA["User-Agent"]] if src.startswith("http") else []
+        self.proc = subprocess.Popen([FFMPEG, "-v", "error", *http, "-i", src, "-map", "0:a:0", "-ac", "1",
+                                      "-ar", "24000", "-f", "f32le", "-"],
+                                     stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        threading.Thread(target=self._read, daemon=True, name="mimi-pcm").start()
+
+    def _read(self):
+        import numpy as np
+        rest = b""
+        try:
+            while self.avail < len(self.buf):
+                b = self.proc.stdout.read(1 << 18)
+                if not b:
+                    break
+                b = rest + b
+                k = len(b) // 4 * 4
+                x = np.frombuffer(b[:k], np.float32)
+                rest = b[k:]
+                n = min(len(x), len(self.buf) - self.avail)
+                self.buf[self.avail:self.avail + n] = x[:n]
+                with self.cond:
+                    self.avail += n
+                    self.cond.notify_all()
+        except Exception as e:
+            self.error = e
+        finally:
+            self.proc.kill()
+            err = self.proc.stderr.read().decode(errors="replace").strip()
+            if self.avail == 0 and not self.error:
+                self.error = RuntimeError(f"ffmpeg produced no audio: {err[-300:]}")
+            with self.cond:
+                self.done = True
+                self.cond.notify_all()
+
+
+def probe(src):
+    http = ["-user_agent", UA["User-Agent"]] if src.startswith("http") else []
+    out = subprocess.run([FFPROBE, "-v", "error", *http, "-show_entries", "format=duration",
+                          "-of", "default=nw=1:nk=1", src], capture_output=True, text=True, timeout=60)
+    return float(out.stdout.strip())  # raises on failure / "N/A"
+
+
+def pick(L, pcm):
+    """Next chunk to encode: a waited-for one if its audio is in, else the first missing (or None: wait)."""
+    def has_audio(c):
+        return pcm.done or pcm.avail >= L.bounds[c][1] * mimi_file.SPF
+    L.wanted = [c for c in L.wanted if not L.ready[c]]
+    for c in L.wanted:
+        if has_audio(c):
+            return c
+    for c, r in enumerate(L.ready):
+        if not r:
+            return c if has_audio(c) else None
+    return None
+
+
+def encode_live(model, L, pcm, fd, i):
+    import numpy as np
+    import torch
+    spf = mimi_file.SPF
+    for done in range(1, len(L.bounds) + 1):
+        with L.cond:
+            while (c := pick(L, pcm)) is None:
+                if pcm.error:
+                    raise pcm.error
+                L.cond.wait(0.5)
+        f0, f1 = L.bounds[c]
+        lo = max(0, (f0 - CTX) * spf)
+        x = torch.from_numpy(pcm.buf[lo:f1 * spf].copy())[None, None]
+        with torch.inference_mode():
+            codes = model.encode(x, num_quantizers=32).audio_codes[0].T.numpy()
+        seg = codes[(f0 * spf - lo) // spf:][: f1 - f0]
+        if len(seg) < f1 - f0:  # pad (only at the very end)
+            seg = np.concatenate([seg, np.repeat(seg[-1:], f1 - f0 - len(seg), axis=0)])
+        os.pwrite(fd, mimi_file.pack(seg, 32).tobytes(), L.data_offset + f0 * FRAME_BYTES)
+        with L.cond:
+            L.ready[c] = True
+            L.cond.notify_all()
+        if done % 4 == 0 or done == len(L.bounds):
+            update(i, progress=round(done / len(L.bounds), 3))
+
+
 def run(i):
     r = load(i)
-    work = Path(tempfile.mkdtemp(prefix=f"mimi-{i}-"))
+    upload = r.get("upload")
+    L = None
     try:
-        src = work / "source"
-        if r.get("upload"):
-            shutil.move(r["upload"], src)
-        else:
-            update(i, state="downloading")
-            download(r["audio_url"], src)
+        if not (FFMPEG and FFPROBE):
+            raise RuntimeError("ffmpeg/ffprobe not on PATH (start the hub with hub/run.sh)")
         m = models()
-        update(i, state="encoding", progress=0.0)
-        wav24 = load_audio(src, mimi_file.SR)
-        codes = mimi_file.encode_array(m["mimi"], wav24, progress=lambda p: update(i, progress=round(p, 3)))
-        meta = dict(title=r.get("title", ""), source=r.get("url", ""), id=i,
-                    encoder="transformers MimiModel", duration_s=len(wav24) / mimi_file.SR)
-        mimi_file.write(DATA / f"{i}.mimi.tmp", codes, 32, meta)
-        (DATA / f"{i}.mimi.tmp").replace(DATA / f"{i}.mimi")
-        update(i, state="transcribing", progress=0.0, duration_s=meta["duration_s"],
-               mimi_bytes=(DATA / f"{i}.mimi").stat().st_size)
-        del wav24
-        wav16 = load_audio(src, 16000)
+        update(i, state="downloading", progress=0.0)
+        if upload:
+            src, dur = upload, probe(upload)
+        else:
+            src, dur, err = None, None, None
+            for u in candidates(r["audio_url"]):  # skip tracking hops that are unreachable
+                try:
+                    src, dur = u, probe(u)
+                    break
+                except Exception as e:
+                    err = e
+            if src is None or dur is None:
+                raise RuntimeError(f"cannot read source: {err}")
+        n_frames = int(dur * FPS) + 13  # + ~1 s: ffprobe estimates can run short; the tail is padded
+        head, _ = mimi_file.header(n_frames, 32, dict(title=r.get("title", ""), source=r.get("url", ""), id=i,
+                                                      encoder="transformers MimiModel", duration_s=dur))
+        path = DATA / f"{i}.mimi"
+        with open(path, "wb") as f:
+            f.write(head)
+            f.truncate(len(head) + n_frames * FRAME_BYTES)
+        L = Live(i, n_frames, head)
+        live[i] = L
+        update(i, state="encoding", progress=0.0, duration_s=dur, mimi_bytes=L.total)
+        pcm = Pcm(src, n_frames * mimi_file.SPF, L.cond)
+        fd = os.open(path, os.O_WRONLY)
+        try:
+            encode_live(m["mimi"], L, pcm, fd, i)
+        finally:
+            os.close(fd)
+        live.pop(i, None)  # complete: served as a plain file from now on
+        update(i, state="transcribing", progress=0.0)
+        import librosa
+        with L.cond:
+            while not pcm.done:
+                L.cond.wait(1.0)
+        wav16 = librosa.resample(pcm.buf[:pcm.avail], orig_sr=mimi_file.SR, target_sr=16000)
         with open(DATA / f"{i}.vtt.tmp", "w") as f:
             f.write("WEBVTT\n\n")
             for s in m["asr"].recognize(wav16, sample_rate=16000):
@@ -254,28 +398,41 @@ def run(i):
         update(i, state="ready", progress=1.0, asr=ASR_MODEL)
     except Exception as e:
         traceback.print_exc()
+        if L is not None:
+            with L.cond:
+                L.failed = True
+                L.cond.notify_all()
+        live.pop(i, None)
         update(i, state="failed", error=f"{type(e).__name__}: {e}")
     finally:
-        shutil.rmtree(work, ignore_errors=True)
+        if upload and os.path.exists(upload):
+            os.unlink(upload)
+
+
+_seq = itertools.count()
 
 
 def worker():
     while True:
-        i = jobs.get()
-        try:
-            run(i)
-        finally:
-            jobs.task_done()
+        _, _, i = jobs.get()
+        with lock:
+            r = load(i)
+            if not r or r["state"] != "queued":
+                continue  # duplicate entry (re-queued at a higher priority) or already handled
+            save(dict(r, state="starting"))
+        run(i)
 
 
 @app.on_event("startup")
 def start():
     for p in sorted(DATA.glob("*.json"), key=lambda p: p.stat().st_mtime):
         r = json.loads(p.read_text())
-        if r["state"] not in ("ready", "failed"):  # resume interrupted jobs
+        if r["state"] not in ("ready", "failed"):  # resume interrupted jobs from scratch
+            (DATA / f"{r['id']}.mimi").unlink(missing_ok=True)  # partial, preallocated: never serve it
             save(dict(r, state="queued", progress=0.0))
-            jobs.put(r["id"])
-    threading.Thread(target=worker, daemon=True, name="mimi-worker").start()
+            jobs.put((r.get("priority", 1), next(_seq), r["id"]))
+    for k in range(WORKERS):
+        threading.Thread(target=worker, daemon=True, name=f"mimi-worker-{k}").start()
 
 
 # ---------- HTTP ----------
@@ -294,6 +451,7 @@ class ConvertRequest(BaseModel):
     url: str
     id: str | None = None
     title: str | None = None
+    priority: int = 1  # 0: a client is about to stream it
 
 
 @app.post("/v1/convert", status_code=202)
@@ -306,7 +464,8 @@ def convert(req: ConvertRequest, authorization: str | None = Header(None)):
     if req.id:
         check_id(req.id)
         i = req.id
-    return enqueue(i, url=req.url, audio_url=audio, title=req.title or title)
+    return enqueue(i, priority=min(1, max(0, req.priority)), url=req.url, audio_url=audio,
+                   title=req.title or title)
 
 
 @app.post("/v1/upload", status_code=202)
@@ -332,11 +491,64 @@ def list_jobs(authorization: str | None = Header(None)):
     return sorted(rs, key=lambda r: -r.get("created", 0))
 
 
+def stream_live(L, rng):
+    """Serve (a Range of) a .mimi that is still being encoded, waiting for each chunk as needed."""
+    start, end, status = 0, L.total - 1, 200
+    m = re.match(r"bytes=(\d*)-(\d*)$", (rng or "").strip())
+    if m and (m.group(1) or m.group(2)):
+        a, b = m.groups()
+        if a == "":
+            start = max(0, L.total - int(b))
+        else:
+            start, end = int(a), min(int(b), end) if b else end
+        if start > end:
+            return Response(status_code=416, headers={"Content-Range": f"bytes */{L.total}"})
+        status = 206
+    path = DATA / f"{L.i}.mimi"
+
+    def body():
+        # os.pread, not a buffered file: read-ahead would cache bytes of chunks that aren't written yet
+        fd = os.open(path, os.O_RDONLY)
+        try:
+            pos = start
+            while pos <= end:
+                if pos < L.data_offset:
+                    n = min(end + 1, L.data_offset) - pos
+                    yield L.header[pos:pos + n]
+                    pos += n
+                    continue
+                c = L.chunk_of((pos - L.data_offset) // FRAME_BYTES)
+                if not L.wait_ready(c):
+                    return  # job failed or stalled; the client sees a short read
+                stop = min(end, L.data_offset + L.bounds[c][1] * FRAME_BYTES - 1)
+                data = os.pread(fd, stop - pos + 1, pos)
+                if not data:
+                    return
+                yield data
+                pos += len(data)
+        finally:
+            os.close(fd)
+
+    headers = {"Accept-Ranges": "bytes", "Content-Length": str(end - start + 1)}
+    if status == 206:
+        headers["Content-Range"] = f"bytes {start}-{end}/{L.total}"
+    return StreamingResponse(body(), status_code=status, media_type="audio/x-mimi", headers=headers)
+
+
 @app.get("/v1/episodes/{name}")
-def episode(name: str, authorization: str | None = Header(None)):
+def episode(name: str, request: Request, authorization: str | None = Header(None)):
     auth(authorization)
     stem, _, ext = name.partition(".")
     check_id(stem)
+    if ext == "mimi":
+        deadline = time.time() + 30  # a just-requested job writes its header within a few seconds
+        while (L := live.get(stem)) is None and time.time() < deadline:
+            r = load(stem)
+            if not r or r["state"] not in ("queued", "starting", "downloading"):
+                break
+            time.sleep(0.25)
+        if L is not None:
+            return stream_live(L, request.headers.get("range"))
     if ext in ("mimi", "vtt"):
         p = DATA / f"{stem}.{ext}"
         if not p.exists():
