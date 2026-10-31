@@ -193,6 +193,66 @@ def cues(seg, max_s=7.0, max_chars=110):
     return [c for c in out if c[2]]
 
 
+# ---------- speaker diarization (sherpa-onnx: pyannote segmentation-3.0 + WeSpeaker ResNet34 + clustering) ----------
+#
+# Tuned on a 44-min two-host episode with ad reads: threshold 0.7 found the 2 hosts (18.6 / 15.9 min), 2 ad/news
+# voices (4.9 / 3.1 min) and a few fragments; 0.9 merged hosts, 0.5 and TitaNet over-split. ~112 s per 44 min on 8
+# threads. Speakers are numbered by first appearance; ones with < 10 s in total are folded into their neighbours.
+
+MODELS_DIR = Path(os.environ.get("MIMI_HUB_MODELS", ROOT / "hub_models"))
+DIAR_NAME = "pyannote-seg-3.0 + wespeaker-resnet34 @0.7 (sherpa-onnx)"
+_diar_lock = threading.Lock()
+
+
+def diarize(wav16):
+    """[(start_s, end_s, speaker_number)], speakers numbered 1.. by first appearance."""
+    import sherpa_onnx as so
+    with _diar_lock:  # one diarizer, not shared across threads
+        if "diar" not in _models:
+            cfg = so.OfflineSpeakerDiarizationConfig(
+                segmentation=so.OfflineSpeakerSegmentationModelConfig(
+                    pyannote=so.OfflineSpeakerSegmentationPyannoteModelConfig(
+                        model=str(MODELS_DIR / "sherpa-onnx-pyannote-segmentation-3-0/model.onnx")),
+                    num_threads=8),
+                embedding=so.SpeakerEmbeddingExtractorConfig(
+                    model=str(MODELS_DIR / "wespeaker_en_voxceleb_resnet34_LM.onnx"), num_threads=8),
+                clustering=so.FastClusteringConfig(num_clusters=-1, threshold=0.7),
+                min_duration_on=0.3, min_duration_off=0.5)
+            if not cfg.validate():
+                raise RuntimeError(f"diarization models missing under {MODELS_DIR}")
+            _models["diar"] = so.OfflineSpeakerDiarization(cfg)
+        segs = [(s.start, s.end, s.speaker) for s in _models["diar"].process(wav16).sort_by_start_time()]
+    total = {}
+    for a, b, k in segs:
+        total[k] = total.get(k, 0.0) + b - a
+    keep = [(a, b, k) for a, b, k in segs if total[k] >= 10.0]
+    if not keep:
+        return []
+    out = []
+    for a, b, k in segs:
+        if total[k] < 10.0:  # fragment: take the speaker of the nearest kept turn
+            k = min(keep, key=lambda t: max(t[0] - b, a - t[1], 0.0))[2]
+        out.append((a, b, k))
+    number = {}
+    for _, _, k in out:
+        number.setdefault(k, len(number) + 1)
+    return [(a, b, number[k]) for a, b, k in out]
+
+
+def speaker_for(a, b, turns):
+    """Speaker number overlapping cue [a, b] most (nearest turn if none overlaps); None without turns."""
+    if not turns:
+        return None
+    best, best_ov = None, 0.0
+    for s, e, k in turns:
+        ov = min(b, e) - max(a, s)
+        if ov > best_ov:
+            best, best_ov = k, ov
+    if best is None:
+        best = min(turns, key=lambda t: max(t[0] - b, a - t[1], 0.0))[2]
+    return best
+
+
 def vtt_time(t):
     h, r = divmod(t, 3600)
     m, s = divmod(r, 60)
@@ -389,13 +449,22 @@ def run(i):
             while not pcm.done:
                 L.cond.wait(1.0)
         wav16 = librosa.resample(pcm.buf[:pcm.avail], orig_sr=mimi_file.SR, target_sr=16000)
+        all_cues = [c for s in m["asr"].recognize(wav16, sample_rate=16000) for c in cues(s)]
+        try:
+            update(i, state="transcribing", progress=0.5)  # 0.5: ASR done, diarizing
+            turns = diarize(wav16)
+        except Exception:
+            traceback.print_exc()  # a transcript without speakers is still useful
+            turns = []
         with open(DATA / f"{i}.vtt.tmp", "w") as f:
             f.write("WEBVTT\n\n")
-            for s in m["asr"].recognize(wav16, sample_rate=16000):
-                for a, b, text in cues(s):
-                    f.write(f"{vtt_time(a)} --> {vtt_time(b)}\n{text}\n\n")
+            for a, b, text in all_cues:
+                text = text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+                who = speaker_for(a, b, turns)
+                f.write(f"{vtt_time(a)} --> {vtt_time(b)}\n{f'<v Speaker {who}>' if who else ''}{text}\n\n")
         (DATA / f"{i}.vtt.tmp").replace(DATA / f"{i}.vtt")
-        update(i, state="ready", progress=1.0, asr=ASR_MODEL)
+        update(i, state="ready", progress=1.0, asr=ASR_MODEL,
+               speakers=len({t[2] for t in turns}), diarization=DIAR_NAME if turns else None)
     except Exception as e:
         traceback.print_exc()
         if L is not None:

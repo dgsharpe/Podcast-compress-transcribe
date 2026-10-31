@@ -27,6 +27,19 @@ Opus/ffmpeg come from `nix shell nixpkgs#opus-tools nixpkgs#ffmpeg` (libopus 1.6
 
 `hub/run.sh` starts `hub/mimi_hub.py` (FastAPI) on the server's Tailscale IP, port 8765, as the `mimi-hub` user unit.
 It converts a URL, a Pocket Casts share link (resolved to the episode UUID and its enclosure) or an uploaded file
-into `hub_data/<id>.mimi` plus `<id>.vtt`. The transcript comes from Parakeet TDT 0.6B v2 via onnx-asr: 44 min of
-audio in 140 s on CPU, punctuated. Mimi Bridge's "Convert" feature and the planned Pocket Casts patch are its
-clients. The API is documented in the module docstring, and `hub/test_hub.py` is an in-process end-to-end test.
+into `hub_data/<id>.mimi` plus `<id>.vtt`. Mimi Bridge's "Convert" feature and the patched Pocket Casts are its
+clients. The API is documented in the module docstring.
+
+- **Progressive:** a job writes the header and preallocates the file within about 1 s. It then encodes 10 s and
+  then 60 s chunks while ffmpeg is still decoding the source, and `GET <id>.mimi` serves bytes as their chunk lands
+  (Range requests work, and a waited-for chunk jumps the queue). Clients can stream or download a `.mimi` that is
+  still being made. In `hub/test_stream.py` the whole 44 min arrived in 73 s and matched the final file exactly.
+- **Transcript:** Parakeet TDT 0.6B v2 via onnx-asr (44 min in 140 s on CPU, punctuated), split into
+  sentence-sized cues using token timestamps.
+- **Speakers:** sherpa-onnx diarization (pyannote segmentation-3.0, WeSpeaker ResNet34, clustering threshold 0.7;
+  about 112 s per 44 min). Each cue gets `<v Speaker N>`, which Pocket Casts shows as speaker labels. Models are in
+  `hub_models/` (gitignored, from the sherpa-onnx GitHub releases). One person can still end up with two numbers,
+  e.g. a host over intro music.
+- **Running it:** `hub/run.sh` (a transient unit), or the home-manager service in `hub/mimi-hub.service.nix`.
+- **Tests:** `hub/test_hub.py` (upload) and `hub/test_stream.py` (progressive streaming); both run in-process,
+  with ffmpeg on PATH.

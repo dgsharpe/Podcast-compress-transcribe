@@ -21,7 +21,11 @@ android {
         targetCompatibility = JavaVersion.VERSION_17
     }
     packaging {
-        jniLibs { useLegacyPackaging = true }
+        jniLibs {
+            useLegacyPackaging = true
+            // NPU graph ships precompiled (mimi_dec_tx_npu.tflite): no on-device QNN compiler needed
+            excludes += "**/libLiteRtCompilerPlugin_Qualcomm.so"
+        }
     }
     androidResources {
         noCompress += listOf("tflite", "bin")

@@ -25,7 +25,7 @@ fi
 Q=https://softwarecenter.qualcomm.com/api/download/software/sdks/Qualcomm_AI_Runtime_Community/All/2.50.0.260828/v2.50.0.260828.zip
 J=mimi/src/main/jniLibs/arm64-v8a
 need=()
-for f in libQnnHtp.so libQnnHtpPrepare.so libQnnHtpV81Stub.so libQnnSystem.so; do
+for f in libQnnHtp.so libQnnHtpV81Stub.so libQnnSystem.so; do  # no libQnnHtpPrepare: NPU graph is precompiled
   [ -f "$J/$f" ] || need+=("260828/lib/aarch64-android/$f")
 done
 for f in libQnnHtpV81Skel.so libQairtHtpV81.so; do
@@ -36,7 +36,16 @@ if [ ${#need[@]} -gt 0 ]; then
 fi
 
 A=mimi/src/main/assets/mimi
-for f in mimi_dec_tx_fp16.tflite mimi_deconly_fp16.tflite mimi_rvq.bin; do
+for f in mimi_dec_tx_fp16.tflite mimi_deconly_fp16.tflite; do
   [ -f "$A/$f" ] || curl -sL -A "$UA" -o "$A/$f" "https://huggingface.co/litert-community/Mimi/resolve/main/$f"
 done
+if [ ! -f "$A/mimi_rvq_f16.bin" ]; then  # fp16 decoder tables (scripts/rvq_fp16.py; -72 dB vs fp32)
+  tmp=$(mktemp -d)
+  curl -sL -A "$UA" -o "$tmp/mimi_rvq.bin" https://huggingface.co/litert-community/Mimi/resolve/main/mimi_rvq.bin
+  (cd "$ROOT" && uv run python scripts/rvq_fp16.py "$tmp/mimi_rvq.bin" "$OLDPWD/$A/mimi_rvq_f16.bin")
+  rm -rf "$tmp"
+fi
+# mimi_dec_tx_npu.tflite (optional, SoC-specific) is the transformer compiled for the Fold 8's Hexagon V81:
+# LiteRT's JIT cache from one NPU run of phone/libmimi/mimi_play (see phone/README.md), copied here.
+[ -f "$A/mimi_dec_tx_npu.tflite" ] || echo "note: no $A/mimi_dec_tx_npu.tflite; the transformer will run on the CPU"
 ls -la "$lib" "$J" "$A"

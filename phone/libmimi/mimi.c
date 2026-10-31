@@ -6,6 +6,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include <unistd.h>
 
 #include "litert/c/litert_common.h"
 #include "litert/c/litert_compiled_model.h"
@@ -70,7 +71,8 @@ typedef struct {
 struct MimiDecoder {
   LiteRtEnvironment env;
   Net tx, conv;
-  float* rvq;
+  float* rvq;        // fp32 tables (mimi_rvq.bin, incl. the encoder-only *_Win), or NULL
+  _Float16* rvq16;   // fp16 decoder tables (mimi_rvq_f16.bin), preferred: half the size, -72 dB change
   float *emb, *mid, *aud, tail[MIMI_XF];
   int last_k, have_tail;
   double t_rvq, t_tx, t_conv;
@@ -163,11 +165,12 @@ static int run_net(Net* n, const float* x, float* y) {
   return 0;
 }
 
-static float* slurp_floats(const char* path, size_t want) {
+// Whole file of exactly `want` bytes, or NULL.
+static void* slurp_bytes(const char* path, size_t want) {
   FILE* f = fopen(path, "rb");
   if (!f) return NULL;
-  float* p = malloc(want * sizeof(float));
-  size_t got = p ? fread(p, sizeof(float), want, f) : 0;
+  char* p = malloc(want + 1);
+  size_t got = p ? fread(p, 1, want + 1, f) : 0;
   fclose(f);
   if (got != want) { free(p); return NULL; }
   return p;
@@ -191,7 +194,11 @@ MimiDecoder* mimi_decoder_create(const MimiConfig* cfg, char* err, size_t err_le
     if (err) snprintf(err, err_len, "LiteRtCreateEnvironment failed");
     goto fail;
   }
-  snprintf(p, sizeof p, "%s/mimi_dec_tx_fp16.tflite", cfg->model_dir);
+  // On the NPU prefer the ahead-of-time compiled graph (no on-device QNN compiler needed); it only runs
+  // on the SoC it was compiled for, so the plain graph stays as the CPU fallback.
+  snprintf(p, sizeof p, "%s/mimi_dec_tx_npu.tflite", cfg->model_dir);
+  if (cfg->tx != MIMI_NPU || access(p, R_OK) != 0)
+    snprintf(p, sizeof p, "%s/mimi_dec_tx_fp16.tflite", cfg->model_dir);
   if (load_net(d->env, &d->tx, p, cfg->tx, cfg->threads, err, err_len)) goto fail;
   snprintf(p, sizeof p, "%s/mimi_deconly_fp16.tflite", cfg->model_dir);
   if (load_net(d->env, &d->conv, p, cfg->conv, cfg->threads, err, err_len)) goto fail;
@@ -199,10 +206,13 @@ MimiDecoder* mimi_decoder_create(const MimiConfig* cfg, char* err, size_t err_le
     if (err) snprintf(err, err_len, "unexpected graph shapes");
     goto fail;
   }
+  // mimi_rvq_f16.bin: sem_Wout, aco_Wout [512,256]; sem_CB + 31 aco_CB [2048,256] (float16)
+  snprintf(p, sizeof p, "%s/mimi_rvq_f16.bin", cfg->model_dir);
+  d->rvq16 = slurp_bytes(p, ((size_t)2 * D * H512 + (size_t)MIMI_NQMAX * CB * D) * sizeof(_Float16));
+  // mimi_rvq.bin: sem_Win, aco_Win [256,512]; then the same tables as float32
   snprintf(p, sizeof p, "%s/mimi_rvq.bin", cfg->model_dir);
-  // sem_Win, aco_Win [256,512]; sem_Wout, aco_Wout [512,256]; sem_CB + 31 aco_CB [2048,256]
-  d->rvq = slurp_floats(p, (size_t)4 * D * H512 + (size_t)MIMI_NQMAX * CB * D);
-  if (!d->rvq) {
+  if (!d->rvq16) d->rvq = slurp_bytes(p, ((size_t)4 * D * H512 + (size_t)MIMI_NQMAX * CB * D) * sizeof(float));
+  if (!d->rvq16 && !d->rvq) {
     if (err) snprintf(err, err_len, "cannot read %s", p);
     goto fail;
   }
@@ -226,40 +236,45 @@ void mimi_decoder_destroy(MimiDecoder* d) {
     if (nets[i]->model) LiteRtDestroyModel(nets[i]->model);
   }
   if (d->env) LiteRtDestroyEnvironment(d->env);
-  free(d->rvq); free(d->emb); free(d->mid); free(d->aud);
+  free(d->rvq); free(d->rvq16); free(d->emb); free(d->mid); free(d->aud);
   free(d);
 }
 
 void mimi_decoder_reset(MimiDecoder* d) { d->have_tail = 0; d->last_k = -2; }
 
-static void rvq_window(const float* rvq, const int16_t* codes, int nq, float* emb) {
-  const float* sem_Wout = rvq + 2 * D * H512;
-  const float* aco_Wout = sem_Wout + H512 * D;
-  const float* sem_CB = aco_Wout + H512 * D;
-  const float* aco_CB = sem_CB + CB * D;
-  float s[D], a[D];
-  for (int t = 0; t < MIMI_W; t++) {
-    const int16_t* c = codes + t * MIMI_NQMAX;
-    memcpy(s, sem_CB + (size_t)(c[0] & (CB - 1)) * D, sizeof s);
-    memset(a, 0, sizeof a);
-    for (int i = 1; i < nq; i++) {
-      const float* v = aco_CB + ((size_t)(i - 1) * CB + (c[i] & (CB - 1))) * D;
-      for (int k = 0; k < D; k++) a[k] += v[k];
-    }
-    for (int h = 0; h < H512; h++) {
-      const float* ws = sem_Wout + (size_t)h * D;
-      const float* wa = aco_Wout + (size_t)h * D;
-      float acc = 0.f;
-      for (int k = 0; k < D; k++) acc += ws[k] * s[k] + wa[k] * a[k];
-      emb[h * MIMI_W + t] = acc;
-    }
+// emb[512][W] from the window's codes; tables = sem_Wout, aco_Wout, sem_CB, aco_CB (accumulated in fp32).
+#define RVQ_WINDOW(NAME, T)                                                                    \
+  static void NAME(const T* tables, const int16_t* codes, int nq, float* emb) {               \
+    const T* sem_Wout = tables;                                                                \
+    const T* aco_Wout = sem_Wout + H512 * D;                                                   \
+    const T* sem_CB = aco_Wout + H512 * D;                                                     \
+    const T* aco_CB = sem_CB + CB * D;                                                         \
+    float s[D], a[D];                                                                          \
+    for (int t = 0; t < MIMI_W; t++) {                                                         \
+      const int16_t* c = codes + t * MIMI_NQMAX;                                               \
+      const T* v0 = sem_CB + (size_t)(c[0] & (CB - 1)) * D;                                   \
+      for (int k = 0; k < D; k++) s[k] = (float)v0[k], a[k] = 0.f;                             \
+      for (int i = 1; i < nq; i++) {                                                           \
+        const T* v = aco_CB + ((size_t)(i - 1) * CB + (c[i] & (CB - 1))) * D;                 \
+        for (int k = 0; k < D; k++) a[k] += (float)v[k];                                       \
+      }                                                                                        \
+      for (int h = 0; h < H512; h++) {                                                         \
+        const T* ws = sem_Wout + (size_t)h * D;                                                \
+        const T* wa = aco_Wout + (size_t)h * D;                                                \
+        float acc = 0.f;                                                                       \
+        for (int k = 0; k < D; k++) acc += (float)ws[k] * s[k] + (float)wa[k] * a[k];          \
+        emb[h * MIMI_W + t] = acc;                                                             \
+      }                                                                                        \
+    }                                                                                          \
   }
-}
+RVQ_WINDOW(rvq_window_f32, float)
+RVQ_WINDOW(rvq_window_f16, _Float16)
 
 int mimi_decode_block(MimiDecoder* d, int k, const int16_t* codes, int nq, int valid, float* pcm) {
   if (valid < 0 || valid > MIMI_H || nq < 1 || nq > MIMI_NQMAX) return -1;
   double t0 = now_ms();
-  rvq_window(d->rvq, codes, nq, d->emb);
+  if (d->rvq16) rvq_window_f16(d->rvq16, codes, nq, d->emb);
+  else rvq_window_f32(d->rvq + 2 * D * H512, codes, nq, d->emb);
   double t1 = now_ms();
   if (run_net(&d->tx, d->emb, d->mid)) return -1;
   double t2 = now_ms();

@@ -5,3 +5,4 @@ pocket-casts-android/
 hub_data/
 __pycache__/
 *.pyc
+hub_models/

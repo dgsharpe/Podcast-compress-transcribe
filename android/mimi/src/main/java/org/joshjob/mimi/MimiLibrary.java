@@ -25,7 +25,7 @@ public final class MimiLibrary {
   private static final String TAG = "MimiLibrary";
   public static final String MIME_TYPE = "audio/x-mimi";
   static final String[] MODEL_FILES = {
-    "mimi_dec_tx_fp16.tflite", "mimi_deconly_fp16.tflite", "mimi_rvq.bin"
+    "mimi_dec_tx_fp16.tflite", "mimi_deconly_fp16.tflite", "mimi_rvq_f16.bin"
   };
   private static final int[][] BACKENDS = {
     {MimiNative.NPU, MimiNative.GPU}, {MimiNative.CPU, MimiNative.GPU}, {MimiNative.CPU, MimiNative.CPU}
@@ -116,13 +116,30 @@ public final class MimiLibrary {
     return h == null ? "decoder not created yet" : h.stats();
   }
 
-  /** Copies the bundled models from assets/mimi/ to files/mimi/ (once; re-copied if sizes differ). */
+  /**
+   * Mirrors assets/mimi/ into files/mimi/: copies what's missing or changed in size (once), and deletes
+   * files no longer bundled (e.g. fp32 tables from older builds). The NPU graph (mimi_dec_tx_npu.tflite,
+   * compiled ahead of time for one SoC) is optional; libmimi falls back to mimi_dec_tx_fp16.tflite.
+   */
   static File ensureModels(Context context) throws IOException {
     File dir = new File(context.getFilesDir(), "mimi");
     dir.mkdirs();
     AssetManager am = context.getAssets();
+    String[] bundled = am.list("mimi");
+    if (bundled == null) bundled = new String[0];
+    for (String required : MODEL_FILES) {
+      if (!java.util.Arrays.asList(bundled).contains(required)) {
+        throw new IOException("missing asset mimi/" + required);
+      }
+    }
+    File[] present = dir.listFiles();
+    if (present != null) {
+      for (File f : present) {
+        if (!java.util.Arrays.asList(bundled).contains(f.getName())) f.delete();
+      }
+    }
     byte[] buf = new byte[1 << 20];
-    for (String name : MODEL_FILES) {
+    for (String name : bundled) {
       File dst = new File(dir, name);
       long want = -1;
       try (AssetFileDescriptor afd = am.openFd("mimi/" + name)) {

@@ -37,9 +37,17 @@ There are three requirements for the host app:
 If the app already subclasses `DefaultRenderersFactory`, call `MimiRenderersFactory.addMimiRenderer(...)` from its
 `buildAudioRenderers`. If it has its own `ExtractorsFactory`, wrap it: `new MimiExtractorsFactory(theirs)`.
 
-## Size
+## Size (2026-10-31)
 
-The APK grows by about 210 MB: 150 MB of models plus about 120 MB of QNN libraries, which compress somewhat.
-Two easy cuts:
-- Ship the RVQ tables as fp16, saving 34 MB.
-- AOT-compile the NPU graph on the server. Then `libQnnHtpPrepare.so` (85 MB) isn't needed on the device.
+The assets are 166 MB: two transformer graphs, the conv decoder and the fp16 tables. The QNN runtime libraries
+add about 37 MB. The patched Pocket Casts debugProd APK (arm64 only) is 264 MB.
+
+- **fp16 RVQ tables** (`mimi_rvq_f16.bin`, made by `scripts/rvq_fp16.py`) are 34 MB instead of 69 MB. The audio
+  stays at 71.7 dB SNR against fp32 tables on the server and 48 dB on the phone, and fp16 decodes faster (39.5 vs 45.9
+  ms per block).
+- **The NPU graph is precompiled** (`mimi_dec_tx_npu.tflite`, Hexagon V81 / SM8850): it is LiteRT's JIT cache from
+  one NPU run, copied in. It loads with only the dispatch library and the QNN runtime. Neither
+  `libQnnHtpPrepare.so` (85 MB) nor the compiler plugin ships; apps exclude `libLiteRtCompilerPlugin_Qualcomm.so`.
+  On any other SoC, libmimi uses `mimi_dec_tx_fp16.tflite` on the CPU.
+- Possible next step: load the models straight out of the APK (`LiteRtCreateModelFromFd` on the uncompressed
+  assets) instead of copying them to `files/mimi/`. That would save about 165 MB of storage on the phone.
