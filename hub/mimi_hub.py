@@ -161,13 +161,13 @@ def models():
 
 
 def candidates(url):
-    """`url`, then the same file fetched from each host embedded in a tracking-prefix chain
-    (podtrac/pdst/pscrb/... URLs end in `.../real.host/path`), innermost host first."""
-    yield url
+    """Ways to fetch `url`'s file: for a tracking-prefix chain (podtrac/pdst/pscrb/... URLs end in
+    `.../real.host/path`) the real host first (fast, and skips blocked tracker hops), then the outer
+    hosts, then the original URL; any other URL is tried as is first."""
     parts = url.split("://", 1)[-1].split("/")
-    for k in range(len(parts) - 2, 0, -1):
-        if "." in parts[k] and not re.search(r"\.(mp3|m4a|aac|ogg|opus|wav)$", parts[k], re.I):
-            yield "https://" + "/".join(parts[k:])
+    inner = ["https://" + "/".join(parts[k:]) for k in range(len(parts) - 2, 0, -1)
+             if "." in parts[k] and not re.search(r"\.(mp3|m4a|aac|ogg|opus|wav)$", parts[k], re.I)]
+    yield from (inner + [url]) if inner else [url]
 
 
 def cues(seg, max_s=7.0, max_chars=110):
