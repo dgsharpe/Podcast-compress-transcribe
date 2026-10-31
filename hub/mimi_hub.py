@@ -195,12 +195,15 @@ def cues(seg, max_s=7.0, max_chars=110):
 
 # ---------- speaker diarization (sherpa-onnx: pyannote segmentation-3.0 + WeSpeaker ResNet34 + clustering) ----------
 #
-# Tuned on a 44-min two-host episode with ad reads: threshold 0.7 found the 2 hosts (18.6 / 15.9 min), 2 ad/news
-# voices (4.9 / 3.1 min) and a few fragments; 0.9 merged hosts, 0.5 and TitaNet over-split. ~112 s per 44 min on 8
-# threads. Speakers are numbered by first appearance; ones with < 10 s in total are folded into their neighbours.
+# Tuned on a 44-min two-host episode with ad reads. 0.7 looked right on one decode of it (hosts 18.6 / 15.9 min)
+# but merged the two hosts on another (different dynamic ads; 24 kHz -> 16 kHz resampling), so clustering near 0.7
+# is unstable. 0.6 kept the hosts apart on every version tried (~19 / ~16 min) and only adds small ad/news voices;
+# over-splitting is the lesser evil. 0.9 merged hosts; TitaNet over-split. ~115 s per 44 min on 8 threads. Speakers
+# are numbered by first appearance; ones with < 30 s in total are folded into their neighbours.
 
 MODELS_DIR = Path(os.environ.get("MIMI_HUB_MODELS", ROOT / "hub_models"))
-DIAR_NAME = "pyannote-seg-3.0 + wespeaker-resnet34 @0.7 (sherpa-onnx)"
+DIAR_NAME = "pyannote-seg-3.0 + wespeaker-resnet34 @0.6 (sherpa-onnx)"
+DIAR_THRESHOLD, DIAR_MIN_TALK_S = 0.6, 30.0
 _diar_lock = threading.Lock()
 
 
@@ -216,7 +219,7 @@ def diarize(wav16):
                     num_threads=8),
                 embedding=so.SpeakerEmbeddingExtractorConfig(
                     model=str(MODELS_DIR / "wespeaker_en_voxceleb_resnet34_LM.onnx"), num_threads=8),
-                clustering=so.FastClusteringConfig(num_clusters=-1, threshold=0.7),
+                clustering=so.FastClusteringConfig(num_clusters=-1, threshold=DIAR_THRESHOLD),
                 min_duration_on=0.3, min_duration_off=0.5)
             if not cfg.validate():
                 raise RuntimeError(f"diarization models missing under {MODELS_DIR}")
@@ -225,12 +228,12 @@ def diarize(wav16):
     total = {}
     for a, b, k in segs:
         total[k] = total.get(k, 0.0) + b - a
-    keep = [(a, b, k) for a, b, k in segs if total[k] >= 10.0]
+    keep = [(a, b, k) for a, b, k in segs if total[k] >= DIAR_MIN_TALK_S]
     if not keep:
         return []
     out = []
     for a, b, k in segs:
-        if total[k] < 10.0:  # fragment: take the speaker of the nearest kept turn
+        if total[k] < DIAR_MIN_TALK_S:  # fragment: take the speaker of the nearest kept turn
             k = min(keep, key=lambda t: max(t[0] - b, a - t[1], 0.0))[2]
         out.append((a, b, k))
     number = {}

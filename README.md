@@ -36,8 +36,8 @@ clients. The API is documented in the module docstring.
   still being made. In `hub/test_stream.py` the whole 44 min arrived in 73 s and matched the final file exactly.
 - **Transcript:** Parakeet TDT 0.6B v2 via onnx-asr (44 min in 140 s on CPU, punctuated), split into
   sentence-sized cues using token timestamps.
-- **Speakers:** sherpa-onnx diarization (pyannote segmentation-3.0, WeSpeaker ResNet34, clustering threshold 0.7;
-  about 112 s per 44 min). Each cue gets `<v Speaker N>`, which Pocket Casts shows as speaker labels. Models are in
+- **Speakers:** sherpa-onnx diarization (pyannote segmentation-3.0, WeSpeaker ResNet34, clustering threshold 0.6,
+  fragments < 30 s folded; about 115 s per 44 min). 0.7 sometimes merged the two hosts; see the note in mimi_hub.py. Each cue gets `<v Speaker N>`, which Pocket Casts shows as speaker labels. Models are in
   `hub_models/` (gitignored, from the sherpa-onnx GitHub releases). One person can still end up with two numbers,
   e.g. a host over intro music.
 - **Running it:** `hub/run.sh` (a transient unit), or the home-manager service in `hub/mimi-hub.service.nix`.
