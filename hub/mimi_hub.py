@@ -16,8 +16,13 @@ API (JSON unless noted):
                                                 job is "encoding": bytes are served as their chunk is encoded, so a
                                                 client can play (and seek in) a .mimi that is still being made.
   GET  /v1/episodes/{id}.vtt                    the transcript
+  GET  /v1/episodes/{id}.segments.json          ads / self-promotion to skip, found by an LLM after transcription
+                                                ({"model", "segments": [{"start", "end", "kind": "ad" | "promo",
+                                                "label"}]}, seconds); the record's "segments_state" says
+                                                pending | ready | failed | off. See hub/segments.py.
+  POST /v1/episodes/{id}/segments               re-run that detection
   GET  /v1/episodes                             all jobs, newest first
-Files live in $MIMI_HUB_DATA (default neural_audio/hub_data/): <id>.mimi, <id>.vtt, <id>.json.
+Files live in $MIMI_HUB_DATA (default neural_audio/hub_data/): <id>.mimi, <id>.vtt, <id>.segments.json, <id>.json.
 """
 
 import gzip
@@ -46,6 +51,8 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "scripts"))
 import mimi_file  # noqa: E402
 
+from hub import segments  # noqa: E402
+
 # uv's Python doesn't know NixOS's CA bundle; systemd-run services don't inherit SSL_CERT_FILE.
 if not os.environ.get("SSL_CERT_FILE") and os.path.exists("/etc/ssl/certs/ca-certificates.crt"):
     os.environ["SSL_CERT_FILE"] = "/etc/ssl/certs/ca-certificates.crt"
@@ -68,6 +75,10 @@ lock = threading.Lock()
 
 def rec_path(i):
     return DATA / f"{i}.json"
+
+
+def record_paths():
+    return [p for p in DATA.glob("*.json") if not p.name.endswith(".segments.json")]
 
 
 def load(i):
@@ -490,6 +501,7 @@ def run(i):
         (DATA / f"{i}.vtt.tmp").replace(DATA / f"{i}.vtt")
         update(i, state="ready", progress=1.0, asr=ASR_MODEL,
                speakers=len({t[2] for t in turns}), diarization=DIAR_NAME if turns else None)
+        queue_segments(i)
     except Exception as e:
         traceback.print_exc()
         if L is not None:
@@ -501,6 +513,35 @@ def run(i):
     finally:
         if upload and os.path.exists(upload):
             os.unlink(upload)
+
+
+# ---------- ad / self-promotion segments (an LLM over the transcript; one at a time, after "ready") ----------
+
+seg_jobs: "queue.Queue" = queue.Queue()
+
+
+def queue_segments(i):
+    if segments.SEGMENTER.strip().lower() in ("", "off"):
+        update(i, segments_state="off")
+        return
+    update(i, segments_state="pending")
+    seg_jobs.put(i)
+
+
+def segment_worker():
+    while True:
+        i = seg_jobs.get()
+        try:
+            vtt = (DATA / f"{i}.vtt").read_text()
+            res = segments.detect(segments.read_cues(vtt), log=lambda m: print(f"[{i}] {m}", flush=True))
+            tmp = DATA / f"{i}.segments.json.tmp"
+            tmp.write_text(json.dumps(res, indent=1))
+            tmp.replace(DATA / f"{i}.segments.json")
+            update(i, segments_state="ready", segments=len(res["segments"]), segments_model=res["model"],
+                   skippable_s=round(sum(s["end"] - s["start"] for s in res["segments"]), 1))
+        except Exception as e:
+            traceback.print_exc()
+            update(i, segments_state="failed", segments_error=f"{type(e).__name__}: {e}"[:500])
 
 
 _seq = itertools.count()
@@ -519,14 +560,17 @@ def worker():
 
 @app.on_event("startup")
 def start():
-    for p in sorted(DATA.glob("*.json"), key=lambda p: p.stat().st_mtime):
+    for p in sorted(record_paths(), key=lambda p: p.stat().st_mtime):
         r = json.loads(p.read_text())
         if r["state"] not in ("ready", "failed"):  # resume interrupted jobs from scratch
             (DATA / f"{r['id']}.mimi").unlink(missing_ok=True)  # partial, preallocated: never serve it
             save(dict(r, state="queued", progress=0.0))
             jobs.put((r.get("priority", 1), next(_seq), r["id"]))
+        elif r["state"] == "ready" and r.get("segments_state") not in ("ready", "failed", "off"):
+            queue_segments(r["id"])  # converted before segment detection existed, or interrupted
     for k in range(WORKERS):
         threading.Thread(target=worker, daemon=True, name=f"mimi-worker-{k}").start()
+    threading.Thread(target=segment_worker, daemon=True, name="mimi-segments").start()
 
 
 # ---------- HTTP ----------
@@ -578,10 +622,21 @@ def upload(file: UploadFile = File(...), title: str = "", authorization: str | N
     return r
 
 
+@app.post("/v1/episodes/{i}/segments", status_code=202)
+def redo_segments(i: str, authorization: str | None = Header(None)):
+    auth(authorization)
+    check_id(i)
+    r = load(i)
+    if not r or r["state"] != "ready":
+        raise HTTPException(409, "episode not ready")
+    queue_segments(i)
+    return load(i)
+
+
 @app.get("/v1/episodes")
 def list_jobs(authorization: str | None = Header(None)):
     auth(authorization)
-    rs = [json.loads(p.read_text()) for p in DATA.glob("*.json")]
+    rs = [json.loads(p.read_text()) for p in record_paths()]
     return sorted(rs, key=lambda r: -r.get("created", 0))
 
 
@@ -634,6 +689,11 @@ def episode(name: str, request: Request, authorization: str | None = Header(None
     auth(authorization)
     stem, _, ext = name.partition(".")
     check_id(stem)
+    if ext == "segments.json":
+        p = DATA / f"{stem}.segments.json"
+        if not p.exists():
+            raise HTTPException(404, "no segments yet")
+        return FileResponse(p, media_type="application/json")
     if ext == "mimi":
         deadline = time.time() + 30  # a just-requested job writes its header within a few seconds
         while (L := live.get(stem)) is None and time.time() < deadline:
