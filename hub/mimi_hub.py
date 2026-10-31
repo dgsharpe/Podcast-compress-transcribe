@@ -163,10 +163,16 @@ _models = {}
 def models():
     if not _models:
         import onnx_asr
+        import onnxruntime as ort
         import torch
         torch.set_num_threads(THREADS)
         _models["mimi"] = mimi_file.load_model()
-        _models["asr"] = (onnx_asr.load_model(ASR_MODEL).with_vad(onnx_asr.load_vad("silero"))
+        # onnxruntime's default spin-waiting threads starve torch's: on a 15 min clip (scripts/bench_overlap.py)
+        # ASR alone went 50 -> 31 s with spinning off, and encode || ASR 87 -> 39 s
+        so = ort.SessionOptions()
+        so.intra_op_num_threads = THREADS
+        so.add_session_config_entry("session.intra_op.allow_spinning", "0")
+        _models["asr"] = (onnx_asr.load_model(ASR_MODEL, sess_options=so).with_vad(onnx_asr.load_vad("silero"))
                           .with_timestamps())
     return _models
 
@@ -441,6 +447,32 @@ def encode_live(model, L, pcm, fd, i):
             update(i, progress=round(done / len(L.bounds), 3))
 
 
+def transcribe(m, pcm, cond, out):
+    """ASR and diarization of the full decoded episode, concurrently; results (or "error") go into [out]."""
+    try:
+        import librosa
+        with cond:
+            while not pcm.done:
+                cond.wait(1.0)
+        if pcm.error:
+            return  # the encoder reports it
+        wav16 = librosa.resample(pcm.buf[:pcm.avail], orig_sr=mimi_file.SR, target_sr=16000)
+
+        def speakers():
+            try:
+                out["turns"] = diarize(wav16)
+            except Exception:
+                traceback.print_exc()  # a transcript without speakers is still useful
+                out["turns"] = []
+
+        d = threading.Thread(target=speakers, daemon=True, name="mimi-diarize")
+        d.start()
+        out["cues"] = [c for s in m["asr"].recognize(wav16, sample_rate=16000) for c in cues(s)]
+        d.join()
+    except Exception as e:
+        out["error"] = e
+
+
 def run(i):
     r = load(i)
     upload = r.get("upload")
@@ -473,6 +505,11 @@ def run(i):
         live[i] = L
         update(i, state="encoding", progress=0.0, duration_s=dur, mimi_bytes=L.total)
         pcm = Pcm(src, n_frames * mimi_file.SPF, L.cond)
+        # transcription and diarization start once the whole episode is decoded (ffmpeg is far ahead of the
+        # encoder) and run alongside the encode
+        tx = {}
+        t = threading.Thread(target=transcribe, args=(m, pcm, L.cond, tx), daemon=True, name=f"mimi-asr-{i}")
+        t.start()
         fd = os.open(path, os.O_WRONLY)
         try:
             encode_live(m["mimi"], L, pcm, fd, i)
@@ -480,18 +517,12 @@ def run(i):
             os.close(fd)
         live.pop(i, None)  # complete: served as a plain file from now on
         update(i, state="transcribing", progress=0.0)
-        import librosa
-        with L.cond:
-            while not pcm.done:
-                L.cond.wait(1.0)
-        wav16 = librosa.resample(pcm.buf[:pcm.avail], orig_sr=mimi_file.SR, target_sr=16000)
-        all_cues = [c for s in m["asr"].recognize(wav16, sample_rate=16000) for c in cues(s)]
-        try:
-            update(i, state="transcribing", progress=0.5)  # 0.5: ASR done, diarizing
-            turns = diarize(wav16)
-        except Exception:
-            traceback.print_exc()  # a transcript without speakers is still useful
-            turns = []
+        t.join()
+        if "error" in tx:
+            raise tx["error"]
+        if "cues" not in tx:
+            raise pcm.error or RuntimeError("transcription did not run")
+        all_cues, turns = tx["cues"], tx["turns"]
         with open(DATA / f"{i}.vtt.tmp", "w") as f:
             f.write("WEBVTT\n\n")
             for a, b, text in all_cues:
