@@ -316,39 +316,43 @@ def _pipelined(items, depth=2):
         yield x
 
 
+def _asr_batches(asr, batches, samples, asr_kwargs, sample_rate=16000):
+    """Recognize [batches] (an iterable of lists of (start, end) sample ranges; may block for more) with [asr],
+    taking the audio from samples(start, end): yields (segment, TimestampedSegmentResult) per segment."""
+    from onnx_asr.utils import pad_list
+    from onnx_asr.vad import TimestampedSegmentResult
+
+    def features():
+        for batch in batches:
+            yield batch, asr._preprocessor(*pad_list([samples(s, e) for s, e in batch]))
+
+    def encoded(items):
+        for batch, feats in items:
+            yield batch, asr._encode(*feats)
+
+    if ASR_PIPELINE:
+        outputs = (zip(batch, map(asr._decode_tokens, *zip(*asr._decoding(*enc, **asr_kwargs))))
+                   for batch, enc in _pipelined(encoded(_pipelined(features()))))
+    else:
+        outputs = (zip(batch, asr.recognize_batch(*pad_list([samples(s, e) for s, e in batch]), **asr_kwargs))
+                   for batch in batches)
+    for batch in outputs:
+        for (s, e), res in batch:
+            yield (s, e), TimestampedSegmentResult(s / sample_rate, e / sample_rate, res.text, res.timestamps,
+                                                   res.tokens, res.logprobs)
+
+
 def _bucketed_recognize_batch(self, asr, waveforms, waveforms_len, sample_rate, asr_kwargs, batch_size=8,
                               **kwargs):
     """Drop-in for onnx_asr BaseVad.recognize_batch: segment each waveform fully, recognize the segments in
     length-sorted batches of ASR_BUCKET, and yield the results in time order."""
-    from onnx_asr.utils import pad_list
-    from onnx_asr.vad import TimestampedSegmentResult
 
     def recognize(waveform, segments):
         segments = list(segments)
         order = sorted(range(len(segments)), key=lambda i: segments[i][1] - segments[i][0])
-        batches = [order[i:i + ASR_BUCKET] for i in range(0, len(order), ASR_BUCKET)]
-        results = [None] * len(segments)
-
-        def features():
-            for idx in batches:
-                yield idx, asr._preprocessor(*pad_list([waveform[s:e] for s, e in (segments[j] for j in idx)]))
-
-        def encoded(items):
-            for idx, feats in items:
-                yield idx, asr._encode(*feats)
-
-        if ASR_PIPELINE:
-            outputs = (zip(map(asr._decode_tokens, *zip(*asr._decoding(*enc, **asr_kwargs))), idx)
-                       for idx, enc in _pipelined(encoded(_pipelined(features()))))
-        else:
-            outputs = (zip(asr.recognize_batch(*pad_list([waveform[s:e] for s, e in (segments[j] for j in idx)]),
-                                               **asr_kwargs), idx) for idx in batches)
-        for batch in outputs:
-            for res, j in batch:
-                s, e = segments[j]
-                results[j] = TimestampedSegmentResult(s / sample_rate, e / sample_rate, res.text, res.timestamps,
-                                                      res.tokens, res.logprobs)
-        return iter(results)
+        batches = [[segments[j] for j in order[i:i + ASR_BUCKET]] for i in range(0, len(order), ASR_BUCKET)]
+        results = dict(_asr_batches(asr, batches, lambda s, e: waveform[s:e], asr_kwargs, sample_rate))
+        return iter([results[seg] for seg in segments])
 
     return map(recognize, waveforms, self.segment_batch(waveforms, waveforms_len, sample_rate, **kwargs))
 
@@ -744,50 +748,139 @@ STREAM_VAD = os.environ.get("MIMI_HUB_STREAM_VAD", "1") != "0"
 _vad_pre = threading.local()  # (n_samples, probabilities) for the VAD call of this thread's next recognize()
 
 
-def _stream_prepare(pcm, cond, vad, sr=16000, hop=512, ctx=64):
-    """(16 kHz waveform, per-frame VAD probabilities as SileroVad._encode would give) of [pcm], as it decodes."""
-    import numpy as np
-    import soxr
-    rs = soxr.ResampleStream(mimi_file.SR, sr, 1, dtype="float32", quality="HQ")
-    w = np.empty(int(len(pcm.buf) * sr / mimi_file.SR) + 1024, np.float32)
-    n = pos = 0
-    state = np.zeros((2, 1, 128), dtype=np.float32)
-    probs, next_frame = [], -1  # -1: the first (left-padded) frame; k >= 0: w[448 + 512 k:][:576]
-    srs = np.array([sr], dtype=np.int64)
+# ...and with STREAM_ASR, ASR's batches start during the download too: VAD segments are final as soon as the audio
+# after them is decoded, and every STREAM_WINDOW of them are batched (sorted by length) and recognized at once.
+# Same transcripts. Off by default: on the server one episode is GPU-bound too, so ASR done sooner (a 43 min episode:
+# 19.7 -> 18.2 s, ad marks 2.6 s sooner) only pushed the .mimi back (13 -> 35 s) and it was ready no sooner (~36 s).
+# It would pay off where the GPU has room to spare during a download.
+STREAM_ASR = os.environ.get("MIMI_HUB_STREAM_ASR", "0") == "1"
+STREAM_WINDOW = int(os.environ.get("MIMI_HUB_STREAM_WINDOW", "64"))
 
-    def vad_run(frame):
-        nonlocal state
-        o, state = vad._model.run(["output", "stateN"], {"input": frame[None], "state": state, "sr": srs})
-        probs.append(o[0, 0])
 
-    while True:
-        with cond:
-            while pcm.avail - pos < mimi_file.SR and not pcm.done:
-                cond.wait(1.0)
-            done, avail = pcm.done, pcm.avail
-        if done and pcm.error:
-            return None, None
-        y = rs.resample_chunk(pcm.buf[pos:avail], last=done)
-        pos = avail
-        if n + len(y) > len(w):
-            w = np.concatenate([w, np.empty(n + len(y) - len(w) + sr, np.float32)])
-        w[n:n + len(y)] = y
-        n += len(y)
-        if next_frame == -1 and n >= hop:
-            vad_run(np.pad(w[:hop], (ctx, 0)))
-            next_frame = 0
-        while next_frame >= 0 and hop - ctx + hop * next_frame + ctx + hop <= n:
-            a = hop - ctx + hop * next_frame
-            vad_run(w[a:a + ctx + hop])
-            next_frame += 1
-        if done:
-            break
-    w = w[:n]
-    if next_frame == -1:  # under one frame: let the VAD do it all
-        return w, None
-    if last := n % hop:
-        vad_run(np.pad(w[-last - ctx:], (0, hop - last)))
-    return w, np.array(probs, dtype=np.float32)
+class _StreamPrep:
+    """[pcm] at 16 kHz, and SileroVad._encode's per-frame probabilities of it, as ffmpeg decodes it (a thread)."""
+
+    END = object()
+
+    def __init__(self, pcm, cond, vad, sr=16000, hop=512, ctx=64):
+        import numpy as np
+        self.pcm, self.cond, self.vad, self.sr, self.hop, self.ctx = pcm, cond, vad, sr, hop, ctx
+        self.w = np.empty(int(len(pcm.buf) * sr / mimi_file.SR) + 1024, np.float32)
+        self.n = 0  # samples written
+        self.length = None  # the final number of samples, once decoded
+        self.probs = []
+        self.q = queue.Queue()
+        self.finished = threading.Event()
+        threading.Thread(target=self._run, daemon=True, name="mimi-prep").start()
+
+    def _run(self):
+        import numpy as np
+        import soxr
+        try:
+            pcm, cond, hop, ctx = self.pcm, self.cond, self.hop, self.ctx
+            rs = soxr.ResampleStream(mimi_file.SR, self.sr, 1, dtype="float32", quality="HQ")
+            state = np.zeros((2, 1, 128), dtype=np.float32)
+            srs = np.array([self.sr], dtype=np.int64)
+            pos, next_frame = 0, -1  # -1: the first (left-padded) frame; k >= 0: w[448 + 512 k:][:576]
+
+            def vad_run(frame):
+                nonlocal state
+                o, state = self.vad._model.run(["output", "stateN"], {"input": frame[None], "state": state, "sr": srs})
+                self.probs.append(o[0, 0])
+                self.q.put(o[0, 0])
+
+            while True:
+                with cond:
+                    while pcm.avail - pos < mimi_file.SR and not pcm.done:
+                        cond.wait(1.0)
+                    done, avail = pcm.done, pcm.avail
+                if done and pcm.error:
+                    return
+                y = rs.resample_chunk(pcm.buf[pos:avail], last=done)
+                pos = avail
+                if self.n + len(y) > len(self.w):
+                    self.w = np.concatenate([self.w, np.empty(self.n + len(y) - len(self.w) + self.sr, np.float32)])
+                self.w[self.n:self.n + len(y)] = y
+                self.n += len(y)
+                if next_frame == -1 and self.n >= hop:
+                    vad_run(np.pad(self.w[:hop], (ctx, 0)))
+                    next_frame = 0
+                while next_frame >= 0 and hop - ctx + hop * next_frame + ctx + hop <= self.n:
+                    a = hop - ctx + hop * next_frame
+                    vad_run(self.w[a:a + ctx + hop])
+                    next_frame += 1
+                if done:
+                    break
+            if next_frame >= 0 and (last := self.n % hop):
+                vad_run(np.pad(self.w[self.n - last - ctx:self.n], (0, hop - last)))
+            # as SileroVad._encode's output; under one frame: let the VAD do it all
+            self.probs = np.array(self.probs, dtype=np.float32) if next_frame >= 0 else None
+            self.length = self.n
+        finally:
+            self.q.put(self.END)
+            self.finished.set()
+
+    def wav16(self):
+        self.finished.wait()
+        return self.w[:self.n]
+
+    def stream(self):
+        """The probabilities as they come."""
+        while (p := self.q.get()) is not self.END:
+            yield p
+
+
+def _merge_stream(vad, segments, length, sample_rate, *, min_speech_duration_ms=250, max_speech_duration_s=20,
+                  min_silence_duration_ms=100, speech_pad_ms=30, **kwargs):
+    """onnx_asr's BaseVad._merge_segments (0.12) for a waveform still being decoded: length() is its final length,
+    only asked for once [segments] has ended (until then no segment can reach the end)."""
+    from itertools import chain
+    INF = vad.INF
+    speech_pad = int(speech_pad_ms * sample_rate // 1000)
+    min_speech_duration = int(min_speech_duration_ms * sample_rate // 1000) - 2 * speech_pad
+    max_speech_duration = int(max_speech_duration_s * sample_rate) - 2 * speech_pad
+    min_silence_duration = int(min_silence_duration_ms * sample_rate // 1000) + 2 * speech_pad
+
+    final = [INF]  # the waveform's length: no segment before the end markers reaches it
+
+    def tail():
+        final[0] = length()
+        yield final[0], final[0]
+        yield INF, INF
+
+    cur_start, cur_end = -INF, -INF
+    for start, end in chain(segments, tail()):
+        n = final[0]
+        if start - cur_end < min_silence_duration and end - cur_start < max_speech_duration:
+            cur_end = end
+        else:
+            if cur_start < n and cur_end > cur_start and cur_end - cur_start > min_speech_duration:
+                yield max(cur_start - speech_pad, 0), min(cur_end + speech_pad, n)
+            while end - start > max_speech_duration:
+                yield max(start - speech_pad, 0), start + max_speech_duration + speech_pad
+                start += max_speech_duration
+            cur_start, cur_end = start, end
+
+
+def _stream_recognize(adapter, prep):
+    """ASR of [prep]'s audio as it decodes: TimestampedSegmentResults in time order (as adapter.recognize)."""
+    vad, asr, kw = adapter.vad, adapter.asr, adapter._vadargs
+    segments = _merge_stream(vad, vad._find_segments(prep.stream(), prep.hop, **kw), lambda: prep.length, prep.sr,
+                             **kw)
+
+    def batches():
+        pending = []
+        for seg in segments:
+            pending.append(seg)
+            if len(pending) >= STREAM_WINDOW:
+                pending.sort(key=lambda x: x[1] - x[0])
+                yield from (pending[k:k + ASR_BUCKET] for k in range(0, len(pending), ASR_BUCKET))
+                pending = []
+        pending.sort(key=lambda x: x[1] - x[0])
+        yield from (pending[k:k + ASR_BUCKET] for k in range(0, len(pending), ASR_BUCKET))
+
+    results = dict(_asr_batches(asr, batches(), lambda s, e: prep.w[s:e], {"need_logprobs": True}, prep.sr))
+    return [results[seg] for seg in sorted(results)]
 
 
 def transcribe(m, pcm, cond, out, on_cues=None):
@@ -796,18 +889,21 @@ def transcribe(m, pcm, cond, out, on_cues=None):
     try:
         import librosa
         mark = out.get("mark", lambda k: None)
-        probs = None
-        if STREAM_VAD:
-            wav16, probs = _stream_prepare(pcm, cond, m["asr"].vad)
+        prep = _StreamPrep(pcm, cond, m["asr"].vad) if STREAM_VAD else None
+        streamed = None
+        if prep is not None and STREAM_ASR:
+            streamed = _stream_recognize(m["asr"], prep)  # done shortly after the download
+        if prep is not None:
+            wav16, probs = prep.wav16(), prep.probs
         else:
             with cond:
                 while not pcm.done:
                     cond.wait(1.0)
         if pcm.error:
             return  # the encoder reports it
-        if not STREAM_VAD:
-            wav16 = librosa.resample(pcm.buf[:pcm.avail], orig_sr=mimi_file.SR, target_sr=16000)
-        mark("decoded")  # and, with STREAM_VAD, resampled and VAD'd
+        if prep is None:
+            wav16, probs = librosa.resample(pcm.buf[:pcm.avail], orig_sr=mimi_file.SR, target_sr=16000), None
+        mark("decoded")  # and, with STREAM_VAD, resampled and VAD'd (and with STREAM_ASR, recognized)
 
         def speakers():
             try:
@@ -824,11 +920,14 @@ def transcribe(m, pcm, cond, out, on_cues=None):
         d = threading.Thread(target=speakers, daemon=True, name="mimi-diarize")
         if not diar_on_gpu:
             d.start()
-        _vad_pre.value = (len(wav16), probs) if probs is not None else None
-        try:
-            out["cues"] = [c for s in m["asr"].recognize(wav16, sample_rate=16000) for c in cues(s)]
-        finally:
-            _vad_pre.value = None
+        if streamed is not None and probs is not None:
+            out["cues"] = [c for s in streamed for c in cues(s)]
+        else:
+            _vad_pre.value = (len(wav16), probs) if probs is not None else None
+            try:
+                out["cues"] = [c for s in m["asr"].recognize(wav16, sample_rate=16000) for c in cues(s)]
+            finally:
+                _vad_pre.value = None
         mark("asr")
         if on_cues:
             on_cues(out["cues"])

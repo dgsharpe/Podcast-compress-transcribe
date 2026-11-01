@@ -80,6 +80,7 @@ Environment variables, e.g. `Environment=` lines in the unit:
 | `MIMI_HUB_MIMI_FP16` | `1` | `0`: Mimi encoder in fp32 on the GPU (fp16 is ~1.7x faster; the coarse codes nearly all match) |
 | `MIMI_HUB_PROCS` | `1` | worker processes, each with its own models: a fast GPU needs several (Modal L40S: 1 -> 6 processes 170 -> 441x; M5 Mac: 1 -> 2, 67 -> 77x; the server: +3%) |
 | `MIMI_HUB_WORKERS` | `2` | episodes at a time per process |
+| `MIMI_HUB_STREAM_ASR` | `0` | `1`: transcribe during the download (same transcript; pays off only where the GPU has room to spare, not on the server) |
 | `MIMI_HUB_TOKEN` | (none) | require `Authorization: Bearer <token>` |
 | `MIMI_HUB_DATA` | `hub_data/` | where `.mimi` / `.vtt` / records live |
 
