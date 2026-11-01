@@ -239,7 +239,11 @@ def _load_models():
     else:  # Apple silicon: the GPU through Metal
         dev = "mps" if torch.backends.mps.is_available() else "cpu"
     m["device"] = dev
-    m["mimi"] = mimi_file.load_model(dev)
+    if COMPRESS:
+        try:
+            m["mimi"] = mimi_file.load_model(dev)
+        except Exception as e:
+            print(f"Warning: could not load mimi model: {e}")
     # onnxruntime's default spin-waiting threads starve torch's: on a 15 min clip (scripts/bench_overlap.py)
     # ASR alone went 50 -> 31 s with spinning off, and encode || ASR 87 -> 39 s
     so = ort.SessionOptions()
