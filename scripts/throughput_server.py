@@ -48,11 +48,28 @@ class GpuBusy:
         self.mean = round(sum(self.samples) / max(1, len(self.samples)), 1)
 
 
+def hub_encode(model, wav):
+    """Mimi codes the way the hub's encode_live makes them: one stream over its chunks (MIMI_STREAMING), else the
+    old windows with 20 s of left context."""
+    import torch
+    from hub import mimi_hub
+    import mimi_file
+    if not mimi_hub.MIMI_STREAMING:
+        return mimi_file.encode_array(model, wav)
+    kv, pad, out = None, None, []
+    with torch.inference_mode():
+        for f0, f1 in mimi_hub.chunk_bounds(len(wav) // mimi_file.SPF):
+            x = torch.from_numpy(wav[f0 * mimi_file.SPF:f1 * mimi_file.SPF].copy())[None, None].cuda()
+            o = model.encode(x, num_quantizers=32, encoder_past_key_values=kv, padding_cache=pad, use_streaming=True)
+            kv, pad = o.encoder_past_key_values, o.padding_cache
+            out.append(o.audio_codes[0].T.cpu().numpy())
+    return out
+
+
 def baseline_episode(m, wav24, wav16):
     """One clip the way hub.mimi_hub.run() handles an episode (minus file I/O)."""
     from hub import mimi_hub
-    import mimi_file
-    enc = threading.Thread(target=mimi_file.encode_array, args=(m["mimi"], wav24))
+    enc = threading.Thread(target=hub_encode, args=(m["mimi"], wav24))
     enc.start()
     cues = [c for s in m["asr"].recognize(wav16, sample_rate=16000) for c in mimi_hub.cues(s)]
     turns, _ = mimi_hub.diarize(wav16)

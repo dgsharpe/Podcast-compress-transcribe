@@ -185,7 +185,12 @@ def models():
         asr = onnx_asr.load_model(ASR_MODEL, sess_options=so)
         if dev == "cuda":
             try:
-                asr.asr._encoder = TorchEncoder(parakeet_encoder())
+                if os.environ.get("MIMI_HUB_ASR_ENCODER") == "native":  # hub/parakeet_native.py; opt-in
+                    from hub import parakeet_native
+                    model_dir = parakeet_native.convert(ASR_MODEL, MODELS_DIR / f"{ASR_MODEL}-hf")
+                    asr.asr._encoder = parakeet_native.NativeEncoder(parakeet_native.load(model_dir, "cuda"))
+                else:
+                    asr.asr._encoder = TorchEncoder(parakeet_encoder())
             except Exception:
                 traceback.print_exc()  # the ONNX encoder on the CPU still works
         vad = onnx_asr.load_vad("silero")

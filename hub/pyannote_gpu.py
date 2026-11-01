@@ -12,6 +12,7 @@ norms become fixed per-channel scale + shift (eval mode). fp16 is not used: it m
 """
 
 import math
+import os
 import types
 
 import numpy as np
@@ -23,7 +24,7 @@ BATCH_CHUNKS = 32
 # moment through the ResNet ~10 times; 0.2 halves diarization time (43.8 min: 34 -> 17 s on the server) and changed the
 # output by DER 0.042 vs the default (hosts 17.5 / 14.9 -> 17.5 / 15.4 min). 0.25: 13.7 s, DER 0.057.
 # scripts/diar_variants_server.py.
-STEP_FRAC = 0.2
+STEP_FRAC = float(os.environ.get("MIMI_HUB_DIAR_STEP", "0.2"))
 
 
 class FrozenBN(torch.nn.Module):
