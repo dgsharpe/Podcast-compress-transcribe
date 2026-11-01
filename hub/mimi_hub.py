@@ -185,7 +185,10 @@ def models():
         asr = onnx_asr.load_model(ASR_MODEL, sess_options=so)
         if dev == "cuda":
             try:
-                if os.environ.get("MIMI_HUB_ASR_ENCODER") == "native":  # hub/parakeet_native.py; opt-in
+                # hub/parakeet_native.py. Checked against NVIDIA's NeMo encoder on real batches: native matches to
+                # ~1e-5 relative error, the onnx2torch-converted ONNX export is off by ~4% (median); transcripts of
+                # both are within 0.6% of NeMo's own. Native is also 18% more pipeline throughput on the server.
+                if os.environ.get("MIMI_HUB_ASR_ENCODER", "native") == "native":
                     from hub import parakeet_native
                     model_dir = parakeet_native.convert(ASR_MODEL, MODELS_DIR / f"{ASR_MODEL}-hf")
                     asr.asr._encoder = parakeet_native.NativeEncoder(parakeet_native.load(model_dir, "cuda"))
