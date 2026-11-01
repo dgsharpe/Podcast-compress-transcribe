@@ -71,6 +71,12 @@ def _without_miopen(module):
     module.forward = wrapped
 
 
+# The ResNet in channels-last memory layout, the one cuDNN's fp16 tensor-core convolutions use natively: the
+# embedding step 1.4x faster on an L40S, 1.3x on an H100, diarization unchanged (DER 0). auto: on with NVIDIA.
+# (CUDA graphs for it and the segmentation model gained nothing: both are compute-bound, not launch-bound.)
+CHANNELS_LAST = os.environ.get("MIMI_HUB_DIAR_CL", "auto")
+
+
 def _frames_mode(device):
     if FRAMES_DTYPE != "auto":
         return FRAMES_DTYPE
@@ -187,4 +193,8 @@ def load(device="cuda", path=None, segmentation_device=None):
         _freeze_bn(pipeline._embedding.model_)
     pipeline.get_embeddings = types.MethodType(get_embeddings, pipeline)
     pipeline._segmentation.step = STEP_FRAC * pipeline._segmentation.duration
+    nvidia = torch.device(device).type == "cuda" and not torch.version.hip
+    if CHANNELS_LAST == "1" or (CHANNELS_LAST == "auto" and nvidia):
+        resnet = pipeline._embedding.model_.resnet.to(memory_format=torch.channels_last)
+        resnet.conv1.register_forward_pre_hook(lambda m, args: (args[0].contiguous(memory_format=torch.channels_last),))
     return pipeline

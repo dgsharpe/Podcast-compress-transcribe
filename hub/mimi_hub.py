@@ -230,8 +230,13 @@ def _load_models():
     m = {}
     import onnx_asr
     import onnxruntime as ort
+    import threadpoolctl
     import torch
     torch.set_num_threads(THREADS)
+    # onnx_asr computes Parakeet's features with NumPy on the CPU, and OpenBLAS's default (a spin-waiting thread
+    # per core) turned their small matrix products into most of the hub's CPU use: ASR 47 -> 19 CPU-ms per audio
+    # second on the server with one BLAS thread, at the same speed
+    threadpoolctl.threadpool_limits(int(os.environ.get("MIMI_HUB_BLAS_THREADS", "1")), user_api="blas")
     if DEVICE != "auto":
         dev = DEVICE
     elif torch.cuda.is_available():
@@ -254,7 +259,12 @@ def _load_models():
             if os.environ.get("MIMI_HUB_ASR_ENCODER", "native") == "native":
                 from hub import parakeet_native
                 model_dir = parakeet_native.convert(ASR_MODEL, MODELS_DIR / f"{ASR_MODEL}-hf")
-                asr.asr._encoder = parakeet_native.NativeEncoder(parakeet_native.load(model_dir, dev))
+                encoder = parakeet_native.load(model_dir, dev)
+                # fp16 weights: 1.2 GB less GPU memory per process (more processes fit), same speed; 545/548
+                # segments of a 43.8 min episode identical (the rest a comma or a word). Off by default.
+                if os.environ.get("MIMI_HUB_ASR_HALF", "0") == "1":
+                    encoder = encoder.half()
+                asr.asr._encoder = parakeet_native.NativeEncoder(encoder)
                 # identical tokens and timestamps to onnx_asr's loop (548/548 segments of a 43.8 min episode;
                 # scripts/parakeet_decoder_check.py). It frees the CPU: on Modal's L40S (CPU-bound) pipeline
                 # throughput went 214 -> 268x, on an M5 Mac 43 -> 47x; the server (ROCm) is GPU-bound and ~3%

@@ -5,9 +5,9 @@
 Ceilings are measured here too (large fp16 / fp32 matmuls, a big device-to-device copy), next to the datasheet ones
 for the Radeon 8060S (gfx1151: 40 CUs at 2.9 GHz -> ~59 TFLOP/s fp16 WMMA, ~30 fp32 with dual issue; LPDDR5X-8000 on
 a 256-bit bus -> 256 GB/s). Stages use the hub's own models and representative inputs:
-  Mimi encode: one 60 s chunk, streaming with caches (fp32)
+  Mimi encode: one 60 s chunk, streaming with caches (fp16 encoder, as the hub)
   Parakeet encoder: a batch of 16 x 20 s segments (native transformers encoder, fp16 autocast)
-  WeSpeaker ResNet34 (pyannote embeddings): 32 x 10 s chunks, fbank + frames (fp32, batch norms frozen)
+  WeSpeaker ResNet34 (pyannote embeddings): 32 x 10 s chunks, fbank + frames (the hub's precision)
   pyannote segmentation (SincNet + LSTM, MIOpen off): 32 x 10 s chunks (the FLOP counter may miss the LSTM)
 """
 
@@ -73,22 +73,20 @@ def main():
         res[name] = {"gflop_per_audio_s": round(fl / audio_s / 1e9, 2), "time_s": round(t, 3),
                      "tflops": round(tflops, 2), "pct_of_measured_peak": round(100 * tflops / res[peak_key], 1),
                      "x_realtime": round(audio_s / t)}
-        print(f"STAGE {name}: " + json.dumps(res[name]), flush=True)
+        print("STAGE " + json.dumps({"stage": name, **res[name]}), flush=True)
 
     # --- Mimi: a 60 s chunk in steady-state streaming (caches warm from the previous minute)
     mimi = m["mimi"]
-    with torch.inference_mode():
-        x0 = torch.from_numpy(wav[: 60 * sr]).cuda()[None, None]
-        o = mimi.encode(x0, num_quantizers=32, use_streaming=True)
-        kv, pad = o.encoder_past_key_values, o.padding_cache
+    x0 = torch.from_numpy(wav[: 60 * sr]).cuda()[None, None]
+    o = mimi_hub.mimi_encode(mimi, x0, use_streaming=True)  # as the hub: fp16 encoder on a GPU
+    kv, pad = o.encoder_past_key_values, o.padding_cache
     x1 = torch.from_numpy(wav[60 * sr: 120 * sr]).cuda()[None, None]
 
     def mimi_chunk():
         import copy
-        with torch.inference_mode():
-            mimi.encode(x1, num_quantizers=32, encoder_past_key_values=copy.deepcopy(kv),
-                        padding_cache=copy.deepcopy(pad), use_streaming=True)
-    stage("mimi_encode_fp32", mimi_chunk, 60.0, "peak_matmul_fp32_tflops")
+        mimi_hub.mimi_encode(mimi, x1, encoder_past_key_values=copy.deepcopy(kv), padding_cache=copy.deepcopy(pad),
+                             use_streaming=True)
+    stage("mimi_encode_fp16", mimi_chunk, 60.0, "peak_matmul_fp16_tflops")
 
     # --- Parakeet encoder: 16 segments of 20 s (128 mel bins at 100 frames/s), fp16
     enc = parakeet_native.load(mimi_hub.MODELS_DIR / f"{mimi_hub.ASR_MODEL}-hf", "cuda")
@@ -102,15 +100,18 @@ def main():
     del enc
 
     # --- pyannote: WeSpeaker ResNet34 over 32 chunks of 10 s, and the segmentation model
-    pipe = pyannote_gpu.load("cuda")
+    pipe = pyannote_gpu.load("cuda", path=os.environ.get("TPUT_PYANNOTE_PATH"))
+    mode = pyannote_gpu._frames_mode(torch.device("cuda"))
+    half = {"fp16": torch.float16, "bf16": torch.bfloat16}.get(mode)
     w16 = torch.randn(32, 1, 160000, device="cuda") * 0.1
     emb = pipe._embedding.model_
 
     def resnet():
-        with torch.inference_mode():
+        with torch.inference_mode(), torch.autocast("cuda", dtype=half or torch.float32, enabled=half is not None):
             emb.resnet.forward_frames(emb.compute_fbank(w16))
     # 32 chunks at the 2 s step cover 64 s of new audio
-    stage("wespeaker_resnet34_fp32", resnet, 32 * 2.0, "peak_matmul_fp32_tflops")
+    stage(f"wespeaker_resnet34_{mode}", resnet, 32 * 2.0,
+          "peak_matmul_fp16_tflops" if half is not None else "peak_matmul_fp32_tflops")
     seg = pipe._segmentation.model
 
     def segmentation():
