@@ -13,7 +13,7 @@ pocket-casts-android.
 
 ```sh
 android/fetch_deps.sh      # libLiteRt.so (link copy), QAIRT QNN libs (range-fetched), Mimi models
-android/build.sh           # :mimi:assembleRelease :demo:assembleDebug (in the server's android-build:36 container)
+android/build.sh           # :mimi:assembleRelease :demo:assembleDebug (in an android-build:36 container)
 android/build.sh :bridge:assembleDebug
 ```
 

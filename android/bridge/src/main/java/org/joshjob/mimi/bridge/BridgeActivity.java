@@ -48,7 +48,7 @@ public class BridgeActivity extends Activity {
     decoder = text("", 12);
     root.addView(decoder);
 
-    root.addView(text("\nConverter (the server):", 14));
+    root.addView(text("\nConverter (mimi-hub):", 14));
     hub = new EditText(this);
     hub.setSingleLine(true);
     hub.setText(HubClient.hubUrl(this));
