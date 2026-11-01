@@ -116,7 +116,7 @@ def rec_path(i):
 
 
 def record_paths():
-    return [p for p in DATA.glob("*.json") if not p.name.endswith(".segments.json")]
+    return [p for p in DATA.glob("*.json") if not p.name.endswith((".segments.json", ".summary.json"))]
 
 
 def load(i):
@@ -1084,6 +1084,19 @@ def segment_worker():
                     timing["segments"] = round(time.time() - r["timing_start"], 2)
                 save(dict(r, segments_state="ready", segments=len(res["segments"]), segments_model=res["model"],
                           skippable_s=round(sum(s["end"] - s["start"] for s in res["segments"]), 1), timing=timing))
+
+            if segments.SUMMARIZER.strip().lower() not in ("", "off", "0", "false"):
+                try:
+                    update(i, summary_state="pending")
+                    sum_res = segments.summarize(cues, res.get("segments"), log=lambda m: print(f"[{i}] {m}", flush=True))
+                    stmp = DATA / f"{i}.summary.json.tmp"
+                    stmp.write_text(json.dumps(sum_res, indent=1))
+                    stmp.replace(DATA / f"{i}.summary.json")
+                    (DATA / f"{i}.summary.html").write_text(sum_res["summary"])
+                    update(i, summary_state="ready", summary_model=sum_res["model"])
+                except Exception as se:
+                    traceback.print_exc()
+                    update(i, summary_state="failed", summary_error=f"{type(se).__name__}: {se}"[:500])
         except Exception as e:
             traceback.print_exc()
             update(i, segments_state="failed", segments_error=f"{type(e).__name__}: {e}"[:500])
@@ -1244,7 +1257,7 @@ _procs = None
 def start():
     for p in sorted(record_paths(), key=lambda p: p.stat().st_mtime):
         r = json.loads(p.read_text())
-        if r["state"] not in ("ready", "failed"):  # resume interrupted jobs from scratch
+        if r.get("state") not in ("ready", "failed"):  # resume interrupted jobs from scratch
             (DATA / f"{r['id']}.mimi").unlink(missing_ok=True)  # partial, preallocated: never serve it
             save(dict(r, state="queued", progress=0.0))
             jobs.put((r.get("priority", 1), next(_seq), r["id"]))
@@ -1424,6 +1437,16 @@ def episode(name: str, request: Request, authorization: str | None = Header(None
         if not p.exists():
             raise HTTPException(404, "no segments yet")
         return FileResponse(p, media_type="application/json")
+    if ext == "summary.json":
+        p = DATA / f"{stem}.summary.json"
+        if not p.exists():
+            raise HTTPException(404, "no summary yet")
+        return FileResponse(p, media_type="application/json")
+    if ext in ("summary.html", "summary.txt"):
+        p = DATA / f"{stem}.summary.html"
+        if not p.exists():
+            raise HTTPException(404, "no summary yet")
+        return FileResponse(p, media_type="text/html" if ext == "summary.html" else "text/plain")
     if ext == "mimi":
         deadline = time.time() + 30  # a just-requested job writes its header within a few seconds
         while (L := live.get(stem)) is None and time.time() < deadline:

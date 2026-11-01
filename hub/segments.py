@@ -25,6 +25,7 @@ import tempfile
 import time
 
 SEGMENTER = os.environ.get("MIMI_HUB_SEGMENTER", "codex:gpt-6.1-sol,claude:claude-haiku-5-5")
+SUMMARIZER = os.environ.get("MIMI_HUB_SUMMARIZER", "off")
 CHUNK_CHARS = 90_000  # agy takes the prompt as one argv string (Linux caps those at 128 KiB)
 OVERLAP_CUES = 40
 TIMEOUT_S = 600
@@ -185,6 +186,83 @@ def detect(cues, segmenter=SEGMENTER, log=print):
             segs.append({"start": round(start, 2), "end": round(end, 2), **s})
     log(f"segments: {len(segs)} via {used} in {time.time() - t0:.0f} s")
     return {"model": used, "segments": segs}
+
+
+SUMMARY_PROMPT = """You are creating a comprehensive, detailed executive summary and highlights breakdown of a podcast episode based on its transcript.
+All advertisements and promotional segments have already been removed.
+
+Create a detailed summary containing enough depth to cover all major discussions, arguments, and takeaways:
+1. Overview: 2-3 sentences synthesizing the core premise and big-picture theme.
+2. Topics & Key Discussion Highlights: Break down each major segment/topic in order. For each topic, provide detailed bullet points explaining the ideas, arguments, stories, or technical details discussed by the speakers, including approximate timestamps [mm:ss] from the transcript cues where relevant.
+3. Notable Takeaways: Key conclusions, memorable insights, recommendations, or lessons.
+
+Format constraints:
+- Do not include any conversational filler, introductory remarks, or preambles (no "Sure, here is...").
+- Begin your response directly with <summary> and end with </summary>.
+- Inside <summary>, format the summary using clean HTML elements: <h4>, <p>, <ul>, <li>, <strong>, <em>.
+- Do not use markdown code fences (no ```html).
+
+Clean Transcript:
+"""
+
+
+def _extract_summary(text):
+    """Extract clean HTML summary from model output, stripping any conversational preamble or fences."""
+    text = text.strip()
+    m = re.search(r"<summary[^>]*>(.*?)</summary>", text, re.DOTALL | re.IGNORECASE)
+    if m:
+        body = m.group(1).strip()
+    else:
+        m = re.search(r"<summary[^>]*>(.*)", text, re.DOTALL | re.IGNORECASE)
+        body = m.group(1).strip() if m else text
+
+    # Strip code fences if present
+    body = re.sub(r"^```[a-zA-Z]*\n?", "", body)
+    body = re.sub(r"\n?```$", "", body).strip()
+
+    # Trim conversational preamble before the first HTML tag if model omitted tags
+    first_tag = re.search(r"<(h[1-6]|p|div|ul|ol|strong|em)[^>]*>", body, re.IGNORECASE)
+    if first_tag and 0 < first_tag.start() < 250 and not body.startswith("<"):
+        body = body[first_tag.start():].strip()
+
+    return body
+
+
+def summarize(cues, segments=None, summarizer=SUMMARIZER, log=print):
+    """Generate a detailed HTML summary from [cues], excluding cues marked in [segments]."""
+    if summarizer.strip().lower() == "auto":
+        summarizer = SEGMENTER
+    if summarizer.strip().lower() in ("", "off", "0", "false"):
+        raise RuntimeError("summarizer disabled")
+
+    skip_cues = set()
+    if segments:
+        for s in segments:
+            first = int(s.get("first", 0))
+            last = int(s.get("last", 0))
+            for idx in range(first, last + 1):
+                skip_cues.add(idx)
+
+    clean_lines = [_line(i, c) for i, c in enumerate(cues) if i not in skip_cues]
+    if not clean_lines:
+        clean_lines = [_line(i, c) for i, c in enumerate(cues)]
+
+    t0 = time.time()
+    errors = []
+    for choice in [c.strip() for c in summarizer.split(",") if c.strip()]:
+        backend, _, model = choice.partition(":")
+        try:
+            log(f"summary: generating via {choice} with {len(clean_lines)} clean cues...")
+            text = "\n".join(clean_lines)
+            prompt = SUMMARY_PROMPT + "\n" + text[:CHUNK_CHARS]
+            out = _run(backend, model, prompt)
+            out = _extract_summary(out)
+            log(f"summary: generated in {time.time() - t0:.1f} s via {choice}")
+            return {"model": choice, "summary": out}
+        except Exception as e:
+            log(f"summary: {choice} failed: {e}")
+            errors.append(f"{choice}: {e}")
+    raise RuntimeError("; ".join(errors) or "no summarizer configured")
 
 
 if __name__ == "__main__":
