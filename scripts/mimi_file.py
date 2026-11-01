@@ -71,20 +71,30 @@ def read(path):
                 model=model.rstrip(b"\0").decode(), meta=meta), unpack(frames, nq)
 
 
-def load_model():
+def load_model(device="cpu"):
     from transformers import MimiModel
-    return MimiModel.from_pretrained("kyutai/mimi").eval()
+    return to_device(MimiModel.from_pretrained("kyutai/mimi").eval(), device)
+
+
+def to_device(m, device):
+    """Move the model; its RVQ codebooks cache their embedding off-module (`_embed`), so drop those caches."""
+    m = m.to(device)
+    for mod in m.modules():
+        if hasattr(mod, "_embed"):
+            mod._embed = None
+    return m
 
 
 def encode_array(m, wav, nq=32, chunk_s=60.0, ctx_s=20.0, progress=None):
     """24 kHz mono float array -> codes (frames, nq), chunked with left context (see module doc)."""
     chunk, ctx = int(chunk_s * SR) // SPF * SPF, int(ctx_s * SR) // SPF * SPF
     out = []
+    dev = next(m.parameters()).device
     with torch.inference_mode():
         for s in range(0, len(wav), chunk):
             lo = max(0, s - ctx)
-            x = torch.from_numpy(wav[lo : s + chunk]).float()[None, None]
-            c = m.encode(x, num_quantizers=nq).audio_codes[0].T.numpy()  # (frames, nq)
+            x = torch.from_numpy(wav[lo : s + chunk]).float()[None, None].to(dev)
+            c = m.encode(x, num_quantizers=nq).audio_codes[0].T.cpu().numpy()  # (frames, nq)
             out.append(c[(s - lo) // SPF :][: (min(len(wav), s + chunk) - s + SPF - 1) // SPF])
             if progress:
                 progress(min(1.0, (s + chunk) / len(wav)))

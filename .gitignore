@@ -6,3 +6,4 @@ hub_data/
 __pycache__/
 *.pyc
 hub_models/
+.venv-rocm/

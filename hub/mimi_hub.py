@@ -23,6 +23,9 @@ API (JSON unless noted):
   POST /v1/episodes/{id}/segments               re-run that detection
   GET  /v1/episodes                             all jobs, newest first
 Files live in $MIMI_HUB_DATA (default neural_audio/hub_data/): <id>.mimi, <id>.vtt, <id>.segments.json, <id>.json.
+
+GPU: run in .venv-rocm (hub/setup_rocm.sh; hub/serve.sh picks it) and the Mimi encoder and Parakeet's encoder run on
+the Radeon 8060S (MIMI_HUB_DEVICE=auto | cuda | cpu). Diarization and Parakeet's decoding loop stay on the CPU.
 """
 
 import gzip
@@ -57,7 +60,11 @@ from hub import segments  # noqa: E402
 if not os.environ.get("SSL_CERT_FILE") and os.path.exists("/etc/ssl/certs/ca-certificates.crt"):
     os.environ["SSL_CERT_FILE"] = "/etc/ssl/certs/ca-certificates.crt"
 
+# MIOpen (ROCm's conv library) otherwise tunes every new input shape exhaustively; Parakeet's batches all differ
+os.environ.setdefault("MIOPEN_FIND_MODE", "FAST")
+
 DATA = Path(os.environ.get("MIMI_HUB_DATA", ROOT / "hub_data"))
+DEVICE = os.environ.get("MIMI_HUB_DEVICE", "auto")
 TOKEN = os.environ.get("MIMI_HUB_TOKEN", "")
 ASR_MODEL = os.environ.get("MIMI_HUB_ASR", "nemo-parakeet-tdt-0.6b-v2")  # -v3 for multilingual
 THREADS = int(os.environ.get("MIMI_HUB_THREADS", "16"))
@@ -166,15 +173,69 @@ def models():
         import onnxruntime as ort
         import torch
         torch.set_num_threads(THREADS)
-        _models["mimi"] = mimi_file.load_model()
+        dev = DEVICE if DEVICE != "auto" else ("cuda" if torch.cuda.is_available() else "cpu")
+        _models["device"] = dev
+        _models["mimi"] = mimi_file.load_model(dev)
         # onnxruntime's default spin-waiting threads starve torch's: on a 15 min clip (scripts/bench_overlap.py)
         # ASR alone went 50 -> 31 s with spinning off, and encode || ASR 87 -> 39 s
         so = ort.SessionOptions()
         so.intra_op_num_threads = THREADS
         so.add_session_config_entry("session.intra_op.allow_spinning", "0")
-        _models["asr"] = (onnx_asr.load_model(ASR_MODEL, sess_options=so).with_vad(onnx_asr.load_vad("silero"))
-                          .with_timestamps())
+        asr = onnx_asr.load_model(ASR_MODEL, sess_options=so)
+        if dev == "cuda":
+            try:
+                asr.asr._encoder = TorchEncoder(parakeet_encoder())
+            except Exception:
+                traceback.print_exc()  # the ONNX encoder on the CPU still works
+        _models["asr"] = asr.with_vad(onnx_asr.load_vad("silero")).with_timestamps()
     return _models
+
+
+# ---------- Parakeet's encoder on the GPU ----------
+#
+# onnxruntime has no working GPU provider for gfx1151 here (no MIGraphX; WebGPU was slower than the CPU and changed
+# the output), so the encoder ONNX graph is converted to torch once (onnx2torch) and run on ROCm in fp16, behind the
+# InferenceSession interface onnx_asr calls. The encoder is ~85% of Parakeet's CPU time; preprocessing, VAD and the
+# TDT decoding loop stay in onnxruntime on the CPU. On a 15 min clip: 33 s -> 10 s, 190/191 segments identical (one
+# comma differs). bf16 changed more words; fp32 is identical but half the speed.
+
+PARAKEET_ONNX = {"nemo-parakeet-tdt-0.6b-v2": "istupakov/parakeet-tdt-0.6b-v2-onnx"}
+
+
+def parakeet_encoder():
+    """Path of the torch-converted encoder of ASR_MODEL, converting it on first use (~2.4 GB, a few seconds)."""
+    out = MODELS_DIR / f"{ASR_MODEL}-encoder.pt"
+    if out.exists():
+        return out
+    import onnx2torch
+    import torch
+    from huggingface_hub import snapshot_download
+    src = Path(snapshot_download(PARAKEET_ONNX[ASR_MODEL], allow_patterns=["encoder-model.onnx*"]))
+    with tempfile.TemporaryDirectory(dir=MODELS_DIR) as tmp:
+        for f in src.glob("encoder-model.onnx*"):  # onnx refuses the HF cache's symlinked weight file
+            shutil.copyfile(f, Path(tmp) / f.name)
+        module = onnx2torch.convert(str(Path(tmp) / "encoder-model.onnx"))
+    torch.save(module, out.with_suffix(".tmp"))
+    out.with_suffix(".tmp").replace(out)
+    return out
+
+
+class TorchEncoder:
+    """Stands in for onnx_asr's encoder InferenceSession: run(names, feeds) -> [outputs, encoded_lengths]."""
+
+    def __init__(self, path):
+        import torch
+        self.torch = torch
+        self.m = torch.load(path, weights_only=False).eval().to("cuda")
+
+    def run(self, names, feeds):
+        import numpy as np
+        torch = self.torch
+        x = torch.from_numpy(feeds["audio_signal"]).cuda()
+        n = torch.from_numpy(np.asarray(feeds["length"])).cuda()
+        with torch.inference_mode(), torch.autocast("cuda", dtype=torch.float16):
+            out, lens = self.m(x, n)
+        return [out.float().cpu().numpy(), lens.cpu().numpy()]
 
 
 def candidates(url):
@@ -243,27 +304,33 @@ def _pyannote_turns(wav16):
     return [(t.start, t.end, spk) for t, _, spk in ann.itertracks(yield_label=True)]
 
 
+_diar_pool = None
+
+
+def _sherpa_turns(wav16):
+    """sherpa-onnx diarization in a child process (hub/diarize_worker.py), which keeps its models loaded."""
+    global _diar_pool
+    import multiprocessing
+    import numpy as np
+    from concurrent.futures import ProcessPoolExecutor
+    from concurrent.futures.process import BrokenProcessPool
+    from hub import diarize_worker
+    if _diar_pool is None:
+        _diar_pool = ProcessPoolExecutor(1, mp_context=multiprocessing.get_context("spawn"))
+    with tempfile.NamedTemporaryFile(suffix=".npy", dir=DATA) as f:
+        np.save(f, wav16)
+        f.flush()
+        try:
+            return _diar_pool.submit(diarize_worker.segments, f.name, str(MODELS_DIR), DIAR_THRESHOLD).result()
+        except BrokenProcessPool:
+            _diar_pool = None  # the child died (e.g. OOM); start a fresh one next time
+            raise
+
+
 def diarize(wav16):
     """[(start_s, end_s, speaker_number)], speakers numbered 1.. by first appearance."""
-    import sherpa_onnx as so
     with _diar_lock:  # one diarizer, not shared across threads
-        if DIARIZER == "pyannote":
-            segs = _pyannote_turns(wav16)
-        elif "diar" not in _models:
-            cfg = so.OfflineSpeakerDiarizationConfig(
-                segmentation=so.OfflineSpeakerSegmentationModelConfig(
-                    pyannote=so.OfflineSpeakerSegmentationPyannoteModelConfig(
-                        model=str(MODELS_DIR / "sherpa-onnx-pyannote-segmentation-3-0/model.onnx")),
-                    num_threads=8),
-                embedding=so.SpeakerEmbeddingExtractorConfig(
-                    model=str(MODELS_DIR / "wespeaker_en_voxceleb_resnet34_LM.onnx"), num_threads=8),
-                clustering=so.FastClusteringConfig(num_clusters=-1, threshold=DIAR_THRESHOLD),
-                min_duration_on=0.3, min_duration_off=0.5)
-            if not cfg.validate():
-                raise RuntimeError(f"diarization models missing under {MODELS_DIR}")
-            _models["diar"] = so.OfflineSpeakerDiarization(cfg)
-        if DIARIZER != "pyannote":
-            segs = [(s.start, s.end, s.speaker) for s in _models["diar"].process(wav16).sort_by_start_time()]
+        segs = _pyannote_turns(wav16) if DIARIZER == "pyannote" else _sherpa_turns(wav16)
     total = {}
     for a, b, k in segs:
         total[k] = total.get(k, 0.0) + b - a
@@ -433,9 +500,9 @@ def encode_live(model, L, pcm, fd, i):
                 L.cond.wait(0.5)
         f0, f1 = L.bounds[c]
         lo = max(0, (f0 - CTX) * spf)
-        x = torch.from_numpy(pcm.buf[lo:f1 * spf].copy())[None, None]
+        x = torch.from_numpy(pcm.buf[lo:f1 * spf].copy())[None, None].to(next(model.parameters()).device)
         with torch.inference_mode():
-            codes = model.encode(x, num_quantizers=32).audio_codes[0].T.numpy()
+            codes = model.encode(x, num_quantizers=32).audio_codes[0].T.cpu().numpy()
         seg = codes[(f0 * spf - lo) // spf:][: f1 - f0]
         if len(seg) < f1 - f0:  # pad (only at the very end)
             seg = np.concatenate([seg, np.repeat(seg[-1:], f1 - f0 - len(seg), axis=0)])
@@ -530,7 +597,7 @@ def run(i):
                 who = speaker_for(a, b, turns)
                 f.write(f"{vtt_time(a)} --> {vtt_time(b)}\n{f'<v Speaker {who}>' if who else ''}{text}\n\n")
         (DATA / f"{i}.vtt.tmp").replace(DATA / f"{i}.vtt")
-        update(i, state="ready", progress=1.0, asr=ASR_MODEL,
+        update(i, state="ready", progress=1.0, asr=ASR_MODEL, device=m["device"],
                speakers=len({t[2] for t in turns}), diarization=DIAR_NAME if turns else None)
         queue_segments(i)
     except Exception as e:
@@ -602,6 +669,12 @@ def start():
     for k in range(WORKERS):
         threading.Thread(target=worker, daemon=True, name=f"mimi-worker-{k}").start()
     threading.Thread(target=segment_worker, daemon=True, name="mimi-segments").start()
+
+
+@app.on_event("shutdown")
+def stop():
+    if _diar_pool is not None:
+        _diar_pool.shutdown(wait=False, cancel_futures=True)
 
 
 # ---------- HTTP ----------

@@ -11,4 +11,4 @@ exec systemd-run --user --unit=mimi-hub --collect -p MemoryMax=24G -p MemorySwap
   --working-directory="$PWD" \
   --setenv=PATH="$PATH" --setenv=MIMI_HUB_THREADS=16 \
   --setenv=SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt \
-  "$(command -v uv)" run uvicorn hub.mimi_hub:app --host "$IP" --port 8765
+  "$(command -v bash)" hub/serve.sh --host "$IP" --port 8765
