@@ -19,6 +19,11 @@ import torch
 
 MODEL = "pyannote/speaker-diarization-community-1"
 BATCH_CHUNKS = 32
+# Segmentation / embedding windows (10 s) start every STEP_FRAC x 10 s. pyannote's default 0.1 (1 s) sends every
+# moment through the ResNet ~10 times; 0.2 halves diarization time (43.8 min: 34 -> 17 s on the server) and changed the
+# output by DER 0.042 vs the default (hosts 17.5 / 14.9 -> 17.5 / 15.4 min). 0.25: 13.7 s, DER 0.057.
+# scripts/diar_variants_server.py.
+STEP_FRAC = 0.2
 
 
 class FrozenBN(torch.nn.Module):
@@ -108,4 +113,5 @@ def load(device="cuda", path=None):
         _without_miopen(pipeline._segmentation.model)
         _freeze_bn(pipeline._embedding.model_)
     pipeline.get_embeddings = types.MethodType(get_embeddings, pipeline)
+    pipeline._segmentation.step = STEP_FRAC * pipeline._segmentation.duration
     return pipeline
