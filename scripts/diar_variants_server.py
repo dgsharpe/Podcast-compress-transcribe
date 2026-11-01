@@ -50,7 +50,7 @@ def main():
                **{k: round(v, 1) for k, v in f["timing"].items() if k != "total"},
                "der_vs_first": round(DiarizationErrorRate()(ref, ann), 4), "speakers_min": top}
         print("DIAR " + json.dumps(res), flush=True)
-        with open(ROOT / "outputs/halo_throughput.jsonl", "a") as fh:
+        with open(ROOT / "outputs/throughput_server.jsonl", "a") as fh:
             fh.write(json.dumps({"label": "E3-diar", **res}) + "\n")
 
 

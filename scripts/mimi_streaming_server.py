@@ -96,7 +96,7 @@ def main():
             kvc, pad = o.encoder_past_key_values, o.padding_cache
     res["chunk_times_first_last"] = [times[:3], times[-3:]]
     print("RESULT " + json.dumps(res), flush=True)
-    with open(ROOT / "outputs/halo_throughput.jsonl", "a") as fh:
+    with open(ROOT / "outputs/throughput_server.jsonl", "a") as fh:
         fh.write(json.dumps({"label": "E6-mimi-streaming", **res}) + "\n")
 
 

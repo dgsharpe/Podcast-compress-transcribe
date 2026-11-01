@@ -72,6 +72,7 @@ Environment variables, e.g. `Environment=` lines in the unit:
 | `MIMI_HUB_DEVICE` | `auto` | `cuda` / `cpu` |
 | `MIMI_HUB_DIARIZER` | `auto` | `pyannote` (GPU; gated HF model, fetch once with a token) / `sherpa` (CPU) |
 | `MIMI_HUB_ASR_ENCODER` | `native` | `onnx2torch` for the converted ONNX encoder |
+| `MIMI_HUB_MIMI_FP16` | `1` | `0`: Mimi encoder in fp32 on the GPU (fp16 is ~1.7x faster; the coarse codes nearly all match) |
 | `MIMI_HUB_TOKEN` | (none) | require `Authorization: Bearer <token>` |
 | `MIMI_HUB_DATA` | `hub_data/` | where `.mimi` / `.vtt` / records live |
 

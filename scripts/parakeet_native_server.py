@@ -99,7 +99,7 @@ def main():
         res[f"{name}_warmup_s"] = round(time.perf_counter() - t, 1)
         _, res[f"{name}_s"] = timed(lambda: all_batches(enc))
         print(f"TIME {name}: {res[f'{name}_s']} s (warm-up {res[f'{name}_warmup_s']} s)", flush=True)
-    with open(ROOT / "outputs/halo_throughput.jsonl", "a") as fh:
+    with open(ROOT / "outputs/throughput_server.jsonl", "a") as fh:
         fh.write(json.dumps({"label": "E7-native-encoder", **res}) + "\n")
     print("RESULT " + json.dumps(res), flush=True)
 

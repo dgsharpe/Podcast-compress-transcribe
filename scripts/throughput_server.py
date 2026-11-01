@@ -5,7 +5,7 @@
 E0 (baseline) runs each clip exactly as mimi-hub runs an episode, with the hub's own models and settings:
 Mimi encode || (Parakeet ASR -> pyannote diarization, which the hub serialises with a lock). Reports aggregate
 x real time (clip audio / wall time) and the mean GPU busy % (amdgpu's gpu_busy_percent, sampled every 100 ms).
-Results are appended to outputs/halo_throughput.jsonl.
+Results are appended to outputs/throughput_server.jsonl.
 """
 
 import argparse
@@ -60,7 +60,7 @@ def hub_encode(model, wav):
     with torch.inference_mode():
         for f0, f1 in mimi_hub.chunk_bounds(len(wav) // mimi_file.SPF):
             x = torch.from_numpy(wav[f0 * mimi_file.SPF:f1 * mimi_file.SPF].copy())[None, None].cuda()
-            o = model.encode(x, num_quantizers=32, encoder_past_key_values=kv, padding_cache=pad, use_streaming=True)
+            o = mimi_hub.mimi_encode(model, x, encoder_past_key_values=kv, padding_cache=pad, use_streaming=True)
             kv, pad = o.encoder_past_key_values, o.padding_cache
             out.append(o.audio_codes[0].T.cpu().numpy())
     return out
@@ -131,7 +131,7 @@ def main():
                "wall_s": round(wall, 1), "x_rt": round(audio_s / wall, 1), "gpu_busy_pct": busy,
                "errors": errors, "cues": sum(v[0] for v in out.values())}
         print("RESULT " + json.dumps(res), flush=True)
-        with open(ROOT / "outputs/halo_throughput.jsonl", "a") as f:
+        with open(ROOT / "outputs/throughput_server.jsonl", "a") as f:
             f.write(json.dumps(res) + "\n")
 
 

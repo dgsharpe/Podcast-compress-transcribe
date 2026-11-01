@@ -576,6 +576,22 @@ def pick(L, pcm):
 # A chunk a reader is waiting for ahead of the stream is encoded at once with 20 s of left context, as before; the
 # stream later passes over it to keep its state, without rewriting bytes that may have been served.
 MIMI_STREAMING = os.environ.get("MIMI_HUB_MIMI_STREAMING", "1") != "0"
+# On a GPU the encoder (SEANet, transformer, downsampling) runs in fp16 and the quantizer in fp32: 1.46x faster on the
+# server, the coarse codes nearly all unchanged (first codebook 99.7%, first 8 98.5%, all 32 90.8% on 5 min) and the
+# decoded audio as close to the original (log-mel L1 0.6552 vs 0.6549; scripts/mimi_fp16_server.py).
+MIMI_FP16 = os.environ.get("MIMI_HUB_MIMI_FP16", "1") != "0"
+
+
+def mimi_encode(model, x, **kw):
+    """model.encode(x, num_quantizers=32, **kw), with the encoder in fp16 on a GPU (MIMI_FP16)."""
+    import torch
+    with torch.inference_mode():
+        with torch.autocast("cuda", dtype=torch.float16, enabled=MIMI_FP16 and x.is_cuda):
+            o = model.encoder(x, past_key_values=kw.get("encoder_past_key_values"),
+                              padding_cache=kw.get("padding_cache"), use_streaming=kw.get("use_streaming"))
+        codes = model.quantizer.encode(o.latents.float(), 32).transpose(0, 1)
+    return types.SimpleNamespace(audio_codes=codes, encoder_past_key_values=o.past_key_values,
+                                 padding_cache=o.padding_cache)
 
 
 def encode_live(model, L, pcm, fd, i):
@@ -610,9 +626,7 @@ def encode_live(model, L, pcm, fd, i):
         f0, f1 = L.bounds[c]
         if kind == "stream":
             x = torch.from_numpy(pcm.buf[f0 * spf:f1 * spf].copy())[None, None].to(dev)
-            with torch.inference_mode():
-                o = model.encode(x, num_quantizers=32, encoder_past_key_values=kv, padding_cache=pad,
-                                 use_streaming=True)
+            o = mimi_encode(model, x, encoder_past_key_values=kv, padding_cache=pad, use_streaming=True)
             kv, pad, seq = o.encoder_past_key_values, o.padding_cache, seq + 1
             if L.ready[c]:
                 continue  # encoded early for a reader: keep its bytes, the pass just advanced the caches
@@ -620,8 +634,7 @@ def encode_live(model, L, pcm, fd, i):
         else:
             lo = max(0, (f0 - CTX) * spf)
             x = torch.from_numpy(pcm.buf[lo:f1 * spf].copy())[None, None].to(dev)
-            with torch.inference_mode():
-                codes = model.encode(x, num_quantizers=32).audio_codes[0].T.cpu().numpy()
+            codes = mimi_encode(model, x).audio_codes[0].T.cpu().numpy()
             seg = codes[(f0 * spf - lo) // spf:][: f1 - f0]
         if len(seg) < f1 - f0:  # pad (only at the very end)
             seg = np.concatenate([seg, np.repeat(seg[-1:], f1 - f0 - len(seg), axis=0)])

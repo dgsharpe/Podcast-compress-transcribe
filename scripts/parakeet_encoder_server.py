@@ -142,7 +142,7 @@ def main():
                                               / sum(x.shape[0] * x.shape[2] for x, _ in groups), 3)
         print("BUCKET " + json.dumps({k: v for k, v in res.items() if k.startswith("bucket")}), flush=True)
 
-    with open(ROOT / "outputs/halo_throughput.jsonl", "a") as fh:
+    with open(ROOT / "outputs/throughput_server.jsonl", "a") as fh:
         fh.write(json.dumps({"label": "E2-encoder", **res}) + "\n")
     print("RESULT " + json.dumps(res), flush=True)
 
