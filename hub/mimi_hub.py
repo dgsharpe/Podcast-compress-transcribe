@@ -87,7 +87,26 @@ PC_EPISODE = re.compile(r"pocketcasts\.com/podcast/[^/]+/([0-9a-f-]{36})/[^/]+/(
 DATA.mkdir(parents=True, exist_ok=True)
 app = FastAPI(title="mimi-hub")
 jobs: "queue.PriorityQueue" = queue.PriorityQueue()  # (priority, seq, id); 0 = streaming
-lock = threading.Lock()
+
+
+class _RecordLock:
+    """Read-modify-write lock for the job records, across threads and (with MIMI_HUB_PROCS > 1) processes."""
+
+    def __init__(self):
+        self.thread = threading.Lock()
+
+    def __enter__(self):
+        import fcntl
+        self.thread.acquire()
+        self.fd = os.open(DATA / ".records.lock", os.O_RDWR | os.O_CREAT, 0o644)
+        fcntl.flock(self.fd, fcntl.LOCK_EX)
+
+    def __exit__(self, *exc):
+        os.close(self.fd)  # releases the flock
+        self.thread.release()
+
+
+lock = _RecordLock()
 
 
 # ---------- job records ----------
@@ -197,60 +216,68 @@ def resolve(url):
 # ---------- worker ----------
 
 _models = {}
+_models_lock = threading.Lock()
 
 
 def models():
-    if not _models:
-        import onnx_asr
-        import onnxruntime as ort
-        import torch
-        torch.set_num_threads(THREADS)
-        if DEVICE != "auto":
-            dev = DEVICE
-        elif torch.cuda.is_available():
-            dev = "cuda"
-        else:  # Apple silicon: the GPU through Metal
-            dev = "mps" if torch.backends.mps.is_available() else "cpu"
-        _models["device"] = dev
-        _models["mimi"] = mimi_file.load_model(dev)
-        # onnxruntime's default spin-waiting threads starve torch's: on a 15 min clip (scripts/bench_overlap.py)
-        # ASR alone went 50 -> 31 s with spinning off, and encode || ASR 87 -> 39 s
-        so = ort.SessionOptions()
-        so.intra_op_num_threads = THREADS
-        so.add_session_config_entry("session.intra_op.allow_spinning", "0")
-        asr = onnx_asr.load_model(ASR_MODEL, sess_options=so)
-        if dev != "cpu":
-            try:
-                # hub/parakeet_native.py. Checked against NVIDIA's NeMo encoder on real batches: native matches to
-                # ~1e-5 relative error, the onnx2torch-converted ONNX export is off by ~4% (median); transcripts of
-                # both are within 0.6% of NeMo's own. Native is also 18% more pipeline throughput on the server.
-                if os.environ.get("MIMI_HUB_ASR_ENCODER", "native") == "native":
-                    from hub import parakeet_native
-                    model_dir = parakeet_native.convert(ASR_MODEL, MODELS_DIR / f"{ASR_MODEL}-hf")
-                    asr.asr._encoder = parakeet_native.NativeEncoder(parakeet_native.load(model_dir, dev))
-                    # identical tokens and timestamps to onnx_asr's loop (548/548 segments of a 43.8 min episode;
-                    # scripts/parakeet_decoder_check.py). It frees the CPU: on Modal's L40S (CPU-bound) pipeline
-                    # throughput went 214 -> 268x, on an M5 Mac 43 -> 47x; the server (ROCm) is GPU-bound and ~3%
-                    # faster without it.
-                    if os.environ.get("MIMI_HUB_ASR_DECODER", "onnx" if torch.version.hip else "native") == "native":
-                        path = parakeet_native.convert_decoder(ASR_MODEL, model_dir)
-                        asr.asr._decoding = parakeet_native.NativeTdtDecoder(
-                            path, dev, asr.asr._blank_idx, asr.asr._vocab_size,
-                            max_symbols=asr.asr._max_tokens_per_step)
-                elif dev == "cuda":
-                    asr.asr._encoder = TorchEncoder(parakeet_encoder())
-            except Exception:
-                traceback.print_exc()  # the ONNX encoder on the CPU still works
-        # Silero VAD is one tiny ONNX call per 32 ms: onnxruntime's default (a spinning thread per core) used 5.1 CPU-s
-        # per 10 min of audio, one thread 1.1 CPU-s in the same wall time
-        vad_so = ort.SessionOptions()
-        vad_so.intra_op_num_threads = vad_so.inter_op_num_threads = 1
-        vad_so.add_session_config_entry("session.intra_op.allow_spinning", "0")
-        vad = onnx_asr.load_vad("silero", sess_options=vad_so)
-        if ASR_BUCKET > 1:
-            vad.recognize_batch = types.MethodType(_bucketed_recognize_batch, vad)
-        _models["asr"] = asr.with_vad(vad).with_timestamps()
+    with _models_lock:  # jobs starting together on a fresh hub must not see half-loaded models
+        if not _models:
+            _models.update(_load_models())
     return _models
+
+
+def _load_models():
+    m = {}
+    import onnx_asr
+    import onnxruntime as ort
+    import torch
+    torch.set_num_threads(THREADS)
+    if DEVICE != "auto":
+        dev = DEVICE
+    elif torch.cuda.is_available():
+        dev = "cuda"
+    else:  # Apple silicon: the GPU through Metal
+        dev = "mps" if torch.backends.mps.is_available() else "cpu"
+    m["device"] = dev
+    m["mimi"] = mimi_file.load_model(dev)
+    # onnxruntime's default spin-waiting threads starve torch's: on a 15 min clip (scripts/bench_overlap.py)
+    # ASR alone went 50 -> 31 s with spinning off, and encode || ASR 87 -> 39 s
+    so = ort.SessionOptions()
+    so.intra_op_num_threads = THREADS
+    so.add_session_config_entry("session.intra_op.allow_spinning", "0")
+    asr = onnx_asr.load_model(ASR_MODEL, sess_options=so)
+    if dev != "cpu":
+        try:
+            # hub/parakeet_native.py. Checked against NVIDIA's NeMo encoder on real batches: native matches to
+            # ~1e-5 relative error, the onnx2torch-converted ONNX export is off by ~4% (median); transcripts of
+            # both are within 0.6% of NeMo's own. Native is also 18% more pipeline throughput on the server.
+            if os.environ.get("MIMI_HUB_ASR_ENCODER", "native") == "native":
+                from hub import parakeet_native
+                model_dir = parakeet_native.convert(ASR_MODEL, MODELS_DIR / f"{ASR_MODEL}-hf")
+                asr.asr._encoder = parakeet_native.NativeEncoder(parakeet_native.load(model_dir, dev))
+                # identical tokens and timestamps to onnx_asr's loop (548/548 segments of a 43.8 min episode;
+                # scripts/parakeet_decoder_check.py). It frees the CPU: on Modal's L40S (CPU-bound) pipeline
+                # throughput went 214 -> 268x, on an M5 Mac 43 -> 47x; the server (ROCm) is GPU-bound and ~3%
+                # faster without it.
+                if os.environ.get("MIMI_HUB_ASR_DECODER", "onnx" if torch.version.hip else "native") == "native":
+                    path = parakeet_native.convert_decoder(ASR_MODEL, model_dir)
+                    asr.asr._decoding = parakeet_native.NativeTdtDecoder(
+                        path, dev, asr.asr._blank_idx, asr.asr._vocab_size,
+                        max_symbols=asr.asr._max_tokens_per_step)
+            elif dev == "cuda":
+                asr.asr._encoder = TorchEncoder(parakeet_encoder())
+        except Exception:
+            traceback.print_exc()  # the ONNX encoder on the CPU still works
+    # Silero VAD is one tiny ONNX call per 32 ms: onnxruntime's default (a spinning thread per core) used 5.1 CPU-s
+    # per 10 min of audio, one thread 1.1 CPU-s in the same wall time
+    vad_so = ort.SessionOptions()
+    vad_so.intra_op_num_threads = vad_so.inter_op_num_threads = 1
+    vad_so.add_session_config_entry("session.intra_op.allow_spinning", "0")
+    vad = onnx_asr.load_vad("silero", sess_options=vad_so)
+    if ASR_BUCKET > 1:
+        vad.recognize_batch = types.MethodType(_bucketed_recognize_batch, vad)
+    m["asr"] = asr.with_vad(vad).with_timestamps()
+    return m
 
 
 # onnx_asr sends VAD segments to the ASR model 8 at a time in time order, each batch padded to its longest segment:
@@ -661,6 +688,7 @@ def encode_live(model, L, pcm, fd, i):
         with L.cond:
             L.ready[c] = True
             L.cond.notify_all()
+        _emit("ready", i, c)
         written += 1
         if written % 4 == 0 or written == n:
             update(i, progress=round(written / n, 3))
@@ -744,6 +772,7 @@ def run(i):
                 f.truncate(len(head) + n_frames * FRAME_BYTES)
             L = Live(i, n_frames, head)
             live[i] = L
+            _emit("live", i, n_frames, head)
             update(i, state="encoding", progress=0.0, duration_s=dur, mimi_bytes=L.total)
             cond = L.cond
         else:
@@ -760,6 +789,7 @@ def run(i):
             finally:
                 os.close(fd)
             live.pop(i, None)  # complete: served as a plain file from now on
+            _emit("unlive", i, False)
             update(i, state="transcribing", progress=0.0)
         t.join()
         if "error" in tx:
@@ -780,7 +810,7 @@ def run(i):
             rec = load(i)
             if rec.get("keep_source") and not rec.get("source_ready"):  # asked for while this run was going
                 save(dict(rec, state="queued", progress=0.0))
-                jobs.put((1, next(_seq), i))
+                _requeue(i)
     except Exception as e:
         traceback.print_exc()
         if L is not None:
@@ -788,6 +818,7 @@ def run(i):
                 L.failed = True
                 L.cond.notify_all()
         live.pop(i, None)
+        _emit("unlive", i, True)
         update(i, state="failed", error=f"{type(e).__name__}: {e}")
     finally:
         if upload and os.path.exists(upload):
@@ -807,6 +838,9 @@ def queue_segments(i, cues=None):
         update(i, segments_state="off")
         return
     update(i, segments_state="pending")
+    if _events is not None:  # in a worker process: the main process runs the (one) segment worker
+        _emit("segments", i, cues)
+        return
     seg_jobs.put((i, cues))
 
 
@@ -830,7 +864,15 @@ def segment_worker():
 _seq = itertools.count()
 
 
-def worker():
+def _requeue(i):
+    if _events is not None:
+        _emit("requeue", i)
+    else:
+        jobs.put((1, next(_seq), i))
+
+
+def _take_job():
+    """The next queued job's id (highest priority first), marked starting."""
     while True:
         _, _, i = jobs.get()
         with lock:
@@ -838,7 +880,136 @@ def worker():
             if not r or r["state"] != "queued":
                 continue  # duplicate entry (re-queued at a higher priority) or already handled
             save(dict(r, state="starting"))
-        run(i)
+        return i
+
+
+def worker():
+    while True:
+        run(_take_job())
+
+
+# ---------- worker processes (MIMI_HUB_PROCS > 1) ----------
+#
+# One Python process can't keep a fast GPU busy: Python and kernel launches are serial. With PROCS > 1, jobs run in
+# that many worker processes, each with its own models and WORKERS jobs at a time; the main process keeps HTTP, the
+# job queue and ad detection. A conversion's Live state is mirrored in the main process from the worker's events
+# (header, chunk ready, done), and readers' wanted chunks are sent to the worker. Modal L40S, 8 x 5 min backlog:
+# 1 process 170x, 6 processes 441x; an M5 MacBook Pro 67 -> 77x with 2 (scripts/throughput_server.py --procs).
+PROCS = int(os.environ.get("MIMI_HUB_PROCS", "1"))
+_events = None  # in a worker process: queue of events for the main process
+
+
+def _emit(*event):
+    if _events is not None:
+        _events.put(event)
+
+
+def _proc_main(commands, events):
+    """A worker process: runs the jobs it's sent, reports Live progress, takes readers' wanted chunks."""
+    global _events
+    _events = events
+    while True:
+        cmd = commands.get()
+        if cmd[0] == "run":
+            def go(i=cmd[1]):
+                try:
+                    run(i)
+                finally:
+                    _emit("done", i)
+            threading.Thread(target=go, daemon=True, name=f"mimi-job-{cmd[1]}").start()
+        elif cmd[0] == "want":
+            _, i, c = cmd
+            L = live.get(i)
+            if L is not None:
+                with L.cond:
+                    if not L.ready[c]:
+                        if c in L.wanted:
+                            L.wanted.remove(c)
+                        L.wanted.insert(0, c)
+                        L.cond.notify_all()
+
+
+class _RemoteLive(Live):
+    """The main process's mirror of a conversion running in a worker process."""
+
+    def __init__(self, i, n_frames, header, commands):
+        super().__init__(i, n_frames, header)
+        self.commands = commands
+
+    def wait_ready(self, c, timeout=300):
+        if not self.ready[c]:
+            self.commands.put(("want", self.i, c))
+        return super().wait_ready(c, timeout)
+
+
+class _Procs:
+    def __init__(self, n):
+        import multiprocessing
+        self.ctx = multiprocessing.get_context("spawn")
+        self.events = self.ctx.Queue()
+        self.done = {}  # job id -> threading.Event
+        self.owner = {}  # job id -> worker process index
+        self.slots = []
+        for k in range(n):
+            self.slots.append(None)
+            self._spawn(k)
+        threading.Thread(target=self._listen, daemon=True, name="mimi-proc-events").start()
+
+    def _spawn(self, k):
+        commands = self.ctx.Queue()
+        p = self.ctx.Process(target=_proc_main, args=(commands, self.events), daemon=True, name=f"mimi-proc-{k}")
+        p.start()
+        self.slots[k] = (p, commands)
+
+    def _listen(self):
+        while True:
+            kind, i, *rest = self.events.get()
+            if kind == "live":
+                k = self.owner.get(i)
+                live[i] = _RemoteLive(i, rest[0], rest[1], self.slots[k][1] if k is not None else self.ctx.Queue())
+            elif kind == "ready":
+                L = live.get(i)
+                if L is not None:
+                    with L.cond:
+                        L.ready[rest[0]] = True
+                        L.cond.notify_all()
+            elif kind == "unlive":
+                L = live.pop(i, None)
+                if L is not None and rest[0]:
+                    with L.cond:
+                        L.failed = True
+                        L.cond.notify_all()
+            elif kind == "segments":
+                queue_segments(i, rest[0])
+            elif kind == "requeue":
+                jobs.put((1, next(_seq), i))
+            elif kind == "done" and i in self.done:
+                self.done[i].set()
+
+    def dispatcher(self, k):
+        while True:
+            i = _take_job()
+            p, commands = self.slots[k]
+            if not p.is_alive():
+                self._spawn(k)
+                p, commands = self.slots[k]
+            self.owner[i], self.done[i] = k, threading.Event()
+            commands.put(("run", i))
+            while not self.done[i].wait(5):
+                if not p.is_alive():  # the process died with the job (e.g. out of memory): fail it, restart
+                    L = live.pop(i, None)
+                    if L is not None:
+                        with L.cond:
+                            L.failed = True
+                            L.cond.notify_all()
+                    update(i, state="failed", error=f"worker process exited ({p.exitcode})")
+                    self._spawn(k)
+                    break
+            self.done.pop(i, None)
+            self.owner.pop(i, None)
+
+
+_procs = None
 
 
 @app.on_event("startup")
@@ -851,8 +1022,16 @@ def start():
             jobs.put((r.get("priority", 1), next(_seq), r["id"]))
         elif r["state"] == "ready" and r.get("segments_state") not in ("ready", "failed", "off"):
             queue_segments(r["id"])  # converted before segment detection existed, or interrupted
-    for k in range(WORKERS):
-        threading.Thread(target=worker, daemon=True, name=f"mimi-worker-{k}").start()
+    global _procs
+    if PROCS > 1:
+        _procs = _Procs(PROCS)
+        for k in range(PROCS):
+            for w in range(WORKERS):
+                threading.Thread(target=_procs.dispatcher, args=(k,), daemon=True,
+                                 name=f"mimi-dispatch-{k}-{w}").start()
+    else:
+        for k in range(WORKERS):
+            threading.Thread(target=worker, daemon=True, name=f"mimi-worker-{k}").start()
     threading.Thread(target=segment_worker, daemon=True, name="mimi-segments").start()
 
 
