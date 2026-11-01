@@ -42,6 +42,7 @@ import tempfile
 import threading
 import time
 import traceback
+import types
 import urllib.error
 import urllib.request
 from pathlib import Path
@@ -187,8 +188,41 @@ def models():
                 asr.asr._encoder = TorchEncoder(parakeet_encoder())
             except Exception:
                 traceback.print_exc()  # the ONNX encoder on the CPU still works
-        _models["asr"] = asr.with_vad(onnx_asr.load_vad("silero")).with_timestamps()
+        vad = onnx_asr.load_vad("silero")
+        if ASR_BUCKET > 1:
+            vad.recognize_batch = types.MethodType(_bucketed_recognize_batch, vad)
+        _models["asr"] = asr.with_vad(vad).with_timestamps()
     return _models
+
+
+# onnx_asr sends VAD segments to the ASR model 8 at a time in time order, each batch padded to its longest segment:
+# 61% of the encoder's input was padding on a 43.8 min episode. Batching all of an episode's segments by length
+# (ASR_BUCKET at a time) cut the encoder from 14.3 to 8.3 s on the server (scripts/parakeet_encoder_server.py).
+ASR_BUCKET = int(os.environ.get("MIMI_HUB_ASR_BUCKET", "16"))  # 0 / 1: onnx_asr's own batching
+
+
+def _bucketed_recognize_batch(self, asr, waveforms, waveforms_len, sample_rate, asr_kwargs, batch_size=8,
+                              **kwargs):
+    """Drop-in for onnx_asr BaseVad.recognize_batch: segment each waveform fully, recognize the segments in
+    length-sorted batches of ASR_BUCKET, and yield the results in time order."""
+    from onnx_asr.utils import pad_list
+    from onnx_asr.vad import TimestampedSegmentResult
+
+    def recognize(waveform, segments):
+        segments = list(segments)
+        order = sorted(range(len(segments)), key=lambda i: segments[i][1] - segments[i][0])
+        results = [None] * len(segments)
+        for i in range(0, len(order), ASR_BUCKET):
+            idx = order[i:i + ASR_BUCKET]
+            batch = [segments[j] for j in idx]
+            for res, j in zip(asr.recognize_batch(*pad_list([waveform[s:e] for s, e in batch]), **asr_kwargs), idx,
+                              strict=True):
+                s, e = segments[j]
+                results[j] = TimestampedSegmentResult(s / sample_rate, e / sample_rate, res.text, res.timestamps,
+                                                      res.tokens, res.logprobs)
+        return iter(results)
+
+    return map(recognize, waveforms, self.segment_batch(waveforms, waveforms_len, sample_rate, **kwargs))
 
 
 # ---------- Parakeet's encoder on the GPU ----------
