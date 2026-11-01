@@ -133,6 +133,116 @@ def bench(gpu: str) -> dict:
     return res
 
 
+@app.function(gpu="T4", cpu=CPU_CORES, memory=MEM_GIB * 1024, timeout=1800)
+def asr_profile(gpu: str) -> dict:
+    """Where Parakeet's time goes on 43.8 min: VAD, preprocessing, encoder, decoder (on CUDA, then on 1 CPU thread)."""
+    import time
+
+    import librosa
+    import onnxruntime as ort
+    import soundfile as sf
+
+    ort.preload_dlls()
+    import onnx_asr
+
+    wav, sr = sf.read("/data/ref_24k.wav", dtype="float32")
+    w16 = librosa.resample(wav, orig_sr=sr, target_sr=16000)
+    vad = onnx_asr.load_vad("silero", providers=["CPUExecutionProvider"])
+    totals, counts = {}, {}
+
+    def wrap(obj, attr, key, method="run"):
+        target = getattr(obj, attr)
+        f = getattr(target, method) if method else target
+
+        def timed(*a, **k):
+            t = time.perf_counter()
+            try:
+                return f(*a, **k)
+            finally:
+                totals[key] = totals.get(key, 0.0) + time.perf_counter() - t
+                counts[key] = counts.get(key, 0) + 1
+        if method:
+            setattr(target, method, timed)
+        else:
+            setattr(obj, attr, timed)
+
+    wrap(vad, "_model", "vad")
+    res = {"gpu": gpu, "vcpus": os.cpu_count()}
+    # ORT's CUDA provider benchmarks every cuDNN conv algorithm for each new input shape by default (EXHAUSTIVE);
+    # VAD batches all differ in length, so it searches on every encoder call
+    for search in ("EXHAUSTIVE", "HEURISTIC"):
+        base = onnx_asr.load_model("nemo-parakeet-tdt-0.6b-v2", "/models/parakeet",
+                                   providers=[("CUDAExecutionProvider", {"cudnn_conv_algo_search": search}),
+                                              "CPUExecutionProvider"])
+        wrap(base.asr, "_encoder", "encoder")
+        wrap(base.asr, "_decoder_joint", "decoder")
+        wrap(base.asr, "_preprocessor", "preprocess", method=None)
+        asr = base.with_vad(vad).with_timestamps()
+        list(asr.recognize(w16[: 60 * 16000], sample_rate=16000))  # warm-up
+        totals.clear()
+        counts.clear()
+        t = time.perf_counter()
+        segs = list(asr.recognize(w16, sample_rate=16000))
+        res[search.lower()] = {"total_s": round(time.perf_counter() - t, 1),
+                               **{k: round(v, 1) for k, v in totals.items()},
+                               "words": sum(len(x.text.split()) for x in segs)}
+    return res
+
+
+@app.function(gpu="H100", cpu=CPU_CORES, memory=MEM_GIB * 1024, timeout=3600)
+def throughput(gpu: str, ns: list, clip_min: float = 5.0, search: str = "HEURISTIC") -> dict:
+    """Aggregate speed with n episodes in flight at once (different clip_min-long slices of the episode), each run
+    as the hub runs one: Mimi encode || (ASR -> diarization). Mimi and Parakeet are shared; pyannote is per episode."""
+    import threading
+    import time
+
+    import librosa
+    import onnxruntime as ort
+    import soundfile as sf
+    import torch
+
+    ort.preload_dlls()
+    import mimi_file
+    import onnx_asr
+    import pyannote_gpu
+
+    wav, sr = sf.read("/data/ref_24k.wav", dtype="float32")
+    n_max, step = max(ns), int(clip_min * 60 * sr)
+    clips = [wav[k * step:(k + 1) * step] for k in range(n_max)]
+    assert all(len(c) == step for c in clips), "episode too short for that many clips"
+    clips16 = [librosa.resample(c, orig_sr=sr, target_sr=16000) for c in clips]
+    mimi = mimi_file.load_model("cuda")
+    base = onnx_asr.load_model("nemo-parakeet-tdt-0.6b-v2", "/models/parakeet",
+                               providers=[("CUDAExecutionProvider", {"cudnn_conv_algo_search": search}),
+                                          "CPUExecutionProvider"])
+    asr = base.with_vad(onnx_asr.load_vad("silero", providers=["CPUExecutionProvider"])).with_timestamps()
+    pipes = [pyannote_gpu.load("cuda", path="/models/pyannote") for _ in range(n_max)]
+
+    def episode(k):
+        enc = threading.Thread(target=mimi_file.encode_array, args=(mimi, clips[k]))
+        enc.start()
+        list(asr.recognize(clips16[k], sample_rate=16000))
+        pipes[k]({"waveform": torch.from_numpy(clips16[k])[None], "sample_rate": 16000})
+        enc.join()
+
+    for k in range(n_max):  # warm-up: every pyannote copy, and the shapes of a full clip
+        pipes[k]({"waveform": torch.from_numpy(clips16[k][: 30 * 16000])[None], "sample_rate": 16000})
+    episode(0)
+    res = {"gpu": gpu, "device": torch.cuda.get_device_name(0), "clip_s": clip_min * 60, "search": search, "runs": {}}
+    for n in ns:
+        torch.cuda.synchronize()
+        t = time.perf_counter()
+        threads = [threading.Thread(target=episode, args=(k,)) for k in range(n)]
+        [th.start() for th in threads]
+        [th.join() for th in threads]
+        torch.cuda.synchronize()
+        wall = time.perf_counter() - t
+        res["runs"][str(n)] = {"wall_s": round(wall, 1), "x_rt": round(n * clip_min * 60 / wall, 1),
+                               "gpu_mem_gb": round(torch.cuda.max_memory_allocated() / 2**30, 1)}
+        print(f"THROUGHPUT {gpu} n={n}: {res['runs'][str(n)]}", flush=True)
+    return res
+
+
 @app.function(gpu="T4", cpu=2.0, timeout=600)
 def check() -> dict:
     """Cheap preflight: driver, torch CUDA and onnxruntime's CUDA provider on a real Parakeet session."""
@@ -197,3 +307,35 @@ def main(gpus: str = "T4,L4,A10,L40S,A100-40GB,H100", preflight: bool = True, wa
         row(results[-1])
     out.write_text(json.dumps(results, indent=1))
     print(f"\nresults: {out}")
+
+
+@app.local_entrypoint()
+def profile(gpus: str = "L40S,H100"):
+    """modal run scripts/modal_bench.py::profile [--gpus L40S,H100]: Parakeet's time split, per GPU host."""
+    calls = {g.strip(): asr_profile.with_options(gpu=g.strip()).spawn(g.strip()) for g in gpus.split(",") if g.strip()}
+    for g, call in calls.items():
+        try:
+            print("PROFILE " + json.dumps(call.get(timeout=1500)), flush=True)
+        except Exception as e:
+            print(f"PROFILE {g} failed: {type(e).__name__}: {e}", flush=True)
+
+
+@app.local_entrypoint()
+def batch(gpus: str = "H100,L40S,A10", ns: str = "1,2,4,8", clip_min: float = 5.0, search: str = "HEURISTIC"):
+    """modal run scripts/modal_bench.py::batch: throughput with 1..n episodes in flight, and $ per audio hour."""
+    counts = [int(x) for x in ns.split(",")]
+    calls = {g.strip(): throughput.with_options(gpu=g.strip()).spawn(g.strip(), counts, clip_min, search)
+             for g in gpus.split(",") if g.strip()}
+    results = []
+    for g, call in calls.items():
+        try:
+            r = call.get(timeout=2400)
+        except Exception as e:
+            print(f"{g}: failed: {type(e).__name__}: {e}", flush=True)
+            continue
+        results.append(r)
+        for n, run in r["runs"].items():
+            cost = (PRICE.get(g, 0) + CPU_MEM_PRICE) * 3600 / run["x_rt"]
+            print(f"BATCH {g:10s} n={n:>2s}  wall {run['wall_s']:6.1f} s  {run['x_rt']:6.1f}x real time  "
+                  f"${cost:.4f}/audio h  peak {run['gpu_mem_gb']} GB", flush=True)
+    (ROOT / "outputs/modal_batch.json").write_text(json.dumps(results, indent=1))
