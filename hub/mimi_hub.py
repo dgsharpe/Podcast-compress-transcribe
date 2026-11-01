@@ -16,6 +16,10 @@ API (JSON unless noted):
                                                 job is "encoding": bytes are served as their chunk is encoded, so a
                                                 client can play (and seek in) a .mimi that is still being made.
   GET  /v1/episodes/{id}.vtt                    the transcript
+  GET  /v1/episodes/{id}.src                    the original audio exactly as processed (only with keep_source):
+                                                for clients that want the transcript and ad segments but not the
+                                                .mimi. Dynamically inserted ads differ between downloads, so a
+                                                fresh copy from the publisher may not match their timings.
   GET  /v1/episodes/{id}.segments.json          ads / self-promotion to skip, found by an LLM after transcription
                                                 ({"model", "segments": [{"start", "end", "kind": "ad" | "promo",
                                                 "label"}]}, seconds); the record's "segments_state" says
@@ -109,19 +113,38 @@ def update(i, **kw):
         return save(r)
 
 
-def enqueue(i, priority=1, **fields):
-    """Queue job i (priority 0 = someone is streaming it, 1 = download / background)."""
+def enqueue(i, priority=1, keep_source=False, **fields):
+    """Queue job i (priority 0 = someone is streaming it, 1 = download / background). [keep_source]: keep the
+    original audio as processed and serve it (.src)."""
     with lock:
         r = load(i)
         if r and r["state"] != "failed":
+            if keep_source and not r.get("keep_source"):
+                r = save(dict(r, keep_source=True))
+                if r["state"] == "ready":  # processed without its source: redo it keeping one, so all match
+                    r = save(dict(r, state="queued", priority=priority, progress=0.0, source_ready=False))
+                    jobs.put((priority, next(_seq), i))
+                    return r
+                # in progress: run() queues it again when done
             if r["state"] == "queued" and priority < r.get("priority", 1):  # bump: re-queue at higher priority
                 r = save(dict(r, priority=priority))
                 jobs.put((priority, next(_seq), i))
             return r  # already queued, running or done
         r = save(dict(id=i, state="queued", priority=priority, progress=0.0, error=None, created=time.time(),
-                      **fields))
+                      keep_source=keep_source, **fields))
     jobs.put((priority, next(_seq), i))
     return r
+
+
+def fetch_source(url, i):
+    """Download [url] to <id>.src; its MIME type."""
+    path, tmp = DATA / f"{i}.src", DATA / f"{i}.src.tmp"
+    req = urllib.request.Request(url, headers=UA)
+    with urllib.request.urlopen(req, timeout=60) as resp, open(tmp, "wb") as f:
+        ctype = resp.headers.get_content_type()
+        shutil.copyfileobj(resp, f, 1 << 20)
+    tmp.replace(path)
+    return ctype if ctype.startswith("audio/") else "audio/mpeg"
 
 
 # ---------- URL resolution ----------
@@ -658,6 +681,11 @@ def run(i):
                     err = e
             if src is None or dur is None:
                 raise RuntimeError(f"cannot read source: {err}")
+            if r.get("keep_source"):  # process exactly the bytes the client will get
+                ctype = fetch_source(src, i)
+                src = str(DATA / f"{i}.src")
+                dur = probe(src)
+                update(i, source_ready=True, source_type=ctype, source_bytes=os.path.getsize(src))
         n_frames = int(dur * FPS) + 13  # + ~1 s: ffprobe estimates can run short; the tail is padded
         head, _ = mimi_file.header(n_frames, 32, dict(title=r.get("title", ""), source=r.get("url", ""), id=i,
                                                       encoder="transformers MimiModel", duration_s=dur))
@@ -700,6 +728,11 @@ def run(i):
         (DATA / f"{i}.vtt.tmp").replace(DATA / f"{i}.vtt")
         update(i, state="ready", progress=1.0, asr=ASR_MODEL, device=m["device"],
                speakers=len({t[2] for t in turns}), diarization=tx["diarization"] if turns else None)
+        with lock:
+            rec = load(i)
+            if rec.get("keep_source") and not rec.get("source_ready"):  # asked for while this run was going
+                save(dict(rec, state="queued", progress=0.0))
+                jobs.put((1, next(_seq), i))
     except Exception as e:
         traceback.print_exc()
         if L is not None:
@@ -796,6 +829,7 @@ class ConvertRequest(BaseModel):
     id: str | None = None
     title: str | None = None
     priority: int = 1  # 0: a client is about to stream it
+    keep_source: bool = False  # also keep and serve the original audio (GET .src)
 
 
 @app.post("/v1/convert", status_code=202)
@@ -808,8 +842,8 @@ def convert(req: ConvertRequest, authorization: str | None = Header(None)):
     if req.id:
         check_id(req.id)
         i = req.id
-    return enqueue(i, priority=min(1, max(0, req.priority)), url=req.url, audio_url=audio,
-                   title=req.title or title)
+    return enqueue(i, priority=min(1, max(0, req.priority)), keep_source=req.keep_source, url=req.url,
+                   audio_url=audio, title=req.title or title)
 
 
 @app.post("/v1/upload", status_code=202)
@@ -909,6 +943,12 @@ def episode(name: str, request: Request, authorization: str | None = Header(None
             time.sleep(0.25)
         if L is not None:
             return stream_live(L, request.headers.get("range"))
+    if ext == "src":
+        r = load(stem)
+        p = DATA / f"{stem}.src"
+        if not r or not r.get("source_ready") or not p.exists():
+            raise HTTPException(404, "no source kept")
+        return FileResponse(p, media_type=r.get("source_type") or "audio/mpeg", filename=f"{stem}.src")
     if ext in ("mimi", "vtt"):
         p = DATA / f"{stem}.{ext}"
         if not p.exists():
