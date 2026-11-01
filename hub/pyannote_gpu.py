@@ -103,14 +103,18 @@ def get_embeddings(self, file, binary_segmentations, exclude_overlap=False, hook
     return np.concatenate(out)
 
 
-def load(device="cuda", path=None):
-    """The community-1 pipeline on [device] with the batched embedding step (model from the HF cache, offline)."""
+def load(device="cuda", path=None, segmentation_device=None):
+    """The community-1 pipeline on [device] with the batched embedding step (model from the HF cache, offline).
+    [segmentation_device] (default: [device]) moves just the segmentation model, e.g. to the CPU."""
     from huggingface_hub import snapshot_download
     from pyannote.audio import Pipeline
     pipeline = Pipeline.from_pretrained(path or snapshot_download(MODEL, local_files_only=True))
     pipeline.to(torch.device(device))
+    if segmentation_device:
+        pipeline._segmentation.to(torch.device(segmentation_device))
     if torch.device(device).type == "cuda" and torch.version.hip:  # ROCm only; NVIDIA needs none of this
-        _without_miopen(pipeline._segmentation.model)
+        if pipeline._segmentation.device.type == "cuda":
+            _without_miopen(pipeline._segmentation.model)
         _freeze_bn(pipeline._embedding.model_)
     pipeline.get_embeddings = types.MethodType(get_embeddings, pipeline)
     pipeline._segmentation.step = STEP_FRAC * pipeline._segmentation.duration

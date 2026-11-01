@@ -26,9 +26,10 @@ def main():
     from pyannote.metrics.diarization import DiarizationErrorRate
 
     steps = [float(x) for x in (sys.argv[1:] or ["0.1", "0.2", "0.25"])]
+    seg_device = os.environ.get("SEG_DEVICE")  # e.g. cpu: segmentation model on the CPU, embeddings on the GPU
     wav, sr = sf.read(ROOT / "data/ref/ref_24k.wav", dtype="float32")
     w16 = librosa.resample(wav, orig_sr=sr, target_sr=16000)
-    pipe = pyannote_gpu.load("cuda")
+    pipe = pyannote_gpu.load("cuda", segmentation_device=seg_device)
     seg = pipe._segmentation
     ref = None
     for frac in steps:
@@ -44,7 +45,8 @@ def main():
         ann = getattr(out, "speaker_diarization", out)
         ref = ann if ref is None else ref
         top = sorted((round(ann.label_duration(k) / 60, 1) for k in ann.labels()), reverse=True)[:4]
-        res = {"find_mode": os.environ.get("MIOPEN_FIND_MODE"), "step_frac": frac, "wall_s": round(wall, 1),
+        res = {"find_mode": os.environ.get("MIOPEN_FIND_MODE"), "seg_device": seg_device or "cuda",
+               "threads": torch.get_num_threads(), "step_frac": frac, "wall_s": round(wall, 1),
                **{k: round(v, 1) for k, v in f["timing"].items() if k != "total"},
                "der_vs_first": round(DiarizationErrorRate()(ref, ann), 4), "speakers_min": top}
         print("DIAR " + json.dumps(res), flush=True)

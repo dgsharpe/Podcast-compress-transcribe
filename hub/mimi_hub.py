@@ -330,7 +330,8 @@ def _pyannote_turns(wav16):
     import torch
     from hub import pyannote_gpu
     if "diar_pyannote" not in _models:  # from the HF cache; no token at runtime
-        _models["diar_pyannote"] = pyannote_gpu.load(_models.get("device", "cpu"))
+        _models["diar_pyannote"] = pyannote_gpu.load(_models.get("device", "cpu"),
+                                                     segmentation_device=os.environ.get("MIMI_HUB_SEG_DEVICE") or None)
     out = _models["diar_pyannote"]({"waveform": torch.from_numpy(wav16)[None], "sample_rate": 16000})
     ann = getattr(out, "speaker_diarization", out)
     return [(t.start, t.end, spk) for t, _, spk in ann.itertracks(yield_label=True)]
@@ -529,30 +530,68 @@ def pick(L, pcm):
     return None
 
 
+# Chunks are encoded in order as one stream, carrying the encoder's KV and conv padding caches: the codes match a
+# single uninterrupted encode (99.99% on 5 min, vs 98.7% for the old windows with 20 s of left context) and it's 27%
+# less GPU work, since no context is re-encoded (43.8 min: 17.2 -> 12.6 s on the server; scripts/mimi_streaming_server.py).
+# A chunk a reader is waiting for ahead of the stream is encoded at once with 20 s of left context, as before; the
+# stream later passes over it to keep its state, without rewriting bytes that may have been served.
+MIMI_STREAMING = os.environ.get("MIMI_HUB_MIMI_STREAMING", "1") != "0"
+
+
 def encode_live(model, L, pcm, fd, i):
     import numpy as np
     import torch
     spf = mimi_file.SPF
-    for done in range(1, len(L.bounds) + 1):
+    dev = next(model.parameters()).device
+    n = len(L.bounds)
+
+    def has_audio(c):
+        return pcm.done or pcm.avail >= L.bounds[c][1] * spf
+
+    def next_job(seq):
+        """("stream" | "window", chunk), or None to wait for audio."""
+        if not MIMI_STREAMING:
+            c = pick(L, pcm)
+            return None if c is None else ("window", c)
+        L.wanted = [c for c in L.wanted if not L.ready[c]]
+        ahead = next((c for c in L.wanted if c != seq and has_audio(c)), None)
+        if ahead is not None:
+            return "window", ahead
+        return ("stream", seq) if has_audio(seq) else None
+
+    seq, kv, pad, written = 0, None, None, 0  # the stream's next chunk and caches
+    while not all(L.ready):
         with L.cond:
-            while (c := pick(L, pcm)) is None:
+            while (job := next_job(seq)) is None:
                 if pcm.error:
                     raise pcm.error
                 L.cond.wait(0.5)
+        kind, c = job
         f0, f1 = L.bounds[c]
-        lo = max(0, (f0 - CTX) * spf)
-        x = torch.from_numpy(pcm.buf[lo:f1 * spf].copy())[None, None].to(next(model.parameters()).device)
-        with torch.inference_mode():
-            codes = model.encode(x, num_quantizers=32).audio_codes[0].T.cpu().numpy()
-        seg = codes[(f0 * spf - lo) // spf:][: f1 - f0]
+        if kind == "stream":
+            x = torch.from_numpy(pcm.buf[f0 * spf:f1 * spf].copy())[None, None].to(dev)
+            with torch.inference_mode():
+                o = model.encode(x, num_quantizers=32, encoder_past_key_values=kv, padding_cache=pad,
+                                 use_streaming=True)
+            kv, pad, seq = o.encoder_past_key_values, o.padding_cache, seq + 1
+            if L.ready[c]:
+                continue  # encoded early for a reader: keep its bytes, the pass just advanced the caches
+            seg = o.audio_codes[0].T.cpu().numpy()[: f1 - f0]
+        else:
+            lo = max(0, (f0 - CTX) * spf)
+            x = torch.from_numpy(pcm.buf[lo:f1 * spf].copy())[None, None].to(dev)
+            with torch.inference_mode():
+                codes = model.encode(x, num_quantizers=32).audio_codes[0].T.cpu().numpy()
+            seg = codes[(f0 * spf - lo) // spf:][: f1 - f0]
         if len(seg) < f1 - f0:  # pad (only at the very end)
             seg = np.concatenate([seg, np.repeat(seg[-1:], f1 - f0 - len(seg), axis=0)])
         os.pwrite(fd, mimi_file.pack(seg, 32).tobytes(), L.data_offset + f0 * FRAME_BYTES)
         with L.cond:
             L.ready[c] = True
             L.cond.notify_all()
-        if done % 4 == 0 or done == len(L.bounds):
-            update(i, progress=round(done / len(L.bounds), 3))
+        written += 1
+        if written % 4 == 0 or written == n:
+            update(i, progress=round(written / n, 3))
 
 
 def transcribe(m, pcm, cond, out, on_cues=None):
