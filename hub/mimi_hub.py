@@ -205,7 +205,12 @@ def models():
         import onnxruntime as ort
         import torch
         torch.set_num_threads(THREADS)
-        dev = DEVICE if DEVICE != "auto" else ("cuda" if torch.cuda.is_available() else "cpu")
+        if DEVICE != "auto":
+            dev = DEVICE
+        elif torch.cuda.is_available():
+            dev = "cuda"
+        else:  # Apple silicon: the GPU through Metal
+            dev = "mps" if torch.backends.mps.is_available() else "cpu"
         _models["device"] = dev
         _models["mimi"] = mimi_file.load_model(dev)
         # onnxruntime's default spin-waiting threads starve torch's: on a 15 min clip (scripts/bench_overlap.py)
@@ -214,7 +219,7 @@ def models():
         so.intra_op_num_threads = THREADS
         so.add_session_config_entry("session.intra_op.allow_spinning", "0")
         asr = onnx_asr.load_model(ASR_MODEL, sess_options=so)
-        if dev == "cuda":
+        if dev != "cpu":
             try:
                 # hub/parakeet_native.py. Checked against NVIDIA's NeMo encoder on real batches: native matches to
                 # ~1e-5 relative error, the onnx2torch-converted ONNX export is off by ~4% (median); transcripts of
@@ -222,12 +227,26 @@ def models():
                 if os.environ.get("MIMI_HUB_ASR_ENCODER", "native") == "native":
                     from hub import parakeet_native
                     model_dir = parakeet_native.convert(ASR_MODEL, MODELS_DIR / f"{ASR_MODEL}-hf")
-                    asr.asr._encoder = parakeet_native.NativeEncoder(parakeet_native.load(model_dir, "cuda"))
-                else:
+                    asr.asr._encoder = parakeet_native.NativeEncoder(parakeet_native.load(model_dir, dev))
+                    # identical tokens and timestamps to onnx_asr's loop (548/548 segments of a 43.8 min episode;
+                    # scripts/parakeet_decoder_check.py). It frees the CPU: on Modal's L40S (CPU-bound) pipeline
+                    # throughput went 214 -> 268x, on an M5 Mac 43 -> 47x; the server (ROCm) is GPU-bound and ~3%
+                    # faster without it.
+                    if os.environ.get("MIMI_HUB_ASR_DECODER", "onnx" if torch.version.hip else "native") == "native":
+                        path = parakeet_native.convert_decoder(ASR_MODEL, model_dir)
+                        asr.asr._decoding = parakeet_native.NativeTdtDecoder(
+                            path, dev, asr.asr._blank_idx, asr.asr._vocab_size,
+                            max_symbols=asr.asr._max_tokens_per_step)
+                elif dev == "cuda":
                     asr.asr._encoder = TorchEncoder(parakeet_encoder())
             except Exception:
                 traceback.print_exc()  # the ONNX encoder on the CPU still works
-        vad = onnx_asr.load_vad("silero")
+        # Silero VAD is one tiny ONNX call per 32 ms: onnxruntime's default (a spinning thread per core) used 5.1 CPU-s
+        # per 10 min of audio, one thread 1.1 CPU-s in the same wall time
+        vad_so = ort.SessionOptions()
+        vad_so.intra_op_num_threads = vad_so.inter_op_num_threads = 1
+        vad_so.add_session_config_entry("session.intra_op.allow_spinning", "0")
+        vad = onnx_asr.load_vad("silero", sess_options=vad_so)
         if ASR_BUCKET > 1:
             vad.recognize_batch = types.MethodType(_bucketed_recognize_batch, vad)
         _models["asr"] = asr.with_vad(vad).with_timestamps()
@@ -404,7 +423,7 @@ def diarize(wav16):
     """([(start_s, end_s, speaker_number)], diarizer name), speakers numbered 1.. by first appearance."""
     with _diar_lock:  # one diarizer, not shared across threads
         segs = None
-        if DIARIZER == "pyannote" or (DIARIZER == "auto" and _models.get("device") == "cuda"):
+        if DIARIZER == "pyannote" or (DIARIZER == "auto" and _models.get("device", "cpu") != "cpu"):
             try:
                 segs, name = _pyannote_turns(wav16), PYANNOTE_MODEL
             except Exception:
@@ -586,7 +605,7 @@ def mimi_encode(model, x, **kw):
     """model.encode(x, num_quantizers=32, **kw), with the encoder in fp16 on a GPU (MIMI_FP16)."""
     import torch
     with torch.inference_mode():
-        with torch.autocast("cuda", dtype=torch.float16, enabled=MIMI_FP16 and x.is_cuda):
+        with torch.autocast(x.device.type, dtype=torch.float16, enabled=MIMI_FP16 and x.device.type != "cpu"):
             o = model.encoder(x, past_key_values=kw.get("encoder_past_key_values"),
                               padding_cache=kw.get("padding_cache"), use_streaming=kw.get("use_streaming"))
         codes = model.quantizer.encode(o.latents.float(), 32).transpose(0, 1)
@@ -668,7 +687,7 @@ def transcribe(m, pcm, cond, out, on_cues=None):
 
         # pyannote on the GPU waits for ASR: the GPU is the bottleneck either way (the stages' times add up), and
         # this way the cues, and so ad detection, are ready ~30 s sooner. sherpa (CPU) runs alongside.
-        diar_on_gpu = m.get("device") == "cuda" and DIARIZER in ("auto", "pyannote")
+        diar_on_gpu = m.get("device", "cpu") != "cpu" and DIARIZER in ("auto", "pyannote")
         d = threading.Thread(target=speakers, daemon=True, name="mimi-diarize")
         if not diar_on_gpu:
             d.start()

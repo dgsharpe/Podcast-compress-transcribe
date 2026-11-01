@@ -1,17 +1,21 @@
-"""Throughput experiments on the server's GPU: a backlog of clips processed by c concurrent workers.
+"""Throughput experiments on a GPU: a backlog of clips processed by concurrent workers.
 
-    .venv-rocm/bin/python scripts/throughput_server.py [--workers 1,2,4] [--clips 8] [--clip-min 5] [--label E0]
+    .venv-rocm/bin/python scripts/throughput_server.py [--workers 1,2,4] [--procs 1] [--clips 8] [--clip-min 5]
+                                                       [--label E0] [--tf32]
 
-E0 (baseline) runs each clip exactly as mimi-hub runs an episode, with the hub's own models and settings:
-Mimi encode || (Parakeet ASR -> pyannote diarization, which the hub serialises with a lock). Reports aggregate
-x real time (clip audio / wall time) and the mean GPU busy % (amdgpu's gpu_busy_percent, sampled every 100 ms).
-Results are appended to outputs/throughput_server.jsonl.
+Each clip runs exactly as mimi-hub runs an episode, with the hub's own models and settings: Mimi encode ||
+(Parakeet ASR -> pyannote diarization, which the hub serialises with a lock). [--procs] P > 1 splits the clips over P
+processes, each with its own models and [workers] threads (does one Python process / GIL limit a fast GPU?).
+Reports aggregate x real time (clip audio / wall time), the mean GPU busy % (amdgpu's gpu_busy_percent or NVML,
+sampled every 100 ms), CPU cores in use, and per-clip stage times. Results are appended to
+outputs/throughput_server.jsonl. scripts/modal_hub_bench.py runs this on Modal's GPUs.
 """
 
 import argparse
 import json
 import os
 import queue
+import resource
 import sys
 import tempfile
 import threading
@@ -26,19 +30,41 @@ os.environ.setdefault("HF_HUB_OFFLINE", "1")
 BUSY = Path("/sys/class/drm/card1/device/gpu_busy_percent")
 
 
+def _busy_reader():
+    """A function returning the GPU's busy % now, or None if neither amdgpu's sysfs file nor NVML is there."""
+    if BUSY.exists():
+        return lambda: int(BUSY.read_text())
+    if sys.platform == "darwin":  # Apple silicon: the GPU's own utilization counter
+        import re
+        import subprocess
+
+        def ioreg():
+            out = subprocess.run(["ioreg", "-r", "-d", "1", "-w", "0", "-c", "IOAccelerator"], capture_output=True,
+                                 text=True).stdout
+            return int(re.search(r'"Device Utilization %"=(\d+)', out).group(1))
+        return ioreg
+    try:
+        import pynvml
+        pynvml.nvmlInit()
+        h = pynvml.nvmlDeviceGetHandleByIndex(0)
+        return lambda: pynvml.nvmlDeviceGetUtilizationRates(h).gpu
+    except Exception:
+        return None
+
+
 class GpuBusy:
-    """Mean of amdgpu's busy % while running."""
+    """Mean GPU busy % while running."""
 
     def __enter__(self):
-        self.samples, self.stop = [], threading.Event()
+        self.samples, self.stop, self.read = [], threading.Event(), _busy_reader()
         self.thread = threading.Thread(target=self._run, daemon=True)
         self.thread.start()
         return self
 
     def _run(self):
-        while not self.stop.wait(0.1):
+        while self.read and not self.stop.wait(0.1):
             try:
-                self.samples.append(int(BUSY.read_text()))
+                self.samples.append(self.read())
             except (OSError, ValueError):
                 pass
 
@@ -59,7 +85,7 @@ def hub_encode(model, wav):
     kv, pad, out = None, None, []
     with torch.inference_mode():
         for f0, f1 in mimi_hub.chunk_bounds(len(wav) // mimi_file.SPF):
-            x = torch.from_numpy(wav[f0 * mimi_file.SPF:f1 * mimi_file.SPF].copy())[None, None].cuda()
+            x = torch.from_numpy(wav[f0 * mimi_file.SPF:f1 * mimi_file.SPF].copy())[None, None].to(model.device)
             o = mimi_hub.mimi_encode(model, x, encoder_past_key_values=kv, padding_cache=pad, use_streaming=True)
             kv, pad = o.encoder_past_key_values, o.padding_cache
             out.append(o.audio_codes[0].T.cpu().numpy())
@@ -67,18 +93,28 @@ def hub_encode(model, wav):
 
 
 def baseline_episode(m, wav24, wav16):
-    """One clip the way hub.mimi_hub.run() handles an episode (minus file I/O)."""
+    """One clip the way hub.mimi_hub.run() handles an episode (minus file I/O): (cues, speakers, stage seconds)."""
     from hub import mimi_hub
-    enc = threading.Thread(target=hub_encode, args=(m["mimi"], wav24))
+    t0 = time.perf_counter()
+    times = {}
+
+    def encode():
+        hub_encode(m["mimi"], wav24)
+        times["mimi"] = time.perf_counter() - t0
+
+    enc = threading.Thread(target=encode)
     enc.start()
     cues = [c for s in m["asr"].recognize(wav16, sample_rate=16000) for c in mimi_hub.cues(s)]
+    times["asr"] = time.perf_counter() - t0
     turns, _ = mimi_hub.diarize(wav16)
+    times["diar"] = time.perf_counter() - t0 - times["asr"]
     enc.join()
-    return len(cues), len({t[2] for t in turns})
+    return len(cues), len({t[2] for t in turns}), times
 
 
 def run_backlog(episode_fn, m, clips, workers):
-    """Process every clip with [workers] threads pulling from one queue; wall time and mean GPU busy %."""
+    """Process every clip with [workers] threads pulling from one queue: wall time, mean GPU busy %, results,
+    errors, CPU seconds used."""
     q = queue.Queue()
     for k in range(len(clips)):
         q.put(k)
@@ -95,42 +131,136 @@ def run_backlog(episode_fn, m, clips, workers):
             except Exception as e:  # count it, keep going
                 errors.append(f"clip {k}: {type(e).__name__}: {e}")
 
+    r0 = resource.getrusage(resource.RUSAGE_SELF)
     with GpuBusy() as busy:
         t = time.perf_counter()
         threads = [threading.Thread(target=worker) for _ in range(workers)]
         [th.start() for th in threads]
         [th.join() for th in threads]
         wall = time.perf_counter() - t
-    return wall, busy.mean, out, errors
+    r1 = resource.getrusage(resource.RUSAGE_SELF)
+    cpu_s = (r1.ru_utime - r0.ru_utime) + (r1.ru_stime - r0.ru_stime)
+    return wall, busy.mean, out, errors, cpu_s
+
+
+def load_clips(path, n, clip_min, ks=None):
+    import librosa
+    import soundfile as sf
+    wav, sr = sf.read(path, dtype="float32")
+    step = int(clip_min * 60 * sr)
+    ks = range(n) if ks is None else ks
+    clips = [wav[k * step:(k + 1) * step] for k in ks]
+    assert all(len(c) == step for c in clips), "not enough audio for that many clips"
+    return [(w, librosa.resample(w, orig_sr=sr, target_sr=16000)) for w in clips]
+
+
+def setup(tf32):
+    from hub import mimi_hub
+    if tf32:  # fp32 matmuls / convs on NVIDIA tensor cores, and cuDNN's per-shape algorithm search
+        import torch
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+        torch.backends.cudnn.benchmark = True
+    m = mimi_hub.models()
+    if os.environ.get("TPUT_PYANNOTE_PATH"):  # a local copy of the gated model (Modal), not the HF cache
+        from hub import pyannote_gpu
+        mimi_hub._models["diar_pyannote"] = pyannote_gpu.load(m["device"], path=os.environ["TPUT_PYANNOTE_PATH"])
+    return m
+
+
+PROFILE = {}  # --profile: seconds and calls per component, summed over every clip
+
+
+def profile_hooks(m):
+    """Time Parakeet's VAD / preprocessing / encoder / decoder calls and pyannote's segmentation / embedding steps."""
+    from hub import mimi_hub
+
+    def wrap(obj, attr, key):
+        f = getattr(obj, attr)
+
+        def timed(*a, **k):
+            t = time.perf_counter()
+            try:
+                return f(*a, **k)
+            finally:
+                s, n = PROFILE.get(key, (0.0, 0))
+                PROFILE[key] = (s + time.perf_counter() - t, n + 1)
+        setattr(obj, attr, timed)
+
+    asr = m["asr"].asr
+    wrap(m["asr"].vad._model, "run", "vad")
+    wrap(asr, "_preprocessor", "preprocess")
+    wrap(asr._encoder, "run", "encoder")
+    wrap(asr._decoder_joint, "run", "decoder")
+    pipe = mimi_hub._models.get("diar_pyannote")
+    if pipe is not None:
+        wrap(pipe, "get_segmentations", "segmentation")
+        wrap(pipe, "get_embeddings", "embeddings")
+
+
+def _proc(a, ks, workers, barrier, results):
+    """One of --procs processes: its own models, its share [ks] of the clips."""
+    clips = load_clips(a.wav, None, a.clip_min, ks)
+    m = setup(a.tf32)
+    baseline_episode(m, *clips[0])  # warm-up
+    barrier.wait()
+    t = time.time()
+    wall, _, out, errors, cpu_s = run_backlog(baseline_episode, m, clips, workers)
+    results.put((t, t + wall, list(out.values()), errors, cpu_s))
+
+
+def summarize(a, workers, wall, busy, outs, errors, cpu_s):
+    stages = {k: round(sum(o[2].get(k, 0.0) for o in outs) / max(1, len(outs)), 2) for k in ("mimi", "asr", "diar")}
+    return {"label": a.label, "procs": a.procs, "workers": workers, "clips": a.clips, "clip_min": a.clip_min,
+            "tf32": a.tf32, "wall_s": round(wall, 1), "x_rt": round(a.clips * a.clip_min * 60 / wall, 1),
+            "gpu_busy_pct": busy, "cpu_cores_used": round(cpu_s / wall, 1), "clip_stage_s": stages,
+            "errors": errors, "cues": sum(o[0] for o in outs)}
 
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--workers", default="1,2,4")
+    ap.add_argument("--workers", default="1,2,4", help="threads per process")
+    ap.add_argument("--procs", type=int, default=1)
     ap.add_argument("--clips", type=int, default=8)
     ap.add_argument("--clip-min", type=float, default=5.0)
     ap.add_argument("--label", default="E0")
+    ap.add_argument("--tf32", action="store_true")
+    ap.add_argument("--profile", action="store_true", help="component times (one process; per clip)")
     ap.add_argument("--wav", default=str(ROOT / "data/ref/ref_24k.wav"))
     a = ap.parse_args()
 
-    import librosa
-    import soundfile as sf
-    from hub import mimi_hub
-
-    wav, sr = sf.read(a.wav, dtype="float32")
-    step = int(a.clip_min * 60 * sr)
-    clips = [(wav[k * step:(k + 1) * step],) for k in range(a.clips)]
-    assert all(len(c[0]) == step for c in clips), "not enough audio for that many clips"
-    clips = [(w, librosa.resample(w, orig_sr=sr, target_sr=16000)) for (w,) in clips]
-    m = mimi_hub.models()
-    baseline_episode(m, *clips[0])  # warm-up: models, kernel selection for a full clip
-    audio_s = a.clips * a.clip_min * 60
+    results = []
     for workers in [int(x) for x in a.workers.split(",")]:
-        wall, busy, out, errors = run_backlog(baseline_episode, m, clips, workers)
-        res = {"label": a.label, "workers": workers, "clips": a.clips, "clip_min": a.clip_min,
-               "wall_s": round(wall, 1), "x_rt": round(audio_s / wall, 1), "gpu_busy_pct": busy,
-               "errors": errors, "cues": sum(v[0] for v in out.values())}
+        if a.procs == 1:
+            if not results:
+                clips = load_clips(a.wav, a.clips, a.clip_min)
+                m = setup(a.tf32)
+                baseline_episode(m, *clips[0])  # warm-up: models, kernel selection for a full clip
+                if a.profile:
+                    profile_hooks(m)
+            PROFILE.clear()
+            wall, busy, out, errors, cpu_s = run_backlog(baseline_episode, m, clips, workers)
+            res = summarize(a, workers, wall, busy, list(out.values()), errors, cpu_s)
+            if a.profile:
+                res["profile_per_clip"] = {k: [round(v[0] / a.clips, 3), round(v[1] / a.clips)]
+                                           for k, v in PROFILE.items()}
+        else:
+            import multiprocessing as mp
+            ctx = mp.get_context("spawn")
+            barrier, q = ctx.Barrier(a.procs + 1), ctx.Queue()
+            shares = [list(range(a.clips))[p::a.procs] for p in range(a.procs)]
+            ps = [ctx.Process(target=_proc, args=(a, ks, workers, barrier, q)) for ks in shares]
+            [p.start() for p in ps]
+            barrier.wait()
+            with GpuBusy() as busy:
+                got = [q.get() for _ in ps]
+            [p.join() for p in ps]
+            wall = max(g[1] for g in got) - min(g[0] for g in got)
+            res = summarize(a, workers, wall, busy.mean, [o for g in got for o in g[2]],
+                            [e for g in got for e in g[3]], sum(g[4] for g in got))
+        results.append(res)
         print("RESULT " + json.dumps(res), flush=True)
+        (ROOT / "outputs").mkdir(exist_ok=True)
         with open(ROOT / "outputs/throughput_server.jsonl", "a") as f:
             f.write(json.dumps(res) + "\n")
 

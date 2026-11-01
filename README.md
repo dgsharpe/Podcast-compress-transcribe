@@ -22,8 +22,10 @@ Galaxy Z Fold 8 (Snapdragon, Hexagon V81 NPU).
 
 ## Set up a server
 
-Linux with Python 3.12 ([uv](https://docs.astral.sh/uv/)) and `ffmpeg`. A GPU makes it much faster but isn't
-required: a 44 min episode takes about 45 s end to end on the Radeon 8060S, about 5 minutes on its CPU alone.
+Linux or macOS (Apple silicon) with Python 3.12 ([uv](https://docs.astral.sh/uv/)) and `ffmpeg`. A GPU makes it
+much faster but isn't required: a 44 min episode takes about 45 s end to end on the Radeon 8060S, about 5 minutes on
+its CPU alone. With a backlog, the hub processes ~80x real time on the Radeon 8060S, ~67x on an M5 MacBook Pro and
+~38x on an M4 iMac (pyannote's ResNet on the Neural Engine).
 
 ```sh
 git clone https://github.com/joshjob42/Podcast-compress-transcribe neural_audio
@@ -31,6 +33,7 @@ cd neural_audio
 uv sync                    # CPU environment (.venv)
 hub/setup_rocm.sh          # or, AMD GPU: .venv-rocm (AMD's ROCm torch wheels; tested on gfx1151)
 hub/setup_cuda.sh          # or, NVIDIA GPU: .venv-cuda (CUDA 12.8 torch wheels)
+hub/setup_mac.sh           # or, Apple silicon: .venv-mac (Metal GPU + Core ML for the Neural Engine)
 hub/fetch_models.sh        # CPU speaker diarization models (sherpa-onnx), into hub_models/
 ```
 
@@ -72,6 +75,8 @@ Environment variables, e.g. `Environment=` lines in the unit:
 | `MIMI_HUB_DEVICE` | `auto` | `cuda` / `cpu` |
 | `MIMI_HUB_DIARIZER` | `auto` | `pyannote` (GPU; gated HF model, fetch once with a token) / `sherpa` (CPU) |
 | `MIMI_HUB_ASR_ENCODER` | `native` | `onnx2torch` for the converted ONNX encoder |
+| `MIMI_HUB_ASR_DECODER` | `native`; `onnx` on ROCm | `native`: TDT decoding batched on the GPU, same output as onnx_asr's CPU loop; frees the CPU |
+| `MIMI_HUB_DIAR_DTYPE` | `fp16` on NVIDIA, `coreml` on macOS, `fp32` on ROCm | precision of pyannote's embedding ResNet (`fp32` / `tf32` / `fp16` / `bf16` / `coreml`: the Neural Engine, default on macOS; same diarization) |
 | `MIMI_HUB_MIMI_FP16` | `1` | `0`: Mimi encoder in fp32 on the GPU (fp16 is ~1.7x faster; the coarse codes nearly all match) |
 | `MIMI_HUB_TOKEN` | (none) | require `Authorization: Bearer <token>` |
 | `MIMI_HUB_DATA` | `hub_data/` | where `.mimi` / `.vtt` / records live |

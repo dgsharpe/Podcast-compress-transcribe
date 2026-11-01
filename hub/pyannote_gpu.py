@@ -13,13 +13,25 @@ norms become fixed per-channel scale + shift (eval mode). fp16 is not used: it m
 
 import math
 import os
+import sys
 import types
+from pathlib import Path
 
 import numpy as np
 import torch
 
 MODEL = "pyannote/speaker-diarization-community-1"
-BATCH_CHUNKS = 32
+BATCH_CHUNKS = int(os.environ.get("MIMI_HUB_DIAR_BATCH", "32"))
+# The ResNet's frames (its convolutions: nearly all the work) in fp16 / bf16 / tf32 (NVIDIA; pyannote itself turns
+# TF32 off), pooling and everything after in fp32. On a 43.8 min episode fp16, bf16 and tf32 all left the
+# diarization unchanged (DER 0 vs fp32); fp16 made the embedding step 2x faster on an L40S and 13x on an H100
+# (weak at plain fp32), but 2-3x slower on the server's MIOpen, so the default is fp16 on NVIDIA only. (fp16 for
+# the whole model, pooling included, once merged every speaker into one.) scripts/diar_precision_check.py.
+# On a Mac, "coreml" runs the frames on the Neural Engine (Core ML, fp16), off the GPU: 32 x 10 s in 0.16 s on an
+# M5 vs 0.58 s for PyTorch on its GPU (Metal), relative error 1.6%. Converted once, cached in MIMI_HUB_MODELS.
+FRAMES_DTYPE = os.environ.get("MIMI_HUB_DIAR_DTYPE", "auto")  # auto: fp16 on NVIDIA, coreml on macOS, else fp32
+_DTYPES = {"fp32": None, "tf32": None, "fp16": torch.float16, "bf16": torch.bfloat16}
+COREML_DIR = Path(os.environ.get("MIMI_HUB_MODELS", Path(__file__).resolve().parent.parent / "hub_models"))
 # Segmentation / embedding windows (10 s) start every STEP_FRAC x 10 s. pyannote's default 0.1 (1 s) sends every
 # moment through the ResNet ~10 times; 0.2 halves diarization time (43.8 min: 34 -> 17 s on the server) and changed the
 # output by DER 0.042 vs the default (hosts 17.5 / 14.9 -> 17.5 / 15.4 min). 0.25: 13.7 s, DER 0.057.
@@ -59,6 +71,48 @@ def _without_miopen(module):
     module.forward = wrapped
 
 
+def _frames_mode(device):
+    if FRAMES_DTYPE != "auto":
+        return FRAMES_DTYPE
+    if device.type == "cuda" and not torch.version.hip:
+        return "fp16"
+    if sys.platform == "darwin":
+        import importlib.util
+        if importlib.util.find_spec("coremltools"):
+            return "coreml"
+    return "fp32"
+
+
+def _coreml_frames(resnet, fbank_shape):
+    """The ResNet's forward_frames as a Core ML program on the Neural Engine, for fbank batches of [fbank_shape]."""
+    import copy
+
+    import coremltools as ct
+
+    path = COREML_DIR / f"wespeaker-resnet34-frames-{'x'.join(map(str, fbank_shape))}.mlpackage"
+    if not path.exists():
+        class Frames(torch.nn.Module):
+            def __init__(self, r):
+                super().__init__()
+                self.r = r
+
+            def forward(self, x):
+                return self.r.forward_frames(x)
+
+        m = Frames(copy.deepcopy(resnet).float().cpu()).eval()
+        x = torch.zeros(fbank_shape)
+        with torch.no_grad():
+            traced = torch.jit.trace(m, x)
+        ml = ct.convert(traced, inputs=[ct.TensorType(name="fbank", shape=fbank_shape)],
+                        outputs=[ct.TensorType(name="frames")], convert_to="mlprogram",
+                        compute_precision=ct.precision.FLOAT16, minimum_deployment_target=ct.target.macOS15)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_suffix(".tmp.mlpackage")
+        ml.save(str(tmp))
+        tmp.rename(path)
+    return ct.models.MLModel(str(path), compute_units=ct.ComputeUnit.CPU_AND_NE)
+
+
 def get_embeddings(self, file, binary_segmentations, exclude_overlap=False, hook=None):
     """Drop-in for SpeakerDiarization.get_embeddings: (num_chunks, num_speakers, dimension) array."""
     sr = self._embedding.sample_rate
@@ -96,7 +150,21 @@ def get_embeddings(self, file, binary_segmentations, exclude_overlap=False, hook
         for k, c0 in enumerate(range(0, num_chunks, BATCH_CHUNKS), 1):
             c1 = min(num_chunks, c0 + BATCH_CHUNKS)
             chunks = w[starts[c0:c1, None] + offsets][:, None]  # (batch, 1, samples)
-            frames = model.resnet.forward_frames(model.compute_fbank(chunks))
+            fbank = model.compute_fbank(chunks)
+            mode = _frames_mode(device)
+            if mode == "coreml":  # fixed batch: the last one is zero-padded
+                shape = (BATCH_CHUNKS, *fbank.shape[1:])
+                if getattr(self, "_coreml", (None,))[0] != shape:
+                    self._coreml = (shape, _coreml_frames(model.resnet, shape))
+                x = np.zeros(shape, dtype=np.float32)
+                x[:len(fbank)] = fbank.float().cpu().numpy()
+                frames = torch.from_numpy(self._coreml[1].predict({"fbank": x})["frames"][:len(fbank)]).to(device)
+            else:
+                dtype = _DTYPES[mode]
+                cudnn = torch.backends.cudnn.flags(enabled=torch.backends.cudnn.enabled, allow_tf32=mode == "tf32")
+                with torch.autocast(device.type, dtype=dtype or torch.float32, enabled=dtype is not None), cudnn:
+                    frames = model.resnet.forward_frames(fbank)
+            frames = frames.float()
             emb = model.resnet.forward_embedding(frames, weights=weights[c0:c1].to(device))[1]
             out.append(emb.float().cpu().numpy())  # (batch, speakers, dimension)
             if hook is not None:
