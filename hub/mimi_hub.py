@@ -521,8 +521,9 @@ def encode_live(model, L, pcm, fd, i):
             update(i, progress=round(done / len(L.bounds), 3))
 
 
-def transcribe(m, pcm, cond, out):
-    """ASR and diarization of the full decoded episode, concurrently; results (or "error") go into [out]."""
+def transcribe(m, pcm, cond, out, on_cues=None):
+    """ASR and diarization of the full decoded episode, concurrently; results (or "error") go into [out].
+    [on_cues] gets the ASR cues as soon as they exist, before diarization is done."""
     try:
         import librosa
         with cond:
@@ -539,9 +540,17 @@ def transcribe(m, pcm, cond, out):
                 traceback.print_exc()  # a transcript without speakers is still useful
                 out["turns"], out["diarization"] = [], None
 
+        # pyannote on the GPU waits for ASR: the GPU is the bottleneck either way (the stages' times add up), and
+        # this way the cues, and so ad detection, are ready ~30 s sooner. sherpa (CPU) runs alongside.
+        diar_on_gpu = m.get("device") == "cuda" and DIARIZER in ("auto", "pyannote")
         d = threading.Thread(target=speakers, daemon=True, name="mimi-diarize")
-        d.start()
+        if not diar_on_gpu:
+            d.start()
         out["cues"] = [c for s in m["asr"].recognize(wav16, sample_rate=16000) for c in cues(s)]
+        if on_cues:
+            on_cues(out["cues"])
+        if diar_on_gpu:
+            d.start()
         d.join()
     except Exception as e:
         out["error"] = e
@@ -582,7 +591,11 @@ def run(i):
         # transcription and diarization start once the whole episode is decoded (ffmpeg is far ahead of the
         # encoder) and run alongside the encode
         tx = {}
-        t = threading.Thread(target=transcribe, args=(m, pcm, L.cond, tx), daemon=True, name=f"mimi-asr-{i}")
+        # ad detection starts from the ASR cues, alongside diarization: speaker labels add little to it (episodes
+        # without any were found as well), and diarization takes as long as everything else
+        early = lambda cs: queue_segments(i, [(a, b, None, text) for a, b, text in cs])  # noqa: E731
+        t = threading.Thread(target=transcribe, args=(m, pcm, L.cond, tx, early), daemon=True,
+                             name=f"mimi-asr-{i}")
         t.start()
         fd = os.open(path, os.O_WRONLY)
         try:
@@ -606,7 +619,6 @@ def run(i):
         (DATA / f"{i}.vtt.tmp").replace(DATA / f"{i}.vtt")
         update(i, state="ready", progress=1.0, asr=ASR_MODEL, device=m["device"],
                speakers=len({t[2] for t in turns}), diarization=tx["diarization"] if turns else None)
-        queue_segments(i)
     except Exception as e:
         traceback.print_exc()
         if L is not None:
@@ -625,20 +637,22 @@ def run(i):
 seg_jobs: "queue.Queue" = queue.Queue()
 
 
-def queue_segments(i):
+def queue_segments(i, cues=None):
+    """Detect [i]'s ads / self-promotion from [cues] ([(start_s, end_s, speaker or None, text)]), else its VTT."""
     if segments.SEGMENTER.strip().lower() in ("", "off"):
         update(i, segments_state="off")
         return
     update(i, segments_state="pending")
-    seg_jobs.put(i)
+    seg_jobs.put((i, cues))
 
 
 def segment_worker():
     while True:
-        i = seg_jobs.get()
+        i, cues = seg_jobs.get()
         try:
-            vtt = (DATA / f"{i}.vtt").read_text()
-            res = segments.detect(segments.read_cues(vtt), log=lambda m: print(f"[{i}] {m}", flush=True))
+            if cues is None:
+                cues = segments.read_cues((DATA / f"{i}.vtt").read_text())
+            res = segments.detect(cues, log=lambda m: print(f"[{i}] {m}", flush=True))
             tmp = DATA / f"{i}.segments.json.tmp"
             tmp.write_text(json.dumps(res, indent=1))
             tmp.replace(DATA / f"{i}.segments.json")
