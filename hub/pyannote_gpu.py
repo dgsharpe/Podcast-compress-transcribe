@@ -104,7 +104,7 @@ def load(device="cuda", path=None):
     from pyannote.audio import Pipeline
     pipeline = Pipeline.from_pretrained(path or snapshot_download(MODEL, local_files_only=True))
     pipeline.to(torch.device(device))
-    if torch.device(device).type == "cuda":
+    if torch.device(device).type == "cuda" and torch.version.hip:  # ROCm only; NVIDIA needs none of this
         _without_miopen(pipeline._segmentation.model)
         _freeze_bn(pipeline._embedding.model_)
     pipeline.get_embeddings = types.MethodType(get_embeddings, pipeline)
