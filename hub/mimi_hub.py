@@ -274,6 +274,15 @@ def _load_models():
     vad_so.intra_op_num_threads = vad_so.inter_op_num_threads = 1
     vad_so.add_session_config_entry("session.intra_op.allow_spinning", "0")
     vad = onnx_asr.load_vad("silero", sess_options=vad_so)
+    own_encode = vad._encode
+
+    def vad_encode(waveforms, sample_rate, hop_size, context_size):
+        pre = getattr(_vad_pre, "value", None)  # computed while decoding (STREAM_VAD)
+        if pre is not None and waveforms.shape == (1, pre[0]):
+            yield from pre[1][:, None]
+        else:
+            yield from own_encode(waveforms, sample_rate, hop_size, context_size)
+    vad._encode = vad_encode
     if ASR_BUCKET > 1:
         vad.recognize_batch = types.MethodType(_bucketed_recognize_batch, vad)
     m["asr"] = asr.with_vad(vad).with_timestamps()
@@ -284,6 +293,27 @@ def _load_models():
 # 61% of the encoder's input was padding on a 43.8 min episode. Batching all of an episode's segments by length
 # (ASR_BUCKET at a time) cut the encoder from 14.3 to 8.3 s on the server (scripts/parakeet_encoder_server.py).
 ASR_BUCKET = int(os.environ.get("MIMI_HUB_ASR_BUCKET", "16"))  # 0 / 1: onnx_asr's own batching
+# The batches' three steps (features on the CPU, encoder on the GPU, decoding) as a pipeline: one batch's features
+# are computed while the previous one is encoded and the one before decoded, instead of each waiting on the others.
+ASR_PIPELINE = os.environ.get("MIMI_HUB_ASR_PIPELINE", "1") != "0"
+
+
+def _pipelined(items, depth=2):
+    """Iterate [items] (a generator) in a background thread, up to [depth] ahead."""
+    q, end = queue.Queue(maxsize=depth), object()
+
+    def produce():
+        try:
+            for x in items:
+                q.put(x)
+            q.put(end)
+        except BaseException as e:
+            q.put(e)
+    threading.Thread(target=produce, daemon=True, name="mimi-asr-stage").start()
+    while (x := q.get()) is not end:
+        if isinstance(x, BaseException):
+            raise x
+        yield x
 
 
 def _bucketed_recognize_batch(self, asr, waveforms, waveforms_len, sample_rate, asr_kwargs, batch_size=8,
@@ -296,12 +326,25 @@ def _bucketed_recognize_batch(self, asr, waveforms, waveforms_len, sample_rate, 
     def recognize(waveform, segments):
         segments = list(segments)
         order = sorted(range(len(segments)), key=lambda i: segments[i][1] - segments[i][0])
+        batches = [order[i:i + ASR_BUCKET] for i in range(0, len(order), ASR_BUCKET)]
         results = [None] * len(segments)
-        for i in range(0, len(order), ASR_BUCKET):
-            idx = order[i:i + ASR_BUCKET]
-            batch = [segments[j] for j in idx]
-            for res, j in zip(asr.recognize_batch(*pad_list([waveform[s:e] for s, e in batch]), **asr_kwargs), idx,
-                              strict=True):
+
+        def features():
+            for idx in batches:
+                yield idx, asr._preprocessor(*pad_list([waveform[s:e] for s, e in (segments[j] for j in idx)]))
+
+        def encoded(items):
+            for idx, feats in items:
+                yield idx, asr._encode(*feats)
+
+        if ASR_PIPELINE:
+            outputs = (zip(map(asr._decode_tokens, *zip(*asr._decoding(*enc, **asr_kwargs))), idx)
+                       for idx, enc in _pipelined(encoded(_pipelined(features()))))
+        else:
+            outputs = (zip(asr.recognize_batch(*pad_list([waveform[s:e] for s, e in (segments[j] for j in idx)]),
+                                               **asr_kwargs), idx) for idx in batches)
+        for batch in outputs:
+            for res, j in batch:
                 s, e = segments[j]
                 results[j] = TimestampedSegmentResult(s / sample_rate, e / sample_rate, res.text, res.timestamps,
                                                       res.tokens, res.logprobs)
@@ -694,17 +737,77 @@ def encode_live(model, L, pcm, fd, i):
             update(i, progress=round(written / n, 3))
 
 
+# Resampling to 16 kHz and Silero VAD (~6 s of serial CPU work on a 43.8 min episode) run as ffmpeg decodes, so
+# ASR's batches start right after the download instead. Identical results: soxr's stream resampler gives the same
+# samples as resampling the whole (librosa's default, soxr_hq), and the VAD sees the same frames in the same order.
+STREAM_VAD = os.environ.get("MIMI_HUB_STREAM_VAD", "1") != "0"
+_vad_pre = threading.local()  # (n_samples, probabilities) for the VAD call of this thread's next recognize()
+
+
+def _stream_prepare(pcm, cond, vad, sr=16000, hop=512, ctx=64):
+    """(16 kHz waveform, per-frame VAD probabilities as SileroVad._encode would give) of [pcm], as it decodes."""
+    import numpy as np
+    import soxr
+    rs = soxr.ResampleStream(mimi_file.SR, sr, 1, dtype="float32", quality="HQ")
+    w = np.empty(int(len(pcm.buf) * sr / mimi_file.SR) + 1024, np.float32)
+    n = pos = 0
+    state = np.zeros((2, 1, 128), dtype=np.float32)
+    probs, next_frame = [], -1  # -1: the first (left-padded) frame; k >= 0: w[448 + 512 k:][:576]
+    srs = np.array([sr], dtype=np.int64)
+
+    def vad_run(frame):
+        nonlocal state
+        o, state = vad._model.run(["output", "stateN"], {"input": frame[None], "state": state, "sr": srs})
+        probs.append(o[0, 0])
+
+    while True:
+        with cond:
+            while pcm.avail - pos < mimi_file.SR and not pcm.done:
+                cond.wait(1.0)
+            done, avail = pcm.done, pcm.avail
+        if done and pcm.error:
+            return None, None
+        y = rs.resample_chunk(pcm.buf[pos:avail], last=done)
+        pos = avail
+        if n + len(y) > len(w):
+            w = np.concatenate([w, np.empty(n + len(y) - len(w) + sr, np.float32)])
+        w[n:n + len(y)] = y
+        n += len(y)
+        if next_frame == -1 and n >= hop:
+            vad_run(np.pad(w[:hop], (ctx, 0)))
+            next_frame = 0
+        while next_frame >= 0 and hop - ctx + hop * next_frame + ctx + hop <= n:
+            a = hop - ctx + hop * next_frame
+            vad_run(w[a:a + ctx + hop])
+            next_frame += 1
+        if done:
+            break
+    w = w[:n]
+    if next_frame == -1:  # under one frame: let the VAD do it all
+        return w, None
+    if last := n % hop:
+        vad_run(np.pad(w[-last - ctx:], (0, hop - last)))
+    return w, np.array(probs, dtype=np.float32)
+
+
 def transcribe(m, pcm, cond, out, on_cues=None):
     """ASR and diarization of the full decoded episode, concurrently; results (or "error") go into [out].
     [on_cues] gets the ASR cues as soon as they exist, before diarization is done."""
     try:
         import librosa
-        with cond:
-            while not pcm.done:
-                cond.wait(1.0)
+        mark = out.get("mark", lambda k: None)
+        probs = None
+        if STREAM_VAD:
+            wav16, probs = _stream_prepare(pcm, cond, m["asr"].vad)
+        else:
+            with cond:
+                while not pcm.done:
+                    cond.wait(1.0)
         if pcm.error:
             return  # the encoder reports it
-        wav16 = librosa.resample(pcm.buf[:pcm.avail], orig_sr=mimi_file.SR, target_sr=16000)
+        if not STREAM_VAD:
+            wav16 = librosa.resample(pcm.buf[:pcm.avail], orig_sr=mimi_file.SR, target_sr=16000)
+        mark("decoded")  # and, with STREAM_VAD, resampled and VAD'd
 
         def speakers():
             try:
@@ -714,17 +817,25 @@ def transcribe(m, pcm, cond, out, on_cues=None):
                 out["turns"], out["diarization"] = [], None
 
         # pyannote on the GPU waits for ASR: the GPU is the bottleneck either way (the stages' times add up), and
-        # this way the cues, and so ad detection, are ready ~30 s sooner. sherpa (CPU) runs alongside.
+        # this way the cues, and so ad detection, are ready sooner. Even for one episode alone: run alongside ASR,
+        # a 43 min episode was ready 3 s sooner but its ad marks 14 s later and its .mimi 19 s later
+        # (scripts/episode_timeline.py). sherpa (CPU) runs alongside.
         diar_on_gpu = m.get("device", "cpu") != "cpu" and DIARIZER in ("auto", "pyannote")
         d = threading.Thread(target=speakers, daemon=True, name="mimi-diarize")
         if not diar_on_gpu:
             d.start()
-        out["cues"] = [c for s in m["asr"].recognize(wav16, sample_rate=16000) for c in cues(s)]
+        _vad_pre.value = (len(wav16), probs) if probs is not None else None
+        try:
+            out["cues"] = [c for s in m["asr"].recognize(wav16, sample_rate=16000) for c in cues(s)]
+        finally:
+            _vad_pre.value = None
+        mark("asr")
         if on_cues:
             on_cues(out["cues"])
         if diar_on_gpu:
             d.start()
         d.join()
+        mark("diar")
     except Exception as e:
         out["error"] = e
 
@@ -733,6 +844,13 @@ def run(i):
     r = load(i)
     upload = r.get("upload")
     L = None
+    t0, tm = time.time(), {}
+
+    def mark(stage):
+        """Seconds from the job's start to the end of [stage], kept in the record's "timing"."""
+        tm[stage] = round(time.time() - t0, 2)
+
+    update(i, timing_start=t0, timing={})
     try:
         if not (FFMPEG and FFPROBE):
             raise RuntimeError("ffmpeg/ffprobe not on PATH (start the hub with hub/run.sh)")
@@ -755,11 +873,12 @@ def run(i):
                 url, src = src, str(DATA / f"{i}.src")
                 dur = probe(src)
                 update(i, source_ready=True, source_type=ctype, source_bytes=os.path.getsize(src), source_url=url)
+        mark("probed")
         n_frames = int(dur * FPS) + 13  # + ~1 s: ffprobe estimates can run short; the tail is padded
         compress = r.get("compressed", COMPRESS)
         # transcription and diarization start once the whole episode is decoded (ffmpeg is far ahead of the
         # encoder) and run alongside the encode
-        tx = {}
+        tx = {"mark": mark}
         # ad detection starts from the ASR cues, alongside diarization: speaker labels add little to it (episodes
         # without any were found as well), and diarization takes as long as everything else
         early = lambda cs: queue_segments(i, [(a, b, None, text) for a, b, text in cs])  # noqa: E731
@@ -790,6 +909,7 @@ def run(i):
                 os.close(fd)
             live.pop(i, None)  # complete: served as a plain file from now on
             _emit("unlive", i, False)
+            mark("mimi")
             update(i, state="transcribing", progress=0.0)
         t.join()
         if "error" in tx:
@@ -804,8 +924,12 @@ def run(i):
                 who = speaker_for(a, b, turns)
                 f.write(f"{vtt_time(a)} --> {vtt_time(b)}\n{f'<v Speaker {who}>' if who else ''}{text}\n\n")
         (DATA / f"{i}.vtt.tmp").replace(DATA / f"{i}.vtt")
-        update(i, state="ready", progress=1.0, asr=ASR_MODEL, device=m["device"],
-               speakers=len({t[2] for t in turns}), diarization=tx["diarization"] if turns else None)
+        mark("ready")
+        with lock:  # merged: ad detection may have added its time already
+            rec = load(i)
+            save(dict(rec, state="ready", progress=1.0, asr=ASR_MODEL, device=m["device"],
+                      speakers=len({t[2] for t in turns}), diarization=tx["diarization"] if turns else None,
+                      timing={**rec.get("timing", {}), **tm}))
         with lock:
             rec = load(i)
             if rec.get("keep_source") and not rec.get("source_ready"):  # asked for while this run was going
@@ -854,8 +978,13 @@ def segment_worker():
             tmp = DATA / f"{i}.segments.json.tmp"
             tmp.write_text(json.dumps(res, indent=1))
             tmp.replace(DATA / f"{i}.segments.json")
-            update(i, segments_state="ready", segments=len(res["segments"]), segments_model=res["model"],
-                   skippable_s=round(sum(s["end"] - s["start"] for s in res["segments"]), 1))
+            with lock:
+                r = load(i)
+                timing = dict(r.get("timing") or {})
+                if r.get("timing_start"):
+                    timing["segments"] = round(time.time() - r["timing_start"], 2)
+                save(dict(r, segments_state="ready", segments=len(res["segments"]), segments_model=res["model"],
+                          skippable_s=round(sum(s["end"] - s["start"] for s in res["segments"]), 1), timing=timing))
         except Exception as e:
             traceback.print_exc()
             update(i, segments_state="failed", segments_error=f"{type(e).__name__}: {e}"[:500])
