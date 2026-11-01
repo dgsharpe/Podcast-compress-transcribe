@@ -20,6 +20,11 @@ API (JSON unless noted):
                                                 for clients that want the transcript and ad segments but not the
                                                 .mimi. Dynamically inserted ads differ between downloads, so a
                                                 fresh copy from the publisher may not match their timings.
+                                                MIMI_HUB_SOURCES=fetch (default): not stored; fetched from the
+                                                publisher again and passed through if its size still matches the
+                                                processed file's, else 409. =keep: stored on disk and served.
+Server settings: MIMI_HUB_COMPRESS=0 skips the .mimi entirely (transcripts and ad segments only; every episode
+then keeps its source); records say "compressed": false.
   GET  /v1/episodes/{id}.segments.json          ads / self-promotion to skip, found by an LLM after transcription
                                                 ({"model", "segments": [{"start", "end", "kind": "ad" | "promo",
                                                 "label"}]}, seconds); the record's "segments_state" says
@@ -70,6 +75,8 @@ os.environ.setdefault("MIOPEN_FIND_MODE", "FAST")
 
 DATA = Path(os.environ.get("MIMI_HUB_DATA", ROOT / "hub_data"))
 DEVICE = os.environ.get("MIMI_HUB_DEVICE", "auto")
+SOURCES = os.environ.get("MIMI_HUB_SOURCES", "fetch")  # fetch | keep (the originals of keep_source episodes)
+COMPRESS = os.environ.get("MIMI_HUB_COMPRESS", "1") != "0"  # 0: no .mimi, transcripts + ad segments only
 TOKEN = os.environ.get("MIMI_HUB_TOKEN", "")
 ASR_MODEL = os.environ.get("MIMI_HUB_ASR", "nemo-parakeet-tdt-0.6b-v2")  # -v3 for multilingual
 THREADS = int(os.environ.get("MIMI_HUB_THREADS", "16"))
@@ -116,6 +123,7 @@ def update(i, **kw):
 def enqueue(i, priority=1, keep_source=False, **fields):
     """Queue job i (priority 0 = someone is streaming it, 1 = download / background). [keep_source]: keep the
     original audio as processed and serve it (.src)."""
+    keep_source = keep_source or not COMPRESS  # without a .mimi, clients play the original
     with lock:
         r = load(i)
         if r and r["state"] != "failed":
@@ -131,7 +139,7 @@ def enqueue(i, priority=1, keep_source=False, **fields):
                 jobs.put((priority, next(_seq), i))
             return r  # already queued, running or done
         r = save(dict(id=i, state="queued", priority=priority, progress=0.0, error=None, created=time.time(),
-                      keep_source=keep_source, **fields))
+                      keep_source=keep_source, compressed=COMPRESS, **fields))
     jobs.put((priority, next(_seq), i))
     return r
 
@@ -683,36 +691,43 @@ def run(i):
                 raise RuntimeError(f"cannot read source: {err}")
             if r.get("keep_source"):  # process exactly the bytes the client will get
                 ctype = fetch_source(src, i)
-                src = str(DATA / f"{i}.src")
+                url, src = src, str(DATA / f"{i}.src")
                 dur = probe(src)
-                update(i, source_ready=True, source_type=ctype, source_bytes=os.path.getsize(src))
+                update(i, source_ready=True, source_type=ctype, source_bytes=os.path.getsize(src), source_url=url)
         n_frames = int(dur * FPS) + 13  # + ~1 s: ffprobe estimates can run short; the tail is padded
-        head, _ = mimi_file.header(n_frames, 32, dict(title=r.get("title", ""), source=r.get("url", ""), id=i,
-                                                      encoder="transformers MimiModel", duration_s=dur))
-        path = DATA / f"{i}.mimi"
-        with open(path, "wb") as f:
-            f.write(head)
-            f.truncate(len(head) + n_frames * FRAME_BYTES)
-        L = Live(i, n_frames, head)
-        live[i] = L
-        update(i, state="encoding", progress=0.0, duration_s=dur, mimi_bytes=L.total)
-        pcm = Pcm(src, n_frames * mimi_file.SPF, L.cond)
+        compress = r.get("compressed", COMPRESS)
         # transcription and diarization start once the whole episode is decoded (ffmpeg is far ahead of the
         # encoder) and run alongside the encode
         tx = {}
         # ad detection starts from the ASR cues, alongside diarization: speaker labels add little to it (episodes
         # without any were found as well), and diarization takes as long as everything else
         early = lambda cs: queue_segments(i, [(a, b, None, text) for a, b, text in cs])  # noqa: E731
-        t = threading.Thread(target=transcribe, args=(m, pcm, L.cond, tx, early), daemon=True,
+        if compress:
+            head, _ = mimi_file.header(n_frames, 32, dict(title=r.get("title", ""), source=r.get("url", ""), id=i,
+                                                          encoder="transformers MimiModel", duration_s=dur))
+            path = DATA / f"{i}.mimi"
+            with open(path, "wb") as f:
+                f.write(head)
+                f.truncate(len(head) + n_frames * FRAME_BYTES)
+            L = Live(i, n_frames, head)
+            live[i] = L
+            update(i, state="encoding", progress=0.0, duration_s=dur, mimi_bytes=L.total)
+            cond = L.cond
+        else:
+            cond = threading.Condition()
+            update(i, state="transcribing", progress=0.0, duration_s=dur, compressed=False)
+        pcm = Pcm(src, n_frames * mimi_file.SPF, cond)
+        t = threading.Thread(target=transcribe, args=(m, pcm, cond, tx, early), daemon=True,
                              name=f"mimi-asr-{i}")
         t.start()
-        fd = os.open(path, os.O_WRONLY)
-        try:
-            encode_live(m["mimi"], L, pcm, fd, i)
-        finally:
-            os.close(fd)
-        live.pop(i, None)  # complete: served as a plain file from now on
-        update(i, state="transcribing", progress=0.0)
+        if compress:
+            fd = os.open(path, os.O_WRONLY)
+            try:
+                encode_live(m["mimi"], L, pcm, fd, i)
+            finally:
+                os.close(fd)
+            live.pop(i, None)  # complete: served as a plain file from now on
+            update(i, state="transcribing", progress=0.0)
         t.join()
         if "error" in tx:
             raise tx["error"]
@@ -744,6 +759,8 @@ def run(i):
     finally:
         if upload and os.path.exists(upload):
             os.unlink(upload)
+        if SOURCES != "keep":  # fetch mode: the original was only needed to process; .src fetches it again
+            (DATA / f"{i}.src").unlink(missing_ok=True)
 
 
 # ---------- ad / self-promotion segments (an LLM over the transcript; one at a time, after "ready") ----------
@@ -880,6 +897,39 @@ def list_jobs(authorization: str | None = Header(None)):
     return sorted(rs, key=lambda r: -r.get("created", 0))
 
 
+def proxy_source(r, rng):
+    """The original from its publisher (MIMI_HUB_SOURCES=fetch), passed through, if it's still the file that was
+    processed: same size (dynamically inserted ads change it). Otherwise 409, and the client uses the publisher's
+    own copy without the hub's ad marks."""
+    req = urllib.request.Request(r["source_url"], headers={**UA, **({"Range": rng} if rng else {})})
+    try:
+        up = urllib.request.urlopen(req, timeout=30)
+    except urllib.error.HTTPError as e:
+        raise HTTPException(502 if e.code != 416 else 416, f"publisher: HTTP {e.code}")
+    except OSError as e:
+        raise HTTPException(502, f"publisher unreachable: {e}")
+    if up.status == 206:
+        total = int((up.headers.get("Content-Range") or "/-1").rsplit("/", 1)[1])
+    else:
+        total = int(up.headers.get("Content-Length") or -1)
+    if total != r.get("source_bytes"):
+        up.close()
+        raise HTTPException(409, f"the publisher now serves a different file ({total} vs {r.get('source_bytes')} "
+                                 "bytes): its timings may not match this transcript")
+    headers = {"Accept-Ranges": "bytes"}
+    for h in ("Content-Length", "Content-Range"):
+        if up.headers.get(h):
+            headers[h] = up.headers[h]
+
+    def body():
+        with up:
+            while chunk := up.read(1 << 16):
+                yield chunk
+
+    return StreamingResponse(body(), status_code=up.status, media_type=r.get("source_type") or "audio/mpeg",
+                             headers=headers)
+
+
 def stream_live(L, rng):
     """Serve (a Range of) a .mimi that is still being encoded, waiting for each chunk as needed."""
     start, end, status = 0, L.total - 1, 200
@@ -946,9 +996,11 @@ def episode(name: str, request: Request, authorization: str | None = Header(None
     if ext == "src":
         r = load(stem)
         p = DATA / f"{stem}.src"
-        if not r or not r.get("source_ready") or not p.exists():
-            raise HTTPException(404, "no source kept")
-        return FileResponse(p, media_type=r.get("source_type") or "audio/mpeg", filename=f"{stem}.src")
+        if r and p.exists():  # kept, or still being processed
+            return FileResponse(p, media_type=r.get("source_type") or "audio/mpeg", filename=f"{stem}.src")
+        if not r or not r.get("source_ready") or not r.get("source_url"):
+            raise HTTPException(404, "no source")
+        return proxy_source(r, request.headers.get("range"))
     if ext in ("mimi", "vtt"):
         p = DATA / f"{stem}.{ext}"
         if not p.exists():

@@ -52,3 +52,20 @@ clients. The API is documented in the module docstring.
 - **Running it:** `hub/run.sh` (a transient unit), or the home-manager service in `hub/mimi-hub.service.nix`.
 - **Tests:** `hub/test_hub.py` (upload) and `hub/test_stream.py` (progressive streaming); both run in-process,
   with ffmpeg on PATH.
+
+## Running your own hub
+
+`hub/serve.sh --host <ip> --port 8765` (GPU: run `hub/setup_rocm.sh` first on an AMD box; otherwise the uv `.venv`
+on the CPU). In the patched Pocket Casts, point Settings > Advanced > Mimi > Mimi converter URL at it. Server
+settings (environment):
+
+| variable | default | |
+|---|---|---|
+| `MIMI_HUB_COMPRESS` | `1` | `0`: no `.mimi` at all, only transcripts and ad marks (the app then plays originals via the hub) |
+| `MIMI_HUB_SOURCES` | `fetch` | originals for transcript-only episodes: `fetch` = not stored, re-fetched from the publisher when asked (409 if the publisher's file changed); `keep` = stored on disk |
+| `MIMI_HUB_SEGMENTER` | `codex:gpt-6.1-sol,claude:claude-haiku-5-5` | ad detection via logged-in agent CLIs, tried in order; `off` to disable |
+| `MIMI_HUB_DEVICE` | `auto` | `cuda` / `cpu` |
+| `MIMI_HUB_DIARIZER` | `auto` | `pyannote` (GPU; gated HF model, fetch once with a token) / `sherpa` (CPU) |
+| `MIMI_HUB_ASR_ENCODER` | `native` | `onnx2torch` for the converted ONNX encoder |
+| `MIMI_HUB_TOKEN` | (none) | require `Authorization: Bearer <token>` |
+| `MIMI_HUB_DATA` | `hub_data/` | where `.mimi` / `.vtt` / records live |
