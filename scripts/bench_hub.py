@@ -2,7 +2,7 @@
 
     uv run python scripts/bench_hub.py data/ref/ref_24k.wav [--minutes 44] [--out outputs/bench_hub.json]
 
-Uses the hub's own models and settings (hub.mimi_hub.models(), diarize()). Every stage runs on the CPU.
+Uses the hub's own models and settings (hub.mimi_hub.models(), diarize()), on the device the hub picks.
 """
 
 import argparse

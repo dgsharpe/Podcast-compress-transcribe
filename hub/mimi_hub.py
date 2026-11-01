@@ -279,26 +279,24 @@ def cues(seg, max_s=7.0, max_chars=110):
 # over-splitting is the lesser evil. 0.9 merged hosts; TitaNet over-split. ~115 s per 44 min on 8 threads. Speakers
 # are numbered by first appearance; ones with < 30 s in total are folded into their neighbours.
 
-# MIMI_HUB_DIARIZER=pyannote switches to pyannote's speaker-diarization-community-1 (VBx clustering): on the same
-# episode it split the hosts the same way (19.3 / 16.6 min) but took 931 s instead of ~115 s on CPU. Gated model:
-# fetch it once into the HF cache with a token (a Hugging Face token); the hub then
-# loads it from the cache, offline, with no token.
+# pyannote's speaker-diarization-community-1 (VBx clustering) splits the hosts the same way (19.3 / 16.6 min on the
+# same episode). Stock, it took 931 s on the CPU and 142 s on the GPU; with hub/pyannote_gpu.py's batched embedding
+# step (identical output: DER 0.0000 against stock) it takes 33 s on the GPU, so it's the default there
+# (MIMI_HUB_DIARIZER=auto; or pyannote / sherpa). Gated model: fetch it once into the HF cache with a token
+# (a Hugging Face token); the hub then loads it from the cache, offline, with no token.
 MODELS_DIR = Path(os.environ.get("MIMI_HUB_MODELS", ROOT / "hub_models"))
-DIARIZER = os.environ.get("MIMI_HUB_DIARIZER", "sherpa")
+DIARIZER = os.environ.get("MIMI_HUB_DIARIZER", "auto")
 PYANNOTE_MODEL = "pyannote/speaker-diarization-community-1"
-DIAR_NAME = (PYANNOTE_MODEL if DIARIZER == "pyannote"
-             else "pyannote-seg-3.0 + wespeaker-resnet34 @0.6 (sherpa-onnx)")
+SHERPA_NAME = "pyannote-seg-3.0 + wespeaker-resnet34 @0.6 (sherpa-onnx)"
 DIAR_THRESHOLD, DIAR_MIN_TALK_S = 0.6, 30.0
 _diar_lock = threading.Lock()
 
 
 def _pyannote_turns(wav16):
     import torch
-    from huggingface_hub import snapshot_download
-    from pyannote.audio import Pipeline
-    if "diar_pyannote" not in _models:
-        path = snapshot_download(PYANNOTE_MODEL, local_files_only=True)  # cached; no token at runtime
-        _models["diar_pyannote"] = Pipeline.from_pretrained(path)
+    from hub import pyannote_gpu
+    if "diar_pyannote" not in _models:  # from the HF cache; no token at runtime
+        _models["diar_pyannote"] = pyannote_gpu.load(_models.get("device", "cpu"))
     out = _models["diar_pyannote"]({"waveform": torch.from_numpy(wav16)[None], "sample_rate": 16000})
     ann = getattr(out, "speaker_diarization", out)
     return [(t.start, t.end, spk) for t, _, spk in ann.itertracks(yield_label=True)]
@@ -328,15 +326,24 @@ def _sherpa_turns(wav16):
 
 
 def diarize(wav16):
-    """[(start_s, end_s, speaker_number)], speakers numbered 1.. by first appearance."""
+    """([(start_s, end_s, speaker_number)], diarizer name), speakers numbered 1.. by first appearance."""
     with _diar_lock:  # one diarizer, not shared across threads
-        segs = _pyannote_turns(wav16) if DIARIZER == "pyannote" else _sherpa_turns(wav16)
+        segs = None
+        if DIARIZER == "pyannote" or (DIARIZER == "auto" and _models.get("device") == "cuda"):
+            try:
+                segs, name = _pyannote_turns(wav16), PYANNOTE_MODEL
+            except Exception:
+                if DIARIZER == "pyannote":
+                    raise
+                traceback.print_exc()  # e.g. pyannote missing or its model not cached: use sherpa
+        if segs is None:
+            segs, name = _sherpa_turns(wav16), SHERPA_NAME
     total = {}
     for a, b, k in segs:
         total[k] = total.get(k, 0.0) + b - a
     keep = [(a, b, k) for a, b, k in segs if total[k] >= DIAR_MIN_TALK_S]
     if not keep:
-        return []
+        return [], name
     out = []
     for a, b, k in segs:
         if total[k] < DIAR_MIN_TALK_S:  # fragment: take the speaker of the nearest kept turn
@@ -345,7 +352,7 @@ def diarize(wav16):
     number = {}
     for _, _, k in out:
         number.setdefault(k, len(number) + 1)
-    return [(a, b, number[k]) for a, b, k in out]
+    return [(a, b, number[k]) for a, b, k in out], name
 
 
 def speaker_for(a, b, turns):
@@ -527,10 +534,10 @@ def transcribe(m, pcm, cond, out):
 
         def speakers():
             try:
-                out["turns"] = diarize(wav16)
+                out["turns"], out["diarization"] = diarize(wav16)
             except Exception:
                 traceback.print_exc()  # a transcript without speakers is still useful
-                out["turns"] = []
+                out["turns"], out["diarization"] = [], None
 
         d = threading.Thread(target=speakers, daemon=True, name="mimi-diarize")
         d.start()
@@ -598,7 +605,7 @@ def run(i):
                 f.write(f"{vtt_time(a)} --> {vtt_time(b)}\n{f'<v Speaker {who}>' if who else ''}{text}\n\n")
         (DATA / f"{i}.vtt.tmp").replace(DATA / f"{i}.vtt")
         update(i, state="ready", progress=1.0, asr=ASR_MODEL, device=m["device"],
-               speakers=len({t[2] for t in turns}), diarization=DIAR_NAME if turns else None)
+               speakers=len({t[2] for t in turns}), diarization=tx["diarization"] if turns else None)
         queue_segments(i)
     except Exception as e:
         traceback.print_exc()

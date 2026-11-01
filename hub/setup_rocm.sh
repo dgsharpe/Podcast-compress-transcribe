@@ -16,5 +16,5 @@ PINS
 uv pip install -q --prerelease=allow --index-url "$IDX" -c .venv-rocm/constraints.txt torch torchaudio torchvision numpy
 uv pip install -q --prerelease=allow --extra-index-url "$IDX" --index-strategy unsafe-best-match \
   -c .venv-rocm/constraints.txt "transformers>=4.50" soundfile librosa scipy "fastapi>=0.162" python-multipart httpx \
-  uvicorn "onnx-asr[cpu,hub]>=0.12" "sherpa-onnx>=2.0.1" onnx onnx2torch
+  uvicorn "onnx-asr[cpu,hub]>=0.12" "sherpa-onnx>=2.0.1" onnx onnx2torch "pyannote-audio>=4"
 .venv-rocm/bin/python -c "import torch; assert torch.cuda.is_available(), 'no ROCm GPU'; print(torch.__version__, torch.cuda.get_device_name(0))"
