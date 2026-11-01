@@ -356,7 +356,8 @@ def cues(seg, max_s=7.0, max_chars=110):
 # same episode). Stock, it took 931 s on the CPU and 142 s on the GPU; with hub/pyannote_gpu.py's batched embedding
 # step (identical output: DER 0.0000 against stock) it takes 33 s on the GPU, so it's the default there
 # (MIMI_HUB_DIARIZER=auto; or pyannote / sherpa). Gated model: fetch it once into the HF cache with a token
-# (a Hugging Face token); the hub then loads it from the cache, offline, with no token.
+# (accept its terms on huggingface.co, then e.g. `HF_TOKEN=... hf download pyannote/speaker-diarization-community-1`);
+# the hub then loads it from the cache, offline, with no token.
 MODELS_DIR = Path(os.environ.get("MIMI_HUB_MODELS", ROOT / "hub_models"))
 DIARIZER = os.environ.get("MIMI_HUB_DIARIZER", "auto")
 PYANNOTE_MODEL = "pyannote/speaker-diarization-community-1"

@@ -15,7 +15,10 @@ android {
         versionCode = 1
         versionName = "0.1"
         ndk { abiFilters += "arm64-v8a" }
+        // default hub URL: blank unless the build sets the Gradle property mimiHubUrl (kept out of the repo)
+        buildConfigField("String", "HUB_URL", "\"${providers.gradleProperty("mimiHubUrl").getOrElse("")}\"")
     }
+    buildFeatures { buildConfig = true }
     compileOptions {
         sourceCompatibility = JavaVersion.VERSION_17
         targetCompatibility = JavaVersion.VERSION_17

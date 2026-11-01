@@ -1,6 +1,6 @@
 """Run in a throwaway NeMo venv (data/venv-nemo: CPU torch + nemo_toolkit[asr]): NVIDIA reference for the hub's
 Parakeet encoders, on batches exported to data/nemo_check/ from the hub env."""
-import glob, json
+import glob, json, os
 import numpy as np, torch
 def stats(got, ref, lens):
     cos, rel = [], []
@@ -11,7 +11,7 @@ def stats(got, ref, lens):
     return min(cos), max(rel)
 def main():
     import nemo.collections.asr as nemo_asr
-    path = glob.glob("~/.cache/huggingface/hub/models--nvidia--parakeet-tdt-0.6b-v2/snapshots/*/parakeet-tdt-0.6b-v2.nemo")[0]
+    path = glob.glob(os.path.expanduser("~/.cache/huggingface/hub/models--nvidia--parakeet-tdt-0.6b-v2/snapshots/*/parakeet-tdt-0.6b-v2.nemo"))[0]
     model = nemo_asr.models.ASRModel.restore_from(path, map_location="cpu").eval()
     torch.set_num_threads(16)
     d = np.load("data/nemo_check/batches.npz")

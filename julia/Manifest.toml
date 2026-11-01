@@ -10,7 +10,7 @@ version = "1.11.0"
 
 [[deps.BayesBoot]]
 deps = ["HypergeometricFunctions", "PrecompileTools", "QuadGK", "Random", "SpecialFunctions", "Statistics"]
-path = "~/Lab_notebook/stats_fuckery/bb/BayesBoot.jl"
+path = "../../../stats_fuckery/bb/BayesBoot.jl"
 uuid = "288eb149-8f73-4ef6-b507-31cc64d272b3"
 version = "0.1.0"
 

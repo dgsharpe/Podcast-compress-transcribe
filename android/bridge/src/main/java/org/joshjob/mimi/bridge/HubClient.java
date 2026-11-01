@@ -24,7 +24,7 @@ import org.json.JSONObject;
  * `.mimi` + `.vtt` files into the {@link Library}. Jobs are process-wide so they survive the activity.
  */
 final class HubClient {
-  static final String DEFAULT_URL = "http://<tailscale-ip>:8765";  // the server on Tailscale
+  static final String DEFAULT_URL = BuildConfig.HUB_URL;  // Gradle property mimiHubUrl; blank: none set
 
   /** A conversion this app asked for. */
   static final class Job {
