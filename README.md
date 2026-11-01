@@ -1,7 +1,16 @@
 # neural_audio
 
-Neural speech codecs for a personal podcast pipeline: re-encode episodes on the server, serve them
-with Whisper transcripts, decode on the phone (see `reports/Neural audio codecs SOTA 2026.md`).
+Neural speech codecs for a personal podcast pipeline: the server re-encodes episodes with Mimi (32 codebooks,
+4.4 kb/s, ~2 MB/hour), transcribes them with speaker labels and marks ads / self-promotion; the phone decodes
+`.mimi` on its NPU + GPU (see `reports/Neural audio codecs SOTA 2026.md`, `bakeoff_2026-10-30.md`).
+
+| where | what |
+|---|---|
+| `hub/` | **mimi-hub** on the server (FastAPI, :8765, tailnet only): progressive `.mimi` conversion + streaming, Parakeet transcripts, diarization, LLM ad detection (`segments.py`). GPU env: `hub/setup_rocm.sh`; runs via `hub/serve.sh` (systemd unit in nix-config `home/server.nix`). |
+| `FORMAT.md`, `scripts/mimi_file.py` | the `.mimi` container |
+| `phone/libmimi/` | C decoder on LiteRT (NPU transformer, GPU conv decoder) |
+| `android/` | Media3 extension, demo player, Mimi Bridge (see `android/README.md`) |
+| `pocket-casts-android/` | the patched Pocket Casts: separate repo, private [joshjob42/pocket-casts-android](https://github.com/joshjob42/pocket-casts-android) branch `mimi` (`origin` there = Automattic upstream); build with `android/pc_build.sh` |
 
 ## Bake-off pipeline
 
