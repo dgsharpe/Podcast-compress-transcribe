@@ -122,6 +122,7 @@ def main():
     ap.add_argument("--clip-min", type=float, default=5.0)
     ap.add_argument("--check", type=int, default=3)
     ap.add_argument("--prep", type=int, default=None)
+    ap.add_argument("--subtype", default="FLOAT", help="the clips' WAV sample format (PCM_16: half the disk)")
     ap.add_argument("--procs", type=int, default=1, help="bulk processes, each with its own models (e.g. under MPS)")
     a = ap.parse_args()
     import soundfile as sf
@@ -134,7 +135,7 @@ def main():
     sources = []
     for k, (w24, _) in enumerate(clips):
         sources.append(work / f"clip{k:03d}.wav")
-        sf.write(sources[-1], w24, mimi_file.SR, subtype="FLOAT")
+        sf.write(sources[-1], w24, mimi_file.SR, subtype=a.subtype)
     if a.procs > 1:
         return multi(a, sources, work)
     m = throughput_server.setup(False)  # the hub's models (and its pyannote, for the reference)

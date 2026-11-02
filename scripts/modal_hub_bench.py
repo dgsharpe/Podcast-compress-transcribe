@@ -88,6 +88,8 @@ image = (
     .add_local_file(ROOT / "scripts/fp16_weights_check.py", f"{NA}/scripts/fp16_weights_check.py")
     .add_local_file(ROOT / "scripts/bulk_bench.py", f"{NA}/scripts/bulk_bench.py")
     .add_local_file(ROOT / "scripts/mimi_static_check.py", f"{NA}/scripts/mimi_static_check.py")
+    .add_local_file(ROOT / "scripts/model_ceiling.py", f"{NA}/scripts/model_ceiling.py")
+    .add_local_file(ROOT / "scripts/seg_profile.py", f"{NA}/scripts/seg_profile.py")
 )
 app = modal.App("mimi-hub-bench", image=image)
 
@@ -343,6 +345,45 @@ PLANS = {
         (["bulk_bench.py", "--clips", "128", "--check", "0", "--prep", "32"],
          {**FT_ENV, "BULK_WATCHDOG_S": "300", "MIMI_BULK_IN_FLIGHT": "96"}),
         (["bulk_bench.py", "--clips", "96", "--check", "0", "--prep", "24"], {**FT_ENV, "BULK_WATCHDOG_S": "300"}),
+    ],
+    # each model's ceiling at large batches (eager, compiled), and the 16-process MPS setup at the 2 s / 5 s step
+    "ceil1": [
+        (["model_ceiling.py"], {}),
+        (["model_ceiling.py", "--compile"], {}),
+        (["--clips", "64", "--workers", "1", "--procs", "16"], MPS_ENV),
+        (["--clips", "64", "--workers", "1", "--procs", "16"], {**MPS_ENV, "MIMI_HUB_DIAR_STEP": "0.5"}),
+    ],
+    # the segmentation model in parts (SincNet fp32 / TF32, LSTM), compiled ceilings, TF32 SincNet's DER, and bulk
+    # mode (free-threaded, Mimi graphs, 96 in flight) at the 5 s step
+    "seg1": [
+        (["seg_profile.py"], {}),
+        (["diar_precision_check.py", "fp16:32:cl1:seg16:fold", "fp16:32:cl1:seg16:fold:segtf32"], {}),
+        (["model_ceiling.py", "--compile"], {}),
+        (["bulk_bench.py", "--clips", "128", "--check", "0", "--prep", "32"],
+         {**FT_ENV, "BULK_WATCHDOG_S": "300", "MIMI_BULK_IN_FLIGHT": "96", "MIMI_HUB_DIAR_STEP": "0.5"}),
+    ],
+    # compiled ceilings (models loaded first), and bulk mode on a 256-episode backlog at the 5 s step (128 episodes
+    # with 96 in flight was mostly ramp-up and tail: no stage above 60% busy)
+    "seg2": [
+        (["model_ceiling.py", "--compile"], {}),
+        (["bulk_bench.py", "--clips", "256", "--check", "0", "--prep", "32"],
+         {**FT_ENV, "BULK_WATCHDOG_S": "400", "MIMI_BULK_IN_FLIGHT": "96", "MIMI_HUB_DIAR_STEP": "0.5"}),
+    ],
+    # bulk mode's steady state: a 1,024-episode backlog (85 h) at the 5 s step; each model through torch.compile
+    "seg3": [
+        (["bulk_bench.py", "--clips", "1024", "--check", "0", "--prep", "32", "--subtype", "PCM_16"],
+         {**FT_ENV, "BULK_WATCHDOG_S": "850", "MIMI_BULK_IN_FLIGHT": "96", "MIMI_HUB_DIAR_STEP": "0.5"}),
+        (["model_ceiling.py", "--compile", "parakeet"], {}),
+        (["model_ceiling.py", "--compile", "mimi_seanet"], {}),
+        (["model_ceiling.py", "--compile", "resnet"], {}),
+        (["model_ceiling.py", "--compile", "segmentation"], {}),
+    ],
+    # the same models with max-autotune (slow compiles: a run of its own, within the function's 25 min)
+    "seg4": [
+        (["model_ceiling.py", "--compile", "parakeet", "--mode", "max-autotune-no-cudagraphs"], {}),
+        (["model_ceiling.py", "--compile", "mimi_seanet", "--mode", "max-autotune-no-cudagraphs"], {}),
+        (["model_ceiling.py", "--compile", "resnet", "--mode", "max-autotune-no-cudagraphs"], {}),
+        (["model_ceiling.py", "--compile", "segmentation", "--mode", "max-autotune-no-cudagraphs"], {}),
     ],
     # pushing one GPU: where its time goes, then a 32-clip backlog (160 min) at more processes
     "push1": [
