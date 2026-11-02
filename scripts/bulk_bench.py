@@ -1,7 +1,10 @@
 """hub/bulk.py on a backlog of clips of the reference episode: throughput, batch sizes, and the output of the first
 --check clips against the hub's one-episode path (transcript words, Mimi codes, DER of the speaker turns).
 
-    python scripts/bulk_bench.py [--clips 48] [--clip-min 5] [--check 3] [--prep N]
+    python scripts/bulk_bench.py [--clips 48] [--clip-min 5] [--check 3] [--prep N] [--profile 60:5]
+
+--profile START:SECONDS: torch.profiler over SECONDS of the run from START s in, then the GPU kernel time launched
+inside each stage (hub/bulk.py's stage:* labels) and the top kernels.
 """
 import argparse
 import difflib
@@ -95,6 +98,79 @@ def multi(a, sources, work):
                                              for g in got]}), flush=True)
 
 
+def _profiler(start_s, seconds):
+    """Profile [seconds] of the run from [start_s] in (a thread; the run blocks the main one). -> the profiler."""
+    import threading
+    import torch
+    from torch._C._profiler import _ExperimentalConfig
+    prof = torch.profiler.profile(activities=[torch.profiler.ProfilerActivity.CPU,
+                                              torch.profiler.ProfilerActivity.CUDA],
+                                  experimental_config=_ExperimentalConfig(profile_all_threads=True))  # the workers
+
+    def run():
+        time.sleep(start_s)
+        prof.start()
+        time.sleep(seconds)
+        prof.stop()
+    threading.Thread(target=run, daemon=True, name="profiler").start()
+    return prof
+
+
+def profile_summary(prof, seconds):
+    """GPU time per stage. Each kernel goes to the stage:* span on its own stream that contains it (kineto puts
+    record_function spans on the GPU timeline too); a kernel outside any span (CUDA-graph replays and the TDT
+    search's kernels got none) goes to its stream's stage: every stage runs on streams of its own, so a stream is
+    the stage most of its labelled kernel time is, and unlabelled time on an ASR stream is the decoder. GPU busy =
+    the union of kernel intervals (streams overlap)."""
+    import bisect
+    from collections import defaultdict
+    from torch.autograd import DeviceType
+    gpu = [e for e in prof.events() if e.device_type != DeviceType.CPU]
+    spans, kernels = defaultdict(list), []
+    for e in gpu:
+        r = (e.time_range.start, e.time_range.end)
+        if e.is_user_annotation:
+            if e.name.startswith("stage:"):
+                spans[e.device_resource_id].append((*r, e.name[6:]))
+        else:
+            kernels.append((*r, e.device_resource_id, e.name))
+    for v in spans.values():
+        v.sort()
+    labelled, by_name = [], defaultdict(lambda: [0.0, 0])
+    per_stream = defaultdict(lambda: defaultdict(float))
+    for s0, s1, stream, name in kernels:
+        v = spans.get(stream, [])
+        k = bisect.bisect_right(v, (s0, float("inf"), "")) - 1
+        label = v[k][2] if k >= 0 and v[k][1] >= s0 else None
+        labelled.append((stream, label, (s1 - s0) / 1e6))
+        if label:
+            per_stream[stream][label] += (s1 - s0) / 1e6
+        by_name[name][0] += (s1 - s0) / 1e6
+        by_name[name][1] += 1
+    owner = {st: max(v, key=v.get) for st, v in per_stream.items()}
+    stage, streams = defaultdict(float), defaultdict(float)
+    for stream, label, t in labelled:
+        if label is None:
+            label = owner.get(stream, "other")
+            label = "asr-decode" if label == "asr-encode" else label
+        stage[label] += t
+        streams[f"{stream}:{owner.get(stream, 'other')}"] += t
+    busy, end = 0.0, None
+    for s0, s1, _, _ in sorted(kernels):
+        if end is None or s0 > end:
+            busy, end = busy + (s1 - s0), s1
+        elif s1 > end:
+            busy, end = busy + (s1 - end), s1
+    total = sum(stage.values())
+    top = sorted(by_name.items(), key=lambda kv: -kv[1][0])[:15]
+    window = (max(k[1] for k in kernels) - min(k[0] for k in kernels)) / 1e6  # kernels finish after stop()
+    return {"window_s": round(window, 2), "gpu_busy_frac": round(busy / 1e6 / window, 3), "kernel_s": round(total, 2),
+            "stage_share": {k: round(v / total, 3) for k, v in sorted(stage.items(), key=lambda kv: -kv[1])},
+            "stage_kernel_s": {k: round(v, 2) for k, v in sorted(stage.items(), key=lambda kv: -kv[1])},
+            "streams": {k: round(v, 2) for k, v in sorted(streams.items(), key=lambda kv: -kv[1])[:12]},
+            "top_kernels": [(name[:90], round(t, 3), n) for name, (t, n) in top]}
+
+
 def _watchdog(seconds):
     """After [seconds], print every thread's stack (a hang shows where; works with the GIL off, unlike faulthandler's
     all-threads dump) and exit."""
@@ -123,6 +199,7 @@ def main():
     ap.add_argument("--check", type=int, default=3)
     ap.add_argument("--prep", type=int, default=None)
     ap.add_argument("--subtype", default="FLOAT", help="the clips' WAV sample format (PCM_16: half the disk)")
+    ap.add_argument("--profile", default=None, help="START:SECONDS of the timed run to profile")
     ap.add_argument("--procs", type=int, default=1, help="bulk processes, each with its own models (e.g. under MPS)")
     a = ap.parse_args()
     import soundfile as sf
@@ -142,9 +219,15 @@ def main():
     refs = [reference(m, *clips[k]) for k in range(min(a.check, len(clips)))]
     models = bulk.Models()
     bulk.convert(sources[:2], work / "warmup", a.prep, models)  # kernels for every shape, pool started
+    prof = None
+    if a.profile:
+        start_s, seconds = map(float, a.profile.split(":"))
+        prof = _profiler(start_s, seconds)
     t = time.perf_counter()
     summary, stats = bulk.convert(sources, work / "out", a.prep, models)
     summary["wall_incl_s"] = round(time.perf_counter() - t, 1)
+    if prof is not None:
+        print("PROFILE " + json.dumps(profile_summary(prof, seconds)), flush=True)
     checks = []
     for k, (codes, words, turns) in enumerate(refs):
         name = sources[k].stem

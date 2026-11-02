@@ -419,6 +419,12 @@ PLANS = {
          {**FT_ENV, "BULK_WATCHDOG_S": "880", "MIMI_BULK_IN_FLIGHT": "96", "MIMI_HUB_DIAR_STEP": "0.5",
           "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True"}),
     ],
+    # where bulk mode's GPU time goes now (AOT models, 5 s step): 5 s of kernels per stage, 40 s into the run
+    "prof1": [
+        (["bulk_bench.py", "--clips", "512", "--check", "0", "--prep", "32", "--subtype", "PCM_16", "--profile", "40:5"],
+         {**FT_ENV, "BULK_WATCHDOG_S": "880", "MIMI_BULK_IN_FLIGHT": "96", "MIMI_HUB_DIAR_STEP": "0.5",
+          "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True"}),
+    ],
     # AOTInductor prototype: Parakeet (one bucket) and the ResNet as packages, with the GIL and free-threaded
     "aot1": [
         (["aoti_check.py"], {"MIMI_HUB_COMPILE": "0"}),

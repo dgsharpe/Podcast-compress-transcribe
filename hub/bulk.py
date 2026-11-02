@@ -195,7 +195,8 @@ class Batcher:
                     with torch.cuda.stream(self.stream), torch.inference_mode():
                         for it in group:
                             self.stream.wait_event(it["ready"])
-                        y = self.fn(torch.cat([it["x"] for it in group]))
+                        with torch.profiler.record_function(f"stage:{self.name}"):  # for scripts/bulk_bench --profile
+                            y = self.fn(torch.cat([it["x"] for it in group]))
                         self.stream.synchronize()
                     k = 0
                     for it in group:
@@ -280,17 +281,18 @@ def mimi_worker(models, pieces, name="mimi", index=0):
             with torch.cuda.stream(stream):
                 xt = torch.from_numpy(x).pin_memory().to("cuda", non_blocking=True)[:, None]
                 out = []
-                if static is not None:
-                    static.reset()
-                    for c0 in range(0, L, CHUNK_FRAMES):
-                        out.append(static.encode(xt[..., c0 * spf:(c0 + CHUNK_FRAMES) * spf]).transpose(1, 2))
-                else:
-                    kv, pad = None, None
-                    for c0 in range(0, L, CHUNK_FRAMES):
-                        o = mimi_hub.mimi_encode(models.mimi, xt[..., c0 * spf:(c0 + CHUNK_FRAMES) * spf],
-                                                 encoder_past_key_values=kv, padding_cache=pad, use_streaming=True)
-                        kv, pad = o.encoder_past_key_values, o.padding_cache
-                        out.append(o.audio_codes.transpose(1, 2))  # (B, frames, 32)
+                with torch.profiler.record_function("stage:mimi"):  # for scripts/bulk_bench --profile
+                    if static is not None:
+                        static.reset()
+                        for c0 in range(0, L, CHUNK_FRAMES):
+                            out.append(static.encode(xt[..., c0 * spf:(c0 + CHUNK_FRAMES) * spf]).transpose(1, 2))
+                    else:
+                        kv, pad = None, None
+                        for c0 in range(0, L, CHUNK_FRAMES):
+                            o = mimi_hub.mimi_encode(models.mimi, xt[..., c0 * spf:(c0 + CHUNK_FRAMES) * spf],
+                                                     encoder_past_key_values=kv, padding_cache=pad, use_streaming=True)
+                            kv, pad = o.encoder_past_key_values, o.padding_cache
+                            out.append(o.audio_codes.transpose(1, 2))  # (B, frames, 32)
                 codes = torch.cat(out, dim=1).cpu().numpy()
         except Exception as e:  # noqa: BLE001
             for ep, _ in batch:
@@ -335,9 +337,11 @@ def asr_worker(models, segments, name="asr", slot=0):
             lens = torch.tensor([n for _, n in feats], dtype=torch.int64)
             try:
                 with torch.cuda.stream(stream):
-                    enc, enc_lens = encoder.encode(x, lens)
-                    found = (asr._decoding.decode_graphed(enc, enc_lens, slot) if graphed
-                             else asr._decoding(enc, enc_lens, need_logprobs=True))
+                    with torch.profiler.record_function("stage:asr-encode"):
+                        enc, enc_lens = encoder.encode(x, lens)
+                    with torch.profiler.record_function("stage:asr-decode"):
+                        found = (asr._decoding.decode_graphed(enc, enc_lens, slot) if graphed
+                                 else asr._decoding(enc, enc_lens, need_logprobs=True))
                     results = list(map(asr._decode_tokens, *zip(*found)))
             except Exception as e:  # noqa: BLE001
                 for ep, _ in batch:

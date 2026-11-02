@@ -208,7 +208,8 @@ def get_embeddings(self, file, binary_segmentations, exclude_overlap=False, hook
         for k, c0 in enumerate(range(0, num_chunks, BATCH_CHUNKS), 1):
             c1 = min(num_chunks, c0 + BATCH_CHUNKS)
             chunks = w[starts[c0:c1, None] + offsets][:, None]  # (batch, 1, samples)
-            with _FBANK_LOCK:  # vmap inside: not safe to enter from several threads at once
+            # vmap inside: not safe to enter from several threads at once (label: scripts/bulk_bench.py --profile)
+            with _FBANK_LOCK, torch.profiler.record_function("stage:fbank"):
                 fbank = model.compute_fbank(chunks)
             mode = _frames_mode(device)
             if mode == "coreml":  # fixed batch: the last one is zero-padded
