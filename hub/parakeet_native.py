@@ -11,6 +11,7 @@ weights are mapped onto ParakeetEncoder here: model_config.yaml and model_weight
 import math
 import re
 import tarfile
+import threading
 from pathlib import Path
 
 import torch
@@ -110,25 +111,44 @@ class NativeEncoder:
     # static, the batch dim dynamic: on an H100 (64 x 20 s) static shapes 111 -> 67 ms, a dynamic batch 119 -> 77 ms,
     # a dynamic time dim 119 -> 146 ms (slower than eager), both dynamic 0.84x. The encoder masks padded frames in
     # every layer, so the padding doesn't change the output. A batch of 1 is padded to 2 (one graph less).
-    BUCKET = 512
+    # compile="aot": an AOTInductor package per bucket (hub/aoti.py; 1.7x on an H100, with or without the GIL);
+    # "jit": torch.compile.
+    BUCKET, MAX_FRAMES = 512, 2048
 
-    def __init__(self, encoder, dtype=torch.float16, compile=False):
+    def __init__(self, encoder, dtype=torch.float16, compile=None):
         self.encoder, self.dtype, self.compiled = encoder, dtype, compile
-        if compile and torch.version.hip:
-            import torch._inductor.config as inductor
-            # its memory-coalescing tiling analysis asserted on dynamic shapes (torch 2.12 nightly, ROCm)
-            inductor.triton.coalesce_tiling_analysis = False
-        self.forward = torch.compile(encoder) if compile else encoder
-        if compile:  # every bucket traced now, not by the workers mid-run (two threads in one recompile failed)
-            device = next(encoder.parameters()).device
-            try:
-                for t in range(self.BUCKET, 2048 + 1, self.BUCKET):
-                    for b in (2, 3):  # a second batch size: the recompile with the batch dim dynamic, here
+        self.forward, self.aot = encoder, {}
+        # one encoder call at a time: from two threads at once (hub/bulk.py's ASR workers, free-threaded) cuDNN's
+        # convolutions failed now and then (CUDNN_STATUS_EXECUTION_FAILED, 40 of 1,024 episodes; GPU memory was not
+        # full). The workers still overlap their decoding; the GPU runs one encoder batch at a time anyway.
+        self._lock = threading.Lock()
+        if not compile:
+            return
+        device = next(encoder.parameters()).device
+        buckets = range(self.BUCKET, self.MAX_FRAMES + 1, self.BUCKET)
+        try:
+            if compile == "aot":
+                from hub import aoti
+                module = _AotEncoder(encoder, dtype).eval()
+                batch = torch.export.Dim("batch", min=2, max=1024)
+                for t in buckets:
+                    x = torch.zeros(2, t, encoder.config.num_mel_bins, device=device)
+                    mask = torch.ones(2, t, dtype=torch.bool, device=device)
+                    self.aot[t] = aoti.load(f"parakeet-encoder-{t}", module, (x, mask), ({0: batch}, {0: batch}),
+                                            num_runners=4)
+            else:
+                if torch.version.hip:
+                    import torch._inductor.config as inductor
+                    # its memory-coalescing tiling analysis asserted on dynamic shapes (torch 2.12 nightly, ROCm)
+                    inductor.triton.coalesce_tiling_analysis = False
+                self.forward = torch.compile(encoder)
+                for t in buckets:  # every bucket traced now, not by the workers mid-run (a recompile from two
+                    for b in (2, 3):  # threads failed); a second batch size: the recompile with it dynamic, here
                         self.encode(torch.zeros(b, t, encoder.config.num_mel_bins, device=device),
                                     torch.full((b,), t, device=device))
-            except Exception as e:  # noqa: BLE001 - e.g. a Python torch.compile doesn't support: eager
-                print(f"parakeet_native: torch.compile failed, eager: {type(e).__name__}: {e}"[:300], flush=True)
-                self.forward, self.compiled = encoder, False
+        except Exception as e:  # noqa: BLE001 - e.g. no compiler toolchain: eager
+            print(f"parakeet_native: {compile} compile failed, eager: {type(e).__name__}: {e}"[:300], flush=True)
+            self.forward, self.aot, self.compiled = encoder, {}, None
 
     def run(self, names, feeds):
         import numpy as np
@@ -149,13 +169,19 @@ class NativeEncoder:
                 if B == 1:
                     x, lengths = x.repeat(2, 1, 1), lengths.repeat(2)
             mask = torch.arange(x.shape[1], device=device)[None, :] < lengths[:, None]
-            if self.compiled:
+            if self.compiled == "jit":
                 for v in (x, mask):
                     torch._dynamo.maybe_mark_dynamic(v, 0)
                     torch._dynamo.mark_static(v, 1)
-        with torch.inference_mode(), torch.autocast(device.type, dtype=self.dtype, enabled=self.dtype != torch.float32):
-            out = self.forward(input_features=x, attention_mask=mask)
-        hidden, lens = out.last_hidden_state[:B], out.attention_mask[:B].sum(-1)
+        aot = self.aot.get(x.shape[1])  # (none for a segment over MAX_FRAMES: eager)
+        with self._lock, torch.inference_mode(), torch.autocast(device.type, dtype=self.dtype,
+                                                                 enabled=self.dtype != torch.float32):
+            if aot is not None:
+                hidden, out_mask = aot(x, mask)
+            else:
+                out = self.forward(input_features=x, attention_mask=mask)
+                hidden, out_mask = out.last_hidden_state, out.attention_mask
+        hidden, lens = hidden[:B], out_mask[:B].sum(-1)
         if self.compiled:  # the frames eager would return for T (each subsampling conv's output length)
             c, t = self.encoder.config, T
             k, stride = c.subsampling_conv_kernel_size, c.subsampling_conv_stride
@@ -163,6 +189,20 @@ class NativeEncoder:
                 t = (t + 2 * ((k - 1) // 2) - k) // stride + 1
             hidden = hidden[:, :t]
         return hidden, lens
+
+
+
+class _AotEncoder(torch.nn.Module):
+    """The encoder as NativeEncoder runs it (autocast), with plain tensor inputs / outputs, for torch.export."""
+
+    def __init__(self, encoder, dtype):
+        super().__init__()
+        self.encoder, self.dtype = encoder, dtype
+
+    def forward(self, x, mask):
+        with torch.autocast(x.device.type, dtype=self.dtype, enabled=self.dtype != torch.float32):
+            out = self.encoder(input_features=x, attention_mask=mask)
+        return out.last_hidden_state, out.attention_mask
 
 
 # ---------- TDT decoding ----------

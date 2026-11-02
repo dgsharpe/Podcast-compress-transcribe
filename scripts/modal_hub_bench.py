@@ -75,7 +75,14 @@ image = (
         "rm -rf /ft/lib/python3.14t/site-packages/google/_upb /ft/lib/python3.14t/site-packages/google/protobuf/pyext",
         "echo 'api_version = 0' > /ft/lib/python3.14t/site-packages/google/protobuf/internal/_api_implementation.py",
     )
-    .env(ENV)
+    # CUDA's compiler and headers for AOTInductor (torch.export + a C++ library built around the kernels)
+    .run_commands(
+        "apt-get update -q && apt-get install -y -q wget build-essential",
+        "wget -q https://developer.download.nvidia.com/compute/cuda/repos/debian$(. /etc/os-release; echo $VERSION_ID)"
+        "/x86_64/cuda-keyring_1.1-1_all.deb && dpkg -i cuda-keyring_1.1-1_all.deb && rm cuda-keyring_1.1-1_all.deb",
+        "apt-get update -q && apt-get install -y -q cuda-nvcc-13-0 cuda-cudart-dev-13-0 cuda-driver-dev-13-0",
+    )
+    .env({**ENV, "CUDA_HOME": "/usr/local/cuda-13.0"})
     .add_local_dir(ROOT / "data/modal_pyannote", "/models/pyannote")
     .add_local_file(ROOT / "data/ref/ref_24k.wav", f"{NA}/data/ref/ref_24k.wav")
     .add_local_dir(ROOT / "hub", f"{NA}/hub", ignore=["__pycache__", "*.pyc"])
@@ -91,6 +98,7 @@ image = (
     .add_local_file(ROOT / "scripts/model_ceiling.py", f"{NA}/scripts/model_ceiling.py")
     .add_local_file(ROOT / "scripts/seg_profile.py", f"{NA}/scripts/seg_profile.py")
     .add_local_file(ROOT / "scripts/compile_check.py", f"{NA}/scripts/compile_check.py")
+    .add_local_file(ROOT / "scripts/aoti_check.py", f"{NA}/scripts/aoti_check.py")
 )
 app = modal.App("mimi-hub-bench", image=image)
 
@@ -396,6 +404,26 @@ PLANS = {
          {**FT_ENV, "BULK_WATCHDOG_S": "850", "MIMI_BULK_IN_FLIGHT": "96", "MIMI_HUB_DIAR_STEP": "0.5",
           "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True"}),
     ],
+    # AOTInductor in the pipeline (MIMI_HUB_COMPILE auto = aot): checked against eager (which builds the packages),
+    # then the 16-process MPS setup and free-threaded bulk mode, both at the 5 s step
+    "aot2": [
+        (["compile_check.py", "aot"], {}),
+        (["--clips", "64", "--workers", "1", "--procs", "16"], {**MPS_ENV, "MIMI_HUB_DIAR_STEP": "0.5"}),
+        (["bulk_bench.py", "--clips", "1024", "--check", "0", "--prep", "32", "--subtype", "PCM_16"],
+         {**FT_ENV, "BULK_WATCHDOG_S": "880", "MIMI_BULK_IN_FLIGHT": "96", "MIMI_HUB_DIAR_STEP": "0.5",
+          "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True"}),
+    ],
+    # bulk mode again with the encoder calls serialized across its ASR workers (40 of 1,024 failed in cuDNN)
+    "aot3": [
+        (["bulk_bench.py", "--clips", "1024", "--check", "0", "--prep", "32", "--subtype", "PCM_16"],
+         {**FT_ENV, "BULK_WATCHDOG_S": "880", "MIMI_BULK_IN_FLIGHT": "96", "MIMI_HUB_DIAR_STEP": "0.5",
+          "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True"}),
+    ],
+    # AOTInductor prototype: Parakeet (one bucket) and the ResNet as packages, with the GIL and free-threaded
+    "aot1": [
+        (["aoti_check.py"], {"MIMI_HUB_COMPILE": "0"}),
+        (["aoti_check.py"], {**FT_ENV, "MIMI_HUB_COMPILE": "0"}),
+    ],
     # bulk mode alone (its free-threaded Python compiles its own kernels; after the others it ran out of time)
     "comp3": [
         (["bulk_bench.py", "--clips", "1024", "--check", "0", "--prep", "32", "--subtype", "PCM_16"],
@@ -430,6 +458,7 @@ CACHE = modal.Volume.from_name("mimi-hub-inductor-cache", create_if_missing=True
 def bench(gpu: str, runs: list) -> list:
     import torch
     os.environ["TORCHINDUCTOR_CACHE_DIR"] = "/cache/inductor"
+    os.environ["MIMI_HUB_AOTI"] = "/cache/aoti"  # hub/aoti.py's packages, shared by both Pythons and later runs
     sys.path.insert(0, NA)
     info = {"gpu": gpu, "device": torch.cuda.get_device_name(0), "vcpus": os.cpu_count(),
             "cpu_model": next((ln.split(":", 1)[1].strip() for ln in open("/proc/cpuinfo")

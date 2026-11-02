@@ -1,9 +1,9 @@
-"""The hub's compiled Parakeet encoder and pyannote ResNet (MIMI_HUB_COMPILE) against eager, on the shapes they get
+"""The hub's compiled Parakeet encoder and pyannote ResNet (MIMI_HUB_COMPILE: aot / jit) against eager, on the shapes they get
 in the pipeline (varied batch sizes and segment lengths, under inference_mode): output difference, time for the
 mixed sequence after warm-up, the CPU time spent issuing it (kernel launches: what a launch-bound process such as
 hub/bulk.py pays), and how many graphs were compiled (a recompile per shape would show up here).
 
-    python scripts/compile_check.py
+    python scripts/compile_check.py [aot|jit]
 """
 import json
 import os
@@ -16,6 +16,8 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 os.environ.setdefault("MIMI_HUB_DATA", "/tmp/mimi-compile-check")
 os.environ.setdefault("HF_HUB_OFFLINE", "1")
+HOW = sys.argv[1] if len(sys.argv) > 1 else "aot"
+os.environ["MIMI_HUB_COMPILE"] = "0"  # models load eager; each is compiled here, timed
 
 
 def mixed(fn, inputs):
@@ -50,7 +52,8 @@ def main():
     encoder = parakeet_native.load(mimi_hub.MODELS_DIR / f"{mimi_hub.ASR_MODEL}-hf", "cuda", half=True)
     eager = parakeet_native.NativeEncoder(encoder)
     t = time.perf_counter()
-    comp = parakeet_native.NativeEncoder(encoder, compile=True)
+    comp = parakeet_native.NativeEncoder(encoder, compile=HOW)
+    res["how"] = HOW
     res["parakeet_compile_s"] = round(time.perf_counter() - t, 1)
     inputs = []
     for b in (1, 2, 5, 16, 33, 64, 64, 40):
@@ -76,14 +79,12 @@ def main():
     pipe = pyannote_gpu.load("cuda", path=os.environ.get("TPUT_PYANNOTE_PATH"))
     model = pipe._embedding.model_
     mode = pyannote_gpu._frames_mode(torch.device("cuda"))
+    eager_frames = model.resnet.forward_frames
+    t = time.perf_counter()
+    pyannote_gpu.compile_frames(model, torch.device("cuda"), HOW)
+    res["resnet_compile_s"] = round(time.perf_counter() - t, 1)
     compiled_frames = model.resnet.forward_frames
-    eager_frames = getattr(compiled_frames, "_torchdynamo_orig_callable", None)
-    res["resnet_compiled_at_load"] = eager_frames is not None
-    if eager_frames is None:  # MIMI_HUB_COMPILE=0, or not NVIDIA
-        t = time.perf_counter()
-        pyannote_gpu.compile_frames(model, torch.device("cuda"))
-        res["resnet_compile_s"] = round(time.perf_counter() - t, 1)
-        eager_frames, compiled_frames = compiled_frames, model.resnet.forward_frames
+    assert compiled_frames is not eager_frames, "compile failed"
     inputs = []
     with torch.inference_mode():
         for n in (32, 7, 256, 100, 32, 1, 256, 13):
