@@ -4,6 +4,8 @@
 
 Runs the hub's ASR (VAD, length buckets, native encoder) over the reference episode; every batch's encoder output
 is decoded both ways. Reports segments with identical tokens / timestamps and each decoder's total time.
+DECODER_GRAPH=1: the CUDA-graph search; DECODER_PRECAPTURE=1 also captures its graphs up front in the main thread
+and replays them from a worker thread on its own stream, as hub/bulk.py does.
 """
 import argparse
 import json
@@ -37,6 +39,24 @@ def main():
     native = parakeet_native.NativeTdtDecoder(path, "cuda", asr._blank_idx, asr._vocab_size,
                                               max_symbols=asr._max_tokens_per_step)
     onnx = asr._decoding
+    precapture = os.environ.get("DECODER_PRECAPTURE") == "1"
+    if precapture:
+        from concurrent.futures import ThreadPoolExecutor
+        t = time.perf_counter()
+        native.capture_graphs(0, max_batch=64)
+        capture_s = time.perf_counter() - t
+        worker, worker_stream = ThreadPoolExecutor(1), torch.cuda.Stream()
+
+    def graphed(enc, lens):
+        enc, lens = torch.from_numpy(np.ascontiguousarray(enc)).cuda(), torch.from_numpy(np.asarray(lens))
+        if not precapture:
+            return list(native.decode_graphed(enc, lens))
+
+        def run():
+            with torch.cuda.stream(worker_stream):
+                worker_stream.wait_stream(torch.cuda.default_stream())
+                return list(native.decode_graphed(enc, lens))
+        return worker.submit(run).result()
     stats = {"segments": 0, "tokens_same": 0, "times_same": 0, "tokens": 0, "onnx_s": 0.0, "native_s": 0.0,
              "examples": []}
 
@@ -47,8 +67,7 @@ def main():
         torch.cuda.synchronize()
         t = time.perf_counter()
         if os.environ.get("DECODER_GRAPH") == "1":  # the CUDA-graph search (hub/bulk.py)
-            new = list(native.decode_graphed(torch.from_numpy(np.ascontiguousarray(enc)).cuda(),
-                                             torch.from_numpy(np.asarray(lens))))
+            new = graphed(enc, lens)
         else:
             new = list(native(enc, lens, **kw))
         torch.cuda.synchronize()
@@ -74,6 +93,10 @@ def main():
     stats["audio_s"] = round(len(w16) / 16000, 1)
     stats["onnx_s"], stats["native_s"] = round(stats["onnx_s"], 2), round(stats["native_s"], 2)
     stats["graph"] = os.environ.get("DECODER_GRAPH") == "1"
+    stats["precision"] = native.precision
+    stats["precapture"] = precapture
+    if precapture:
+        stats["capture_s"] = round(capture_s, 1)
     print("DECODER " + json.dumps(stats), flush=True)
 
 

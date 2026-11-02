@@ -243,8 +243,7 @@ class Models:
         seg.forward = Batcher(seg.forward, DIAR_ROWS, BATCH_WAIT_S, name="bulk-segmentation")
         self.pipe, self.batchers = pipe, {"resnet": frames, "segmentation": seg.forward}
         if ASR_GRAPH == "1" or (ASR_GRAPH == "auto" and not torch.version.hip):  # captured now, not mid-run
-            for k in range(ASR_WORKERS):
-                self.asr._decoding.capture_graphs(k, max_batch=ASR_BATCH)
+            self.asr._decoding.capture_graphs(0, max_batch=ASR_BATCH)  # one set, shared by the workers
         self.mimi_static = []
         # one set per Mimi worker, captured now, before any worker runs on the GPU
         if MIMI_GRAPH == "1" or (MIMI_GRAPH == "auto" and not torch.version.hip):

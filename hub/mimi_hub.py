@@ -37,6 +37,8 @@ GPU: run in .venv-rocm (hub/setup_rocm.sh; hub/serve.sh picks it) and the Mimi e
 the Radeon 8060S (MIMI_HUB_DEVICE=auto | cuda | cpu). Diarization and Parakeet's decoding loop stay on the CPU.
 """
 
+import atexit
+import contextlib
 import gzip
 import hashlib
 import itertools
@@ -227,6 +229,7 @@ def models():
     with _models_lock:  # jobs starting together on a fresh hub must not see half-loaded models
         if not _models:
             _models.update(_load_models())
+            _vad_workers()  # (MIMI_HUB_VAD_SHARDS) started with the models, not by the first episode
     return _models
 
 
@@ -791,9 +794,33 @@ _vad_pre = threading.local()  # (n_samples, probabilities) for the VAD call of t
 STREAM_ASR = os.environ.get("MIMI_HUB_STREAM_ASR", "0") == "1"
 STREAM_WINDOW = int(os.environ.get("MIMI_HUB_STREAM_WINDOW", "64"))
 
+# For one episode on a GPU with room to spare (a cloud H100: the hub's order left it waiting on one CPU thread for
+# ~10 of a 43 min episode's 15 s): diarization starts as soon as the audio is resampled (~1 s), on its own CUDA
+# stream, alongside the VAD and ASR (streamed, as STREAM_ASR), instead of after them. Same speakers; streamed ASR
+# batches segments differently, which moved a few close calls (2 43 min episodes: 3 / 5 of ~900 cues, 99.97% of words
+# the same). On the server (GPU-bound) a 43 min upload was ready 26.5 -> 24.5 s.
+LATENCY = os.environ.get("MIMI_HUB_LATENCY", "0") == "1"
+# Silero VAD in this many worker processes (hub/vad_shard.py; 0: one thread, frame by frame, identical to onnx_asr):
+# 4.6 s -> ~0.4 s for a 43 min episode on the server; the transcript of the reference was word for word the same.
+# Latency mode's default 16.
+VAD_SHARDS = int(os.environ.get("MIMI_HUB_VAD_SHARDS", "16" if LATENCY else "0"))
+_vad_pool = None
+
+
+def _vad_workers():
+    global _vad_pool
+    if _vad_pool is None and VAD_SHARDS > 1:
+        from hub import vad_shard
+        _vad_pool = vad_shard.pool(VAD_SHARDS)
+        atexit.register(_vad_pool.shutdown, wait=False, cancel_futures=True)
+        list(_vad_pool.map(abs, range(VAD_SHARDS)))  # started (and their sessions loaded) now, not by an episode
+    return _vad_pool
+
 
 class _StreamPrep:
-    """[pcm] at 16 kHz, and SileroVad._encode's per-frame probabilities of it, as ffmpeg decodes it (a thread)."""
+    """[pcm] at 16 kHz, and SileroVad._encode's per-frame probabilities of it, as ffmpeg decodes it: one thread
+    resamples, another runs the VAD behind it (wav16() is ready as soon as the resampling is, ~1 s for a 43 min
+    episode; the VAD, one ONNX call per 32 ms, takes ~5 s more)."""
 
     END = object()
 
@@ -802,21 +829,58 @@ class _StreamPrep:
         self.pcm, self.cond, self.vad, self.sr, self.hop, self.ctx = pcm, cond, vad, sr, hop, ctx
         self.w = np.empty(int(len(pcm.buf) * sr / mimi_file.SR) + 1024, np.float32)
         self.n = 0  # samples written
-        self.length = None  # the final number of samples, once decoded
+        self.length = None  # the final number of samples, once resampled
         self.probs = []
         self.q = queue.Queue()
-        self.finished = threading.Event()
-        threading.Thread(target=self._run, daemon=True, name="mimi-prep").start()
+        self.grown = threading.Condition()  # w / n / length changed
+        self.resampled, self.finished = threading.Event(), threading.Event()
+        self.failed = False
+        threading.Thread(target=self._resample, daemon=True, name="mimi-resample").start()
+        threading.Thread(target=self._vad, daemon=True, name="mimi-vad").start()
 
-    def _run(self):
+    def _resample(self):
         import numpy as np
         import soxr
         try:
-            pcm, cond, hop, ctx = self.pcm, self.cond, self.hop, self.ctx
+            pcm, cond = self.pcm, self.cond
             rs = soxr.ResampleStream(mimi_file.SR, self.sr, 1, dtype="float32", quality="HQ")
+            pos = 0
+            while True:
+                with cond:
+                    while pcm.avail - pos < mimi_file.SR and not pcm.done:
+                        cond.wait(1.0)
+                    done, avail = pcm.done, pcm.avail
+                if done and pcm.error:
+                    self.failed = True
+                    return
+                y = rs.resample_chunk(pcm.buf[pos:avail], last=done)
+                pos = avail
+                with self.grown:
+                    if self.n + len(y) > len(self.w):
+                        self.w = np.concatenate([self.w, np.empty(self.n + len(y) - len(self.w) + self.sr,
+                                                                  np.float32)])
+                    self.w[self.n:self.n + len(y)] = y
+                    self.n += len(y)
+                    if done:
+                        self.length = self.n
+                    self.grown.notify_all()
+                if done:
+                    return
+        finally:
+            with self.grown:
+                self.failed = self.failed or self.length is None
+                self.grown.notify_all()
+            self.resampled.set()
+
+    def _vad(self):
+        if _vad_workers() is not None:
+            return self._vad_sharded()
+        import numpy as np
+        try:
+            hop, ctx = self.hop, self.ctx
             state = np.zeros((2, 1, 128), dtype=np.float32)
             srs = np.array([self.sr], dtype=np.int64)
-            pos, next_frame = 0, -1  # -1: the first (left-padded) frame; k >= 0: w[448 + 512 k:][:576]
+            next_frame = -1  # -1: the first (left-padded) frame; k >= 0: w[448 + 512 k:][:576]
 
             def vad_run(frame):
                 nonlocal state
@@ -825,39 +889,80 @@ class _StreamPrep:
                 self.q.put(o[0, 0])
 
             while True:
-                with cond:
-                    while pcm.avail - pos < mimi_file.SR and not pcm.done:
-                        cond.wait(1.0)
-                    done, avail = pcm.done, pcm.avail
-                if done and pcm.error:
-                    return
-                y = rs.resample_chunk(pcm.buf[pos:avail], last=done)
-                pos = avail
-                if self.n + len(y) > len(self.w):
-                    self.w = np.concatenate([self.w, np.empty(self.n + len(y) - len(self.w) + self.sr, np.float32)])
-                self.w[self.n:self.n + len(y)] = y
-                self.n += len(y)
-                if next_frame == -1 and self.n >= hop:
-                    vad_run(np.pad(self.w[:hop], (ctx, 0)))
+                with self.grown:
+                    # frame -1 needs the first hop samples, frame k >= 0 hop x (k + 2)
+                    while not self.failed and self.length is None and self.n < hop * (next_frame + 2):
+                        self.grown.wait(1.0)
+                    if self.failed:
+                        return
+                    w, n, length = self.w, self.n, self.length
+                if next_frame == -1 and n >= hop:
+                    vad_run(np.pad(w[:hop], (ctx, 0)))
                     next_frame = 0
-                while next_frame >= 0 and hop - ctx + hop * next_frame + ctx + hop <= self.n:
+                while next_frame >= 0 and hop - ctx + hop * next_frame + ctx + hop <= n:
                     a = hop - ctx + hop * next_frame
-                    vad_run(self.w[a:a + ctx + hop])
+                    vad_run(w[a:a + ctx + hop])
                     next_frame += 1
-                if done:
+                if length is not None and n == length:
                     break
-            if next_frame >= 0 and (last := self.n % hop):
-                vad_run(np.pad(self.w[self.n - last - ctx:self.n], (0, hop - last)))
+            if next_frame >= 0 and (last := n % hop):
+                vad_run(np.pad(w[n - last - ctx:n], (0, hop - last)))
             # as SileroVad._encode's output; under one frame: let the VAD do it all
             self.probs = np.array(self.probs, dtype=np.float32) if next_frame >= 0 else None
-            self.length = self.n
         finally:
             self.q.put(self.END)
             self.finished.set()
 
+    def _vad_sharded(self):
+        """As _vad, in hub/vad_shard.py's shards, each sent to a worker as soon as its audio is here."""
+        import numpy as np
+        from hub import vad_shard as vs
+        pending = queue.Queue()  # the shards' futures, in order
+
+        def collect():
+            try:
+                parts = []
+                while (f := pending.get()) is not None:
+                    probs = f.result()
+                    parts.append(probs)
+                    for p in probs:
+                        self.q.put(p)
+                self.probs = np.concatenate(parts) if parts else None
+            except Exception:
+                traceback.print_exc()
+                self.probs = None
+            finally:
+                self.q.put(self.END)
+                self.finished.set()
+        threading.Thread(target=collect, daemon=True, name="mimi-vad-collect").start()
+        try:
+            i0 = 0
+            while True:
+                i1 = i0 + vs.SHARD_FRAMES
+                with self.grown:  # until this shard's audio is here, or all of it is
+                    while not self.failed and self.length is None and self.n < vs.samples_for(i1):
+                        self.grown.wait(1.0)
+                    if self.failed:
+                        return
+                    w, n, length = self.w, self.n, self.length
+                if length is not None:
+                    i1 = min(i1, vs.n_frames(length))
+                if i0 >= i1:
+                    return
+                a = max(0, i0 - vs.WARM_FRAMES)
+                pending.put(_vad_pool.submit(vs._run, vs.frames(w, n, a, i1), i0 - a))
+                i0 = i1
+        finally:
+            pending.put(None)
+
     def wav16(self):
-        self.finished.wait()
+        """The resampled audio, once all of it is (the VAD may still be running)."""
+        self.resampled.wait()
         return self.w[:self.n]
+
+    def vad_probs(self):
+        self.finished.wait()
+        return self.probs
 
     def stream(self):
         """The probabilities as they come."""
@@ -926,10 +1031,34 @@ def transcribe(m, pcm, cond, out, on_cues=None):
         mark = out.get("mark", lambda k: None)
         prep = _StreamPrep(pcm, cond, m["asr"].vad) if STREAM_VAD else None
         streamed = None
+        diar_on_gpu = m.get("device", "cpu") != "cpu" and DIARIZER in ("auto", "pyannote")
+        if prep is not None and LATENCY:
+            wav16 = prep.wav16()
+            if pcm.error or prep.failed:
+                return  # the encoder reports it
+            mark("decoded")  # resampled (the VAD still running)
+
+            def speakers_early():
+                import torch
+                try:
+                    with torch.cuda.stream(torch.cuda.Stream()) if diar_on_gpu else contextlib.nullcontext():
+                        out["turns"], out["diarization"] = diarize(wav16)
+                except Exception:
+                    traceback.print_exc()
+                    out["turns"], out["diarization"] = [], None
+            d = threading.Thread(target=speakers_early, daemon=True, name="mimi-diarize")
+            d.start()
+            out["cues"] = [c for s in _stream_recognize(m["asr"], prep) for c in cues(s)]
+            mark("asr")
+            if on_cues:
+                on_cues(out["cues"])
+            d.join()
+            mark("diar")
+            return
         if prep is not None and STREAM_ASR:
             streamed = _stream_recognize(m["asr"], prep)  # done shortly after the download
         if prep is not None:
-            wav16, probs = prep.wav16(), prep.probs
+            wav16, probs = prep.wav16(), prep.vad_probs()
         else:
             with cond:
                 while not pcm.done:
@@ -951,7 +1080,6 @@ def transcribe(m, pcm, cond, out, on_cues=None):
         # this way the cues, and so ad detection, are ready sooner. Even for one episode alone: run alongside ASR,
         # a 43 min episode was ready 3 s sooner but its ad marks 14 s later and its .mimi 19 s later
         # (scripts/episode_timeline.py). sherpa (CPU) runs alongside.
-        diar_on_gpu = m.get("device", "cpu") != "cpu" and DIARIZER in ("auto", "pyannote")
         d = threading.Thread(target=speakers, daemon=True, name="mimi-diarize")
         if not diar_on_gpu:
             d.start()

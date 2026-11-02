@@ -5,8 +5,10 @@ self-promotion; those become time ranges a player can skip. The LLM runs through
 CLI on the server (claude / codex / agy) in print mode, from an empty temp dir with tools off, so it costs nothing
 per episode and needs no API key in the hub.
 
-    MIMI_HUB_SEGMENTER = "<backend>:<model>[,<backend>:<model>...]"   tried in order until one works;
+    MIMI_HUB_SEGMENTER = "<backend>:<model>[+<flag>...][,<backend>:<model>...]"   tried in order until one works;
         default codex:gpt-6.1-sol,claude:claude-haiku-5-5 (also agy:gemini-4-argon-high), or "off"
+        codex flags: minimal / low / medium / high / xhigh (reasoning effort; without one, ~/.codex/config.toml's),
+        fast / priority / flex / default (service tier); e.g. codex:gpt-6.1-sol+low+fast
 
 On six episodes (2026-10-31) Sol and Haiku found the same ad breaks, matching hand labels; Sol ~6-15 s,
 Haiku ~2-17 s, Argon ~220 s per episode.
@@ -96,7 +98,12 @@ _PATH = os.pathsep.join([os.environ.get("PATH", ""), os.path.expanduser("~/.loca
                          f"/etc/profiles/per-user/{pwd.getpwuid(os.getuid()).pw_name}/bin", "/run/current-system/sw/bin"])
 
 
+EFFORTS = ("minimal", "low", "medium", "high", "xhigh")
+TIERS = ("fast", "priority", "flex", "default")
+
+
 def _run(backend, model, prompt):
+    model, *flags = model.split("+")
     env = dict(os.environ, PATH=_PATH)
     exe = shutil.which(backend, path=_PATH) or backend
     with tempfile.TemporaryDirectory(prefix="mimi-seg-") as tmp:
@@ -107,8 +114,15 @@ def _run(backend, model, prompt):
             out = r.stdout
         elif backend == "codex":
             last = os.path.join(tmp, "last.txt")
-            cmd = [exe, "exec", "--skip-git-repo-check", "--ephemeral", "-s", "read-only",
-                   "-m", model, "-o", last, "-"]
+            cmd = [exe, "exec", "--skip-git-repo-check", "--ephemeral", "-s", "read-only", "-m", model, "-o", last]
+            for f in flags:
+                if f in EFFORTS:
+                    cmd += ["-c", f"model_reasoning_effort={f}"]
+                elif f in TIERS:
+                    cmd += ["-c", f"service_tier={f}"]
+                else:
+                    raise ValueError(f"unknown codex flag {f!r}")
+            cmd.append("-")
             r = subprocess.run(cmd, input=prompt, capture_output=True, text=True, cwd=tmp, env=env, timeout=TIMEOUT_S)
             out = open(last).read() if os.path.exists(last) else ""
         elif backend == "agy":
