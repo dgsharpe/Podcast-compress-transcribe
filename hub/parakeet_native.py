@@ -115,14 +115,18 @@ class NativeEncoder:
 
     def run(self, names, feeds):
         import numpy as np
+        hidden, lens = self.encode(torch.from_numpy(np.ascontiguousarray(feeds["audio_signal"].transpose(0, 2, 1))),
+                                   torch.from_numpy(np.asarray(feeds["length"])))
+        return [hidden.float().transpose(1, 2).cpu().numpy(), lens.cpu().numpy().astype(np.int64)]
+
+    def encode(self, x, lengths):
+        """x (B, T, F) features, lengths (B,): encoder outputs (B, T', D) and their lengths, on the GPU."""
         device = next(self.encoder.parameters()).device
-        x = torch.from_numpy(np.ascontiguousarray(feeds["audio_signal"].transpose(0, 2, 1))).to(device)  # (B, T, F)
-        lengths = torch.from_numpy(np.asarray(feeds["length"])).to(device)
+        x, lengths = x.to(device, non_blocking=True), lengths.to(device, non_blocking=True)
         mask = torch.arange(x.shape[1], device=device)[None, :] < lengths[:, None]
         with torch.inference_mode(), torch.autocast(device.type, dtype=self.dtype, enabled=self.dtype != torch.float32):
             out = self.forward(input_features=x, attention_mask=mask)
-        hidden = out.last_hidden_state.float().transpose(1, 2)  # (B, D, T')
-        return [hidden.cpu().numpy(), out.attention_mask.sum(-1).cpu().numpy().astype(np.int64)]
+        return out.last_hidden_state, out.attention_mask.sum(-1)
 
 
 # ---------- TDT decoding ----------
@@ -187,7 +191,10 @@ class NativeTdtDecoder:
         import numpy as np
         need_logprobs = kwargs.get("need_logprobs")
         with torch.inference_mode():
-            enc = torch.from_numpy(np.ascontiguousarray(encoder_out)).to(self.device)  # (B, T, D)
+            if torch.is_tensor(encoder_out):  # straight from NativeEncoder.encode, still on the GPU
+                enc, encoder_out_lens = encoder_out.to(self.device, torch.float32), encoder_out_lens.cpu().numpy()
+            else:
+                enc = torch.from_numpy(np.ascontiguousarray(encoder_out)).to(self.device)  # (B, T, D)
             B, T = enc.shape[:2]
             f_all = torch.addmm(self.enc_b, enc.reshape(B * T, -1), self.enc_w).reshape(B, T, -1)
             lens = torch.from_numpy(np.asarray(encoder_out_lens)).to(self.device)

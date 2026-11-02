@@ -85,6 +85,22 @@ Environment variables, e.g. `Environment=` lines in the unit:
 | `MIMI_HUB_TOKEN` | (none) | require `Authorization: Bearer <token>` |
 | `MIMI_HUB_DATA` | `hub_data/` | where `.mimi` / `.vtt` / records live |
 
+### Batch conversion
+
+`hub/bulk.py` converts many files or URLs at once, outside the hub, into the hub's `.mimi` and `.vtt` files:
+
+```sh
+.venv-rocm/bin/python -m hub.bulk out/ episode1.mp3 episode2.mp3 ...
+```
+
+One process holds one copy of the models and batches each model's GPU work across all the episodes in flight
+(Mimi in lockstep pieces, Parakeet's segments sorted by length, pyannote's windows through shared batchers); decoding,
+VAD and features run in a pool of processes. Transcripts and speaker turns match the hub's (word similarity
+0.998-1.0, DER 0); Mimi codes ~96% (batched fp16 rounds differently). It is limited by Python (one process launches
+the GPU kernels; ~550-640x real time on an H100 vs ~1,500x for 16 hub-style processes under MPS, and ~90x vs ~80x
+on the Radeon 8060S), and its batches take a lot of GPU memory (one process at the defaults: ~58 GB on an H100).
+Settings: `MIMI_BULK_*` at the top of the file. `scripts/bulk_bench.py` measures it and checks it against the hub.
+
 ## Build the app
 
 The patched Pocket Casts includes this repository's `android/mimi` module (`../android/mimi`), so clone it inside

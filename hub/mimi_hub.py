@@ -516,12 +516,18 @@ def diarize(wav16):
                 traceback.print_exc()  # e.g. pyannote missing or its model not cached: use sherpa
         if segs is None:
             segs, name = _sherpa_turns(wav16), SHERPA_NAME
+    return number_turns(segs), name
+
+
+def number_turns(segs):
+    """A diarizer's [(start_s, end_s, label)] as the hub keeps them: speakers with under DIAR_MIN_TALK_S in all
+    merged into the nearest kept turn's, then numbered 1.. by first appearance."""
     total = {}
     for a, b, k in segs:
         total[k] = total.get(k, 0.0) + b - a
     keep = [(a, b, k) for a, b, k in segs if total[k] >= DIAR_MIN_TALK_S]
     if not keep:
-        return [], name
+        return []
     out = []
     for a, b, k in segs:
         if total[k] < DIAR_MIN_TALK_S:  # fragment: take the speaker of the nearest kept turn
@@ -530,7 +536,19 @@ def diarize(wav16):
     number = {}
     for _, _, k in out:
         number.setdefault(k, len(number) + 1)
-    return [(a, b, number[k]) for a, b, k in out], name
+    return [(a, b, number[k]) for a, b, k in out]
+
+
+def write_vtt(path, all_cues, turns):
+    """[all_cues] ([(start_s, end_s, text)]) as a WebVTT file, each cue voiced by its speaker in [turns]."""
+    tmp = Path(path).with_suffix(".vtt.tmp")
+    with open(tmp, "w") as f:
+        f.write("WEBVTT\n\n")
+        for a, b, text in all_cues:
+            text = text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+            who = speaker_for(a, b, turns)
+            f.write(f"{vtt_time(a)} --> {vtt_time(b)}\n{f'<v Speaker {who}>' if who else ''}{text}\n\n")
+    tmp.replace(path)
 
 
 def speaker_for(a, b, turns):
@@ -1026,13 +1044,7 @@ def run(i):
         if "cues" not in tx:
             raise pcm.error or RuntimeError("transcription did not run")
         all_cues, turns = tx["cues"], tx["turns"]
-        with open(DATA / f"{i}.vtt.tmp", "w") as f:
-            f.write("WEBVTT\n\n")
-            for a, b, text in all_cues:
-                text = text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
-                who = speaker_for(a, b, turns)
-                f.write(f"{vtt_time(a)} --> {vtt_time(b)}\n{f'<v Speaker {who}>' if who else ''}{text}\n\n")
-        (DATA / f"{i}.vtt.tmp").replace(DATA / f"{i}.vtt")
+        write_vtt(DATA / f"{i}.vtt", all_cues, turns)
         mark("ready")
         with lock:  # merged: ad detection may have added its time already
             rec = load(i)

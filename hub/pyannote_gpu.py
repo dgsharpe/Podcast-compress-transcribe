@@ -153,6 +153,17 @@ def _coreml_frames(resnet, fbank_shape):
     return ct.models.MLModel(str(path), compute_units=ct.ComputeUnit.CPU_AND_NE)
 
 
+FRAMES_FN = None  # replaces resnet_frames in get_embeddings when set
+
+
+def resnet_frames(model, fbank, mode):
+    """The ResNet's frames of an fbank batch, in [mode]'s precision."""
+    dtype = _DTYPES[mode]
+    cudnn = torch.backends.cudnn.flags(enabled=torch.backends.cudnn.enabled, allow_tf32=mode == "tf32")
+    with torch.autocast(fbank.device.type, dtype=dtype or torch.float32, enabled=dtype is not None), cudnn:
+        return model.resnet.forward_frames(fbank)
+
+
 def get_embeddings(self, file, binary_segmentations, exclude_overlap=False, hook=None):
     """Drop-in for SpeakerDiarization.get_embeddings: (num_chunks, num_speakers, dimension) array."""
     sr = self._embedding.sample_rate
@@ -199,11 +210,10 @@ def get_embeddings(self, file, binary_segmentations, exclude_overlap=False, hook
                 x = np.zeros(shape, dtype=np.float32)
                 x[:len(fbank)] = fbank.float().cpu().numpy()
                 frames = torch.from_numpy(self._coreml[1].predict({"fbank": x})["frames"][:len(fbank)]).to(device)
+            elif FRAMES_FN is not None:  # e.g. hub/bulk.py's batcher, shared by many episodes' pipelines
+                frames = FRAMES_FN(fbank)
             else:
-                dtype = _DTYPES[mode]
-                cudnn = torch.backends.cudnn.flags(enabled=torch.backends.cudnn.enabled, allow_tf32=mode == "tf32")
-                with torch.autocast(device.type, dtype=dtype or torch.float32, enabled=dtype is not None), cudnn:
-                    frames = model.resnet.forward_frames(fbank)
+                frames = resnet_frames(model, fbank, mode)
             frames = frames.float()
             emb = model.resnet.forward_embedding(frames, weights=weights[c0:c1].to(device))[1]
             out.append(emb.float().cpu().numpy())  # (batch, speakers, dimension)

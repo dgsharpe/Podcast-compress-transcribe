@@ -69,6 +69,7 @@ image = (
     .add_local_file(ROOT / "scripts/roofline_server.py", f"{NA}/scripts/roofline_server.py")
     .add_local_file(ROOT / "scripts/mimi_pieces_check.py", f"{NA}/scripts/mimi_pieces_check.py")
     .add_local_file(ROOT / "scripts/fp16_weights_check.py", f"{NA}/scripts/fp16_weights_check.py")
+    .add_local_file(ROOT / "scripts/bulk_bench.py", f"{NA}/scripts/bulk_bench.py")
 )
 app = modal.App("mimi-hub-bench", image=image)
 
@@ -184,6 +185,50 @@ PLANS = {
         (["--clips", "64", "--workers", "1", "--procs", "16"], MPS_ENV),
         (["--clips", "80", "--workers", "1", "--procs", "20"], MPS_ENV),
         (["--clips", "96", "--workers", "1", "--procs", "24"], MPS_ENV),
+    ],
+    # cross-episode batching (hub/bulk.py, one process) vs 16 processes with MPS, same container
+    "bulk1": [
+        (["bulk_bench.py", "--clips", "96", "--check", "2", "--prep", "24"], {}),
+        (["bulk_bench.py", "--clips", "96", "--check", "0", "--prep", "24"],
+         {"MIMI_BULK_MIMI_BATCH": "32", "MIMI_BULK_ASR_BATCH": "128", "MIMI_BULK_DIAR_ROWS": "512",
+          "MIMI_BULK_DIAR_THREADS": "24", "MIMI_BULK_IN_FLIGHT": "48"}),
+        (["fp16_weights_check.py"], {}),
+        (["--clips", "64", "--workers", "1", "--procs", "16"], MPS_ENV),
+    ],
+    # bulk after keeping Parakeet's encoder output on the GPU (2 ASR workers): worker counts and batch sizes
+    "bulk2": [
+        (["bulk_bench.py", "--clips", "96", "--check", "1", "--prep", "24"], {}),
+        (["bulk_bench.py", "--clips", "96", "--check", "0", "--prep", "24"], {"MIMI_BULK_MIMI_WORKERS": "2"}),
+        (["bulk_bench.py", "--clips", "128", "--check", "0", "--prep", "24"],
+         {"MIMI_BULK_MIMI_WORKERS": "2", "MIMI_BULK_ASR_WORKERS": "3", "MIMI_BULK_MIMI_BATCH": "32",
+          "MIMI_BULK_ASR_BATCH": "128", "MIMI_BULK_DIAR_ROWS": "512", "MIMI_BULK_DIAR_THREADS": "24",
+          "MIMI_BULK_IN_FLIGHT": "64"}),
+    ],
+    # bulk is GIL-bound (main process ~1.6 cores): longer Mimi chunks, bigger batches, several bulk processes
+    "bulk3": [
+        (["bulk_bench.py", "--clips", "96", "--check", "0", "--prep", "24"],
+         {"MIMI_BULK_CHUNK_FRAMES": "1000", "MIMI_BULK_ASR_BATCH": "256", "MIMI_BULK_MIMI_BATCH": "32"}),
+        (["bulk_bench.py", "--clips", "128", "--check", "0", "--prep", "24", "--procs", "3"],
+         {"MIMI_BULK_CHUNK_FRAMES": "1000", "MIMI_BULK_ASR_BATCH": "256", "MIMI_BULK_MIMI_BATCH": "32",
+          "MPS": "1"}),
+        (["bulk_bench.py", "--clips", "192", "--check", "0", "--prep", "24", "--procs", "6"],
+         {"MIMI_BULK_CHUNK_FRAMES": "1000", "MIMI_BULK_ASR_BATCH": "128", "MIMI_BULK_MIMI_BATCH": "16",
+          "MPS": "1"}),
+    ],
+    # several bulk processes under MPS (audio now handed over in spool files: /dev/shm ran out with 3)
+    "bulk4": [
+        (["bulk_bench.py", "--clips", "128", "--check", "0", "--prep", "24", "--procs", "3"],
+         {"MIMI_BULK_ASR_BATCH": "128", "MIMI_BULK_MIMI_BATCH": "32", "MPS": "1"}),
+        (["bulk_bench.py", "--clips", "192", "--check", "0", "--prep", "30", "--procs", "6"],
+         {"MIMI_BULK_ASR_BATCH": "128", "MIMI_BULK_MIMI_BATCH": "16", "MPS": "1"}),
+    ],
+    # GPU memory per bulk process (3 with big batches ran an H100 out of memory), then 4 with smaller batches
+    "bulk5": [
+        (["bulk_bench.py", "--clips", "96", "--check", "0", "--prep", "24"], {}),
+        (["bulk_bench.py", "--clips", "128", "--check", "0", "--prep", "32", "--procs", "4"],
+         {"MIMI_BULK_MIMI_BATCH": "8", "MIMI_BULK_ASR_BATCH": "64", "MIMI_BULK_DIAR_ROWS": "128",
+          "MIMI_BULK_DIAR_THREADS": "8", "MIMI_BULK_IN_FLIGHT": "16",
+          "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True", "MPS": "1"}),
     ],
     # pushing one GPU: where its time goes, then a 32-clip backlog (160 min) at more processes
     "push1": [
