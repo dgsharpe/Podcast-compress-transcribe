@@ -106,6 +106,13 @@ of a batch). The process is still limited by Python launching GPU work, so it ru
 free-threaded environment is built in `scripts/modal_hub_bench.py`'s image: uv's `cpython-3.14.10+freethreaded`,
 torch 2.14.1+cu130 (`cp314t`), protobuf's C extensions removed (they segfault without the GIL) and
 `PYTHON_GIL=0`. On the Radeon 8060S it makes no difference (~90x vs ~80x for the hub; GPU-bound).
+
+Since then, on an H100 (1,024 five-minute episodes, 5 s diarization step): AOTInductor for Parakeet's encoder and
+the ResNet (`MIMI_HUB_COMPILE`), ~1,750–1,900x; the TDT search as CUDA graphs (`MIMI_BULK_ASR_GRAPH`, on by default
+on NVIDIA; each graph set captured on a stream of its own, `hub/graph_stream.py`: two graph sets sharing a cuBLAS
+workspace used to hang the GPU), 2,083x; Mimi's SEANet as a TensorRT engine (`MIMI_BULK_MIMI_TRT`,
+`hub/trt_seanet.py`; needs `tensorrt-cu13` and `libnvinfer-headers-dev`, built on first use), 2,165x. Its Mimi codes
+differ from cuDNN's in ~20% of entries but decode to audio as close to the original (log-mel L1 0.585 either way).
 Settings: `MIMI_BULK_*` at the top of `hub/bulk.py`. `scripts/bulk_bench.py` measures it and checks it against the
 hub.
 

@@ -330,12 +330,9 @@ class NativeTdtDecoder:
 
     GRAPH_STEPS = 16  # decoding steps per graph replay (one host check for "any segment still active" per replay)
     _capture_lock = __import__("threading").Lock()  # one capture at a time, across threads
-    # One search at a time, all workers sharing slot 0's graphs. In hub/bulk.py with two ASR workers these graphs
-    # hang the GPU (a worker waits in the sync below forever, Mimi's worker in its own), with and without the GIL or
-    # expandable segments, with each worker's own graphs or these shared ones under this lock; one worker ran.
-    # Alone (scripts/parakeet_decoder_check.py) they match the eager search exactly and decode 2.7x faster on an
-    # H100. Off by default (MIMI_BULK_ASR_GRAPH).
-    _replay_lock = __import__("threading").Lock()
+    # Each slot's graphs are captured on a stream of the slot's own, for a cuBLAS workspace no graph that may replay
+    # at the same time shares (two workers', Mimi's in hub/bulk.py: on a shared one they hung the GPU;
+    # hub/graph_stream.py).
 
     GRAPH_SIZES = (8, 16, 32, 64)  # batch sizes (segments; a batch pads to the next)
     GRAPH_FRAMES = 64  # lengths pad to a multiple of this many encoder frames
@@ -387,7 +384,11 @@ class NativeTdtDecoder:
             g.s.zero_()
             g.graph = torch.cuda.CUDAGraph()
             # its own memory pool: graphs sharing one must replay in their capture order, batches don't
-            with torch.cuda.graph(g.graph, capture_error_mode="thread_local"):
+            from hub.graph_stream import capture_stream
+            streams = self.__dict__.setdefault("_capture_streams", {})  # one per slot (see above)
+            if key[0] not in streams:
+                streams[key[0]] = capture_stream()
+            with torch.cuda.graph(g.graph, stream=streams[key[0]], capture_error_mode="thread_local"):
                 steps()
         self._graphs = {**getattr(self, "_graphs", {}), key: g}
         return g
@@ -416,14 +417,12 @@ class NativeTdtDecoder:
     def decode_graphed(self, encoder_out, encoder_out_lens, slot=0):
         """As __call__ (tokens and frame indices per segment; no logprobs) for GPU tensors (B, T, D) / (B,), with the
         search replayed as CUDA graphs: the batch is padded to a GRAPH_SIZES size (inactive segments) and T to a
-        multiple of GRAPH_FRAMES (never reached), so a few graphs serve every batch. [slot]: ignored (all share
-        slot 0's graphs, one search at a time)."""
-        slot = 0
+        multiple of GRAPH_FRAMES (never reached), so a few graphs serve every batch. [slot]: the calling worker's."""
         B0, T0 = encoder_out.shape[:2]
         B = next((b for b in self.GRAPH_SIZES if b >= B0), 1 << max(0, (B0 - 1).bit_length()))
         T = -(-T0 // self.GRAPH_FRAMES) * self.GRAPH_FRAMES
         g = self._graph_state(slot, B, T)
-        with self._replay_lock, torch.inference_mode():
+        with torch.inference_mode():
             enc = encoder_out.to(self.device, self.jdtype)
             g.f.zero_()
             g.f[:B0, :T0] = torch.addmm(self.enc_b, enc.reshape(B0 * T0, -1), self.enc_w).reshape(B0, T0, -1)

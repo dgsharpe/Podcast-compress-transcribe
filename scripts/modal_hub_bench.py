@@ -81,6 +81,8 @@ image = (
         "wget -q https://developer.download.nvidia.com/compute/cuda/repos/debian$(. /etc/os-release; echo $VERSION_ID)"
         "/x86_64/cuda-keyring_1.1-1_all.deb && dpkg -i cuda-keyring_1.1-1_all.deb && rm cuda-keyring_1.1-1_all.deb",
         "apt-get update -q && apt-get install -y -q cuda-nvcc-13-0 cuda-cudart-dev-13-0 cuda-driver-dev-13-0",
+        # TensorRT's C++ headers, for hub/trt_seanet.py's shim (the pip package's libnvinfer, same version)
+        "apt-get install -y -q libnvinfer-headers-dev=11.4.0.106-1+cuda13.4",
     )
     # TensorRT and the ONNX exporter (the standard Python only), for scripts/trt_mimi_check.py
     .pip_install("tensorrt-cu13", "onnx", "onnxscript")

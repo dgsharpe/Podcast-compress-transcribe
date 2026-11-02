@@ -48,12 +48,16 @@ MIMI_WORKERS = int(os.environ.get("MIMI_BULK_MIMI_WORKERS", "1"))  # threads, ea
 # hundreds of kernel launches (codes as transformers' streaming to ~98%: attention rounds a little differently).
 # auto: on NVIDIA (launch-bound there); the server's ROCm GPU is compute-bound and gained nothing.
 MIMI_GRAPH = os.environ.get("MIMI_BULK_MIMI_GRAPH", "auto")
+# ...with its SEANet as a TensorRT engine (hub/trt_seanet.py): an H100's Mimi step 38.3 -> 29.7 ms a chunk, the
+# codes decoding to audio as close to the original. auto: on for NVIDIA (cuDNN if TensorRT can't be set up)
+MIMI_TRT = os.environ.get("MIMI_BULK_MIMI_TRT", "auto")
 ASR_BATCH = int(os.environ.get("MIMI_BULK_ASR_BATCH", "64"))
 ASR_WORKERS = int(os.environ.get("MIMI_BULK_ASR_WORKERS", "2"))  # threads, each on its own CUDA stream
 # the TDT search as CUDA graphs (hub/parakeet_native.NativeTdtDecoder.decode_graphed): 16 steps per launch, the same
-# tokens and timestamps (548/548 segments). Off by default: on an H100 it was no faster than the eager search (590x
-# vs 789x end to end), and graphs captured at load hung on replay from the worker threads (on demand they didn't).
-ASR_GRAPH = os.environ.get("MIMI_BULK_ASR_GRAPH", "0")
+# tokens and timestamps (548/548 segments), decoding 2.7x faster; 1,024 episodes on one H100 1,754 -> 2,083x. They
+# used to hang the GPU beside Mimi's graph: both had been captured on one stream and so shared a cuBLAS workspace
+# (hub/graph_stream.py). auto: on for NVIDIA.
+ASR_GRAPH = os.environ.get("MIMI_BULK_ASR_GRAPH", "auto")
 DIAR_ROWS = int(os.environ.get("MIMI_BULK_DIAR_ROWS", "256"))  # segmentation / ResNet windows per GPU call
 DIAR_THREADS = int(os.environ.get("MIMI_BULK_DIAR_THREADS", "16"))
 # windows each diarization thread hands the batchers per call (pyannote's segmentation batch, the embedding batch:
@@ -243,7 +247,8 @@ class Models:
         seg.forward = Batcher(seg.forward, DIAR_ROWS, BATCH_WAIT_S, name="bulk-segmentation")
         self.pipe, self.batchers = pipe, {"resnet": frames, "segmentation": seg.forward}
         if ASR_GRAPH == "1" or (ASR_GRAPH == "auto" and not torch.version.hip):  # captured now, not mid-run
-            self.asr._decoding.capture_graphs(0, max_batch=ASR_BATCH)  # one set, shared by the workers
+            for k in range(ASR_WORKERS):
+                self.asr._decoding.capture_graphs(k, max_batch=ASR_BATCH)
         self.mimi_static = []
         # one set per Mimi worker, captured now, before any worker runs on the GPU
         if MIMI_GRAPH == "1" or (MIMI_GRAPH == "auto" and not torch.version.hip):
@@ -254,7 +259,12 @@ class Models:
             for _ in range(MIMI_WORKERS):
                 encs = {}
                 for b in sizes:
-                    encs[b] = StaticMimiEncoder(self.mimi, b, CHUNK_FRAMES)
+                    trt = MIMI_TRT == "1" or (MIMI_TRT == "auto" and not torch.version.hip)
+                    try:
+                        encs[b] = StaticMimiEncoder(self.mimi, b, CHUNK_FRAMES, trt=trt)
+                    except Exception as e:  # noqa: BLE001 - no TensorRT / headers / build: cuDNN's convs
+                        print(f"bulk: Mimi without TensorRT: {type(e).__name__}: {e}"[:300], flush=True)
+                        encs[b] = StaticMimiEncoder(self.mimi, b, CHUNK_FRAMES)
                     encs[b].capture()
                 self.mimi_static.append(encs)
 
