@@ -71,7 +71,7 @@ Environment variables, e.g. `Environment=` lines in the unit:
 |---|---|---|
 | `MIMI_HUB_COMPRESS` | `1` | `0`: no `.mimi` at all, only transcripts and ad marks (the app then plays originals via the hub) |
 | `MIMI_HUB_SOURCES` | `fetch` | originals for transcript-only episodes: `fetch` = not stored, re-fetched from the publisher when asked (409 if the publisher's file changed); `keep` = stored on disk |
-| `MIMI_HUB_SEGMENTER` | `claude:claude-opus-5-5,codex:gpt-5.6-terra+low` | ad detection, tried in order: logged-in agent CLIs (`claude:` / `codex:` / `agy:`, `+effort` / `+fast` flags) or APIs (`openrouter:` / `inception:`); `off` to disable. `scripts/ads_bench.py` compares them |
+| `MIMI_HUB_SEGMENTER` | `claude:claude-opus-5-5,codex:gpt-5.6-terra+high` | ad detection, tried in order: logged-in agent CLIs (`claude:` / `codex:` / `agy:`, `+effort` / `+fast` flags) or APIs (`openrouter:` / `inception:`); `off` to disable. Prompt `MIMI_HUB_SEGMENTS_PROMPT` (`v2`). A backlog: `python -m hub.segments --many 4 *.vtt`. `scripts/ads_bench.py` compares models against `scripts/ads_truth.py`'s judged breaks |
 | `MIMI_HUB_DEVICE` | `auto` | `cuda` / `cpu` |
 | `MIMI_HUB_DIARIZER` | `auto` | `pyannote` (GPU; gated HF model, fetch once with a token) / `sherpa` (CPU) |
 | `MIMI_HUB_ASR_ENCODER` | `native` | `onnx2torch` for the converted ONNX encoder |

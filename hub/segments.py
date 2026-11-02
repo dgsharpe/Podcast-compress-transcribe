@@ -6,18 +6,21 @@ CLI on the server (claude / codex / agy) in print mode, from an empty temp dir w
 per episode and needs no API key in the hub.
 
     MIMI_HUB_SEGMENTER = "<backend>:<model>[+<flag>...][,<backend>:<model>...]"   tried in order until one works;
-        default claude:claude-opus-5-5,codex:gpt-5.6-terra+low (also agy:gemini-4-argon-high), or "off"
+        default claude:claude-opus-5-5,codex:gpt-5.6-terra+high (also agy:gemini-4-argon-high), or "off"
         codex flags: minimal / low / medium / high / xhigh (reasoning effort; without one, ~/.codex/config.toml's),
         fast / priority / flex / default (service tier); e.g. codex:gpt-6.1-sol+low+fast
         claude flags: low / medium / high / xhigh / max (--effort), fast (fast mode); e.g. claude:claude-opus-5-5+fast
         openrouter:<model id> (OpenRouter's API, key in OPENROUTER_API_KEY); e.g. openrouter:inception/mercury-3
         inception:<model id> (Inception Labs' API, key in INCEPTION_API_KEY); e.g. inception:mercury-3
 
-Against a ground truth of 50 breaks in 13 episodes (2026-11-02; scripts/ads_truth.py) Opus 5.5 found all 50 with
-nothing extra in ~7 s an episode (gpt-5.6-terra at low effort, the fallback: 50, ~8 s); the previous default, Sol at
-high effort, 48 in ~12 s. scripts/ads_bench.py runs the comparison.
+Against judged ground truths (2026-11-02; scripts/ads_truth.py): 13 episodes the v2 prompt was written from (50
+breaks) and 11 fresh shows (48), with the v2 prompt: Opus 5.5 97 of 98, nothing extra, ~5 s an episode;
+gpt-5.6-terra at high effort (the fallback) 98, ~8 s; Sol at high effort, the previous default, 96 with 3 extra.
+Several transcripts per request (--many) found 1-2 fewer of the short self-promos. scripts/ads_bench.py compares.
 
 CLI: python -m hub.segments <episode.vtt> [backend:model]   (prints the segments JSON)
+     python -m hub.segments --many 4 <episode.vtt>...      (a backlog: 4 transcripts per request, detect_many;
+                                                           each <episode>.segments.json written beside it)
 """
 
 import json
@@ -30,7 +33,7 @@ import sys
 import tempfile
 import time
 
-SEGMENTER = os.environ.get("MIMI_HUB_SEGMENTER", "claude:claude-opus-5-5,codex:gpt-5.6-terra+low")
+SEGMENTER = os.environ.get("MIMI_HUB_SEGMENTER", "claude:claude-opus-5-5,codex:gpt-5.6-terra+high")
 CHUNK_CHARS = 90_000  # agy takes the prompt as one argv string (Linux caps those at 128 KiB)
 OVERLAP_CUES = 40
 TIMEOUT_S = 600
@@ -62,7 +65,7 @@ Transcript:
 
 # v2: the same task, with the patterns the models missed most spelled out (scripts/ads_truth.py: sponsored inserts and
 # teasers inside a break, post-roll ads, whole breaks as one segment) and what not to mark listed more fully.
-# MIMI_HUB_SEGMENTS_PROMPT=v2 (default v1).
+# MIMI_HUB_SEGMENTS_PROMPT (default v2; v1 the original).
 RULES_V2 = """You are marking the parts of a podcast episode that a listener would want to skip: ad breaks and the
 show's self-promotion. The transcript is automatic, one cue per line: [cue index] mm:ss speaker: text. Speaker labels
 come from automatic diarization and can be wrong; ASR errors, misspelled brand names especially, are common.
@@ -106,7 +109,7 @@ Transcripts:
 """
 
 PROMPTS = {"v1": PROMPT, "v2": RULES_V2 + "\n" + REPLY_ONE}
-PROMPT_VERSION = os.environ.get("MIMI_HUB_SEGMENTS_PROMPT", "v1")
+PROMPT_VERSION = os.environ.get("MIMI_HUB_SEGMENTS_PROMPT", "v2")
 
 _CUE = re.compile(
     r"(\d+):(\d\d):(\d\d\.\d+) --> (\d+):(\d\d):(\d\d\.\d+)[^\n]*\n(?:<v ([^>]+)>)?([^\n]*)"
@@ -326,7 +329,23 @@ def detect_many(episodes, segmenter=SEGMENTER, log=print):
     raise RuntimeError("; ".join(errors) or "no segmenter configured")
 
 
+def _many(n, paths):
+    import pathlib
+    for k in range(0, len(paths), n):
+        group = [pathlib.Path(p) for p in paths[k:k + n]]
+        t0 = time.time()
+        res = detect_many([read_cues(p.read_text()) for p in group], log=lambda m: print(m, file=sys.stderr))
+        for p, r in zip(group, res, strict=True):
+            out = p.with_name(p.name.split(".")[0] + ".segments.json")
+            out.write_text(json.dumps(r, indent=1))
+            print(f"{p.name}: {len(r['segments'])} segments via {r['model']} -> {out.name}", file=sys.stderr)
+        print(f"{len(group)} episodes in {time.time() - t0:.0f} s", file=sys.stderr)
+
+
 if __name__ == "__main__":
+    if sys.argv[1] == "--many":
+        _many(int(sys.argv[2]), sys.argv[3:])
+        sys.exit()
     cues = read_cues(open(sys.argv[1]).read())
     res = detect(cues, *(sys.argv[2:3] or [SEGMENTER]), log=lambda m: print(m, file=sys.stderr))
     for s in res["segments"]:
