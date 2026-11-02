@@ -82,6 +82,8 @@ image = (
         "/x86_64/cuda-keyring_1.1-1_all.deb && dpkg -i cuda-keyring_1.1-1_all.deb && rm cuda-keyring_1.1-1_all.deb",
         "apt-get update -q && apt-get install -y -q cuda-nvcc-13-0 cuda-cudart-dev-13-0 cuda-driver-dev-13-0",
     )
+    # TensorRT and the ONNX exporter (the standard Python only), for scripts/trt_mimi_check.py
+    .pip_install("tensorrt-cu13", "onnx", "onnxscript")
     .env({**ENV, "CUDA_HOME": "/usr/local/cuda-13.0"})
     .add_local_dir(ROOT / "data/modal_pyannote", "/models/pyannote")
     .add_local_file(ROOT / "data/ref/ref_24k.wav", f"{NA}/data/ref/ref_24k.wav")
@@ -99,6 +101,7 @@ image = (
     .add_local_file(ROOT / "scripts/seg_profile.py", f"{NA}/scripts/seg_profile.py")
     .add_local_file(ROOT / "scripts/compile_check.py", f"{NA}/scripts/compile_check.py")
     .add_local_file(ROOT / "scripts/aoti_check.py", f"{NA}/scripts/aoti_check.py")
+    .add_local_file(ROOT / "scripts/trt_mimi_check.py", f"{NA}/scripts/trt_mimi_check.py")
 )
 app = modal.App("mimi-hub-bench", image=image)
 
@@ -469,6 +472,11 @@ PLANS = {
          {**FT_ENV, "BULK_WATCHDOG_S": "880", "MIMI_BULK_IN_FLIGHT": "96", "MIMI_HUB_DIAR_STEP": "0.5",
           "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True", "MPS": "1", "MIMI_BULK_IN_FLIGHT": "48"}),
         (["--clips", "64", "--workers", "1", "--procs", "16"], {**MPS_ENV, "MIMI_HUB_DIAR_STEP": "0.5"}),
+    ],
+    # Mimi's SEANet as a TensorRT engine vs eager: 32 x 20 s (the ceiling test's shape) and 16 x 20 s (bulk's batch)
+    "trt1": [
+        (["trt_mimi_check.py", "32", "20"], {}),
+        (["trt_mimi_check.py", "16", "20"], {}),
     ],
     # AOTInductor prototype: Parakeet (one bucket) and the ResNet as packages, with the GIL and free-threaded
     "aot1": [
