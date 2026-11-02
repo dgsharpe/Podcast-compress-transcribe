@@ -56,6 +56,11 @@ ASR_WORKERS = int(os.environ.get("MIMI_BULK_ASR_WORKERS", "2"))  # threads, each
 ASR_GRAPH = os.environ.get("MIMI_BULK_ASR_GRAPH", "0")
 DIAR_ROWS = int(os.environ.get("MIMI_BULK_DIAR_ROWS", "256"))  # segmentation / ResNet windows per GPU call
 DIAR_THREADS = int(os.environ.get("MIMI_BULK_DIAR_THREADS", "16"))
+# windows each diarization thread hands the batchers per call (pyannote's segmentation batch, the embedding batch:
+# 32 in the hub), and how long a batcher waits for more calls to merge: at 32 and 3 ms the batches averaged 41
+# (ResNet) and 79 (segmentation) windows of DIAR_ROWS, ~3x short of the models' large-batch speed
+DIAR_CALL = int(os.environ.get("MIMI_BULK_DIAR_CALL", "128"))
+BATCH_WAIT_S = float(os.environ.get("MIMI_BULK_BATCH_WAIT_MS", "10")) / 1000
 IN_FLIGHT = int(os.environ.get("MIMI_BULK_IN_FLIGHT", "32"))  # episodes prepared and not yet written
 
 
@@ -229,10 +234,13 @@ class Models:
         pipe = pyannote_gpu.load(self.device, path=os.environ.get("TPUT_PYANNOTE_PATH"))
         mode = pyannote_gpu._frames_mode(torch.device(self.device))
         emb = pipe._embedding.model_
-        frames = Batcher(lambda fb: pyannote_gpu.resnet_frames(emb, fb, mode), DIAR_ROWS, name="bulk-resnet")
-        pyannote_gpu.FRAMES_FN = frames
+        # fbank + ResNet frames from the windows' audio, once per merged batch
+        frames = Batcher(lambda w: pyannote_gpu.wave_frames(emb, w, mode), DIAR_ROWS, BATCH_WAIT_S, name="bulk-resnet")
+        pyannote_gpu.WAVE_FRAMES_FN = frames
+        pyannote_gpu.BATCH_CHUNKS = DIAR_CALL
+        pipe.segmentation_batch_size = DIAR_CALL
         seg = pipe._segmentation.model
-        seg.forward = Batcher(seg.forward, DIAR_ROWS, name="bulk-segmentation")
+        seg.forward = Batcher(seg.forward, DIAR_ROWS, BATCH_WAIT_S, name="bulk-segmentation")
         self.pipe, self.batchers = pipe, {"resnet": frames, "segmentation": seg.forward}
         if ASR_GRAPH == "1" or (ASR_GRAPH == "auto" and not torch.version.hip):  # captured now, not mid-run
             for k in range(ASR_WORKERS):

@@ -141,6 +141,8 @@ def profile_summary(prof, seconds):
     for s0, s1, stream, name in kernels:
         v = spans.get(stream, [])
         k = bisect.bisect_right(v, (s0, float("inf"), "")) - 1
+        while k >= 0 and v[k][1] < s0 and k > bisect.bisect_right(v, (s0 - 5e6, 0, "")) - 1:
+            k -= 1  # spans nest (fbank inside the ResNet batcher's): the innermost one still open at s0
         label = v[k][2] if k >= 0 and v[k][1] >= s0 else None
         labelled.append((stream, label, (s1 - s0) / 1e6))
         if label:

@@ -425,6 +425,51 @@ PLANS = {
          {**FT_ENV, "BULK_WATCHDOG_S": "880", "MIMI_BULK_IN_FLIGHT": "96", "MIMI_HUB_DIAR_STEP": "0.5",
           "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True"}),
     ],
+    # fbank in the ResNet batcher, 128-window calls and a 10 ms merge wait; then Mimi at batch 32; then its profile
+    "opt1": [
+        (["bulk_bench.py", "--clips", "1024", "--check", "0", "--prep", "32", "--subtype", "PCM_16"],
+         {**FT_ENV, "BULK_WATCHDOG_S": "880", "MIMI_BULK_IN_FLIGHT": "96", "MIMI_HUB_DIAR_STEP": "0.5",
+          "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True"}),
+        (["bulk_bench.py", "--clips", "1024", "--check", "0", "--prep", "32", "--subtype", "PCM_16"],
+         {**FT_ENV, "BULK_WATCHDOG_S": "880", "MIMI_BULK_IN_FLIGHT": "96", "MIMI_HUB_DIAR_STEP": "0.5",
+          "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True", "MIMI_BULK_MIMI_BATCH": "32"}),
+        (["bulk_bench.py", "--clips", "512", "--check", "0", "--prep", "32", "--subtype", "PCM_16", "--profile", "40:5"],
+         {**FT_ENV, "BULK_WATCHDOG_S": "880", "MIMI_BULK_IN_FLIGHT": "96", "MIMI_HUB_DIAR_STEP": "0.5",
+          "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True", "MIMI_BULK_MIMI_BATCH": "32"}),
+    ],
+    # the ASR loop is the limit: its streams at high priority (the new default), then with 3 and 4 ASR workers
+    "asr1": [
+        (["bulk_bench.py", "--clips", "1024", "--check", "0", "--prep", "32", "--subtype", "PCM_16"],
+         {**FT_ENV, "BULK_WATCHDOG_S": "880", "MIMI_BULK_IN_FLIGHT": "96", "MIMI_HUB_DIAR_STEP": "0.5",
+          "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True"}),
+        (["bulk_bench.py", "--clips", "1024", "--check", "0", "--prep", "32", "--subtype", "PCM_16"],
+         {**FT_ENV, "BULK_WATCHDOG_S": "880", "MIMI_BULK_IN_FLIGHT": "96", "MIMI_HUB_DIAR_STEP": "0.5",
+          "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True", "MIMI_BULK_ASR_WORKERS": "3"}),
+        (["bulk_bench.py", "--clips", "1024", "--check", "0", "--prep", "32", "--subtype", "PCM_16"],
+         {**FT_ENV, "BULK_WATCHDOG_S": "880", "MIMI_BULK_IN_FLIGHT": "96", "MIMI_HUB_DIAR_STEP": "0.5",
+          "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True", "MIMI_BULK_ASR_WORKERS": "4"}),
+    ],
+    # one bulk process stops scaling (bigger batches, more ASR workers: slower): 2 and 4 under MPS, the episodes in
+    # flight split between them
+    "mp1": [
+        (["bulk_bench.py", "--clips", "1024", "--check", "0", "--prep", "32", "--subtype", "PCM_16", "--procs", "2"],
+         {**FT_ENV, "MPS": "1", "BULK_WATCHDOG_S": "880", "MIMI_HUB_DIAR_STEP": "0.5",
+          "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True", "MIMI_BULK_IN_FLIGHT": "48"}),
+        (["bulk_bench.py", "--clips", "1024", "--check", "0", "--prep", "32", "--subtype", "PCM_16", "--procs", "4"],
+         {**FT_ENV, "MPS": "1", "BULK_WATCHDOG_S": "880", "MIMI_HUB_DIAR_STEP": "0.5",
+          "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True", "MIMI_BULK_IN_FLIGHT": "24"}),
+    ],
+    # every setup tops out at 1,900-1,970x, and more parallel work inside a process makes it slower: the CPU? (run
+    # with --cpu 64): one bulk process with more prep workers, two under MPS, and the 16 hub processes
+    "cpu1": [
+        (["bulk_bench.py", "--clips", "1024", "--check", "0", "--prep", "48", "--subtype", "PCM_16"],
+         {**FT_ENV, "BULK_WATCHDOG_S": "880", "MIMI_BULK_IN_FLIGHT": "96", "MIMI_HUB_DIAR_STEP": "0.5",
+          "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True"}),
+        (["bulk_bench.py", "--clips", "1024", "--check", "0", "--prep", "48", "--subtype", "PCM_16", "--procs", "2"],
+         {**FT_ENV, "BULK_WATCHDOG_S": "880", "MIMI_BULK_IN_FLIGHT": "96", "MIMI_HUB_DIAR_STEP": "0.5",
+          "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True", "MPS": "1", "MIMI_BULK_IN_FLIGHT": "48"}),
+        (["--clips", "64", "--workers", "1", "--procs", "16"], {**MPS_ENV, "MIMI_HUB_DIAR_STEP": "0.5"}),
+    ],
     # AOTInductor prototype: Parakeet (one bucket) and the ResNet as packages, with the GIL and free-threaded
     "aot1": [
         (["aoti_check.py"], {"MIMI_HUB_COMPILE": "0"}),
