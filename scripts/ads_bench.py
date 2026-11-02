@@ -40,6 +40,7 @@ def main():
     ap.add_argument("specs", nargs="*", default=DEFAULT)
     ap.add_argument("--episodes", type=int, default=6)
     ap.add_argument("--parallel", type=int, default=3, help="episodes at once per spec")
+    ap.add_argument("--save", default=None, help="JSON file: every spec's segments per episode (merged into it)")
     a = ap.parse_args()
     from hub import segments
     data = ROOT / "hub_data"
@@ -58,10 +59,11 @@ def main():
             i, title, cues, ref = ep
             t = time.time()
             try:
-                got = [(s["start"], s["end"]) for s in segments.detect(cues, spec, log=lambda m: None)["segments"]]
+                full = segments.detect(cues, spec, log=lambda m: None)["segments"]
+                got = [(s["start"], s["end"]) for s in full]
             except Exception as e:  # noqa: BLE001
                 return {"id": i, "error": f"{type(e).__name__}: {str(e)[:200]}"}
-            return {"id": i, "s": round(time.time() - t, 1), "ref": ref, "got": got}
+            return {"id": i, "s": round(time.time() - t, 1), "ref": ref, "got": got, "segments": full}
         with ThreadPoolExecutor(a.parallel) as ex:
             rows = list(ex.map(one, eps))
         ok = [r for r in rows if "error" not in r]
@@ -71,6 +73,10 @@ def main():
         refs = sum(len(r["ref"]) for r in ok)
         extra = sum(sum(all(overlap(x, y) == 0 for x in r["ref"]) for y in r["got"]) for r in ok)
         times = sorted(r["s"] for r in ok)
+        if a.save:
+            saved = json.loads(Path(a.save).read_text()) if Path(a.save).exists() else {}
+            saved[spec] = {r["id"]: r["segments"] for r in ok}
+            Path(a.save).write_text(json.dumps(saved, indent=1))
         print("ADS " + json.dumps({
             "spec": spec, "episodes": len(ok), "errors": [r["error"] for r in rows if "error" in r][:2],
             "iou": round(inter / either, 3) if either else None, "found": f"{found}/{refs}", "extra": extra,

@@ -9,6 +9,9 @@ per episode and needs no API key in the hub.
         default codex:gpt-6.1-sol,claude:claude-haiku-5-5 (also agy:gemini-4-argon-high), or "off"
         codex flags: minimal / low / medium / high / xhigh (reasoning effort; without one, ~/.codex/config.toml's),
         fast / priority / flex / default (service tier); e.g. codex:gpt-6.1-sol+low+fast
+        claude flags: low / medium / high / xhigh / max (--effort), fast (fast mode); e.g. claude:claude-opus-5-5+fast
+        openrouter:<model id> (OpenRouter's API, key in OPENROUTER_API_KEY); e.g. openrouter:inception/mercury-3
+        inception:<model id> (Inception Labs' API, key in INCEPTION_API_KEY); e.g. inception:mercury-3
 
 On six episodes (2026-10-31) Sol and Haiku found the same ad breaks, matching hand labels; Sol ~6-15 s,
 Haiku ~2-17 s, Argon ~220 s per episode.
@@ -98,7 +101,7 @@ _PATH = os.pathsep.join([os.environ.get("PATH", ""), os.path.expanduser("~/.loca
                          f"/etc/profiles/per-user/{pwd.getpwuid(os.getuid()).pw_name}/bin", "/run/current-system/sw/bin"])
 
 
-EFFORTS = ("minimal", "low", "medium", "high", "xhigh")
+EFFORTS = ("minimal", "low", "medium", "high", "xhigh", "max")
 TIERS = ("fast", "priority", "flex", "default")
 
 
@@ -110,6 +113,13 @@ def _run(backend, model, prompt):
         if backend == "claude":
             cmd = [exe, "-p", "--model", model, "--tools", "", "--no-session-persistence",
                    "--setting-sources", "", "--strict-mcp-config", "--output-format", "text"]
+            for f in flags:
+                if f == "fast":
+                    cmd += ["--settings", '{"fastMode": true}']
+                elif f in EFFORTS and f != "minimal":
+                    cmd += ["--effort", f]
+                else:
+                    raise ValueError(f"unknown claude flag {f!r}")
             r = subprocess.run(cmd, input=prompt, capture_output=True, text=True, cwd=tmp, env=env, timeout=TIMEOUT_S)
             out = r.stdout
         elif backend == "codex":
@@ -125,6 +135,8 @@ def _run(backend, model, prompt):
             cmd.append("-")
             r = subprocess.run(cmd, input=prompt, capture_output=True, text=True, cwd=tmp, env=env, timeout=TIMEOUT_S)
             out = open(last).read() if os.path.exists(last) else ""
+        elif backend in _OPENAI_COMPAT:
+            return _chat(backend, model, prompt)
         elif backend == "agy":
             cmd = [exe, "--model", model, "--output-format", "text", "-p", prompt]
             r = subprocess.run(cmd, capture_output=True, text=True, cwd=tmp, env=env, timeout=TIMEOUT_S)
@@ -134,6 +146,38 @@ def _run(backend, model, prompt):
     if r.returncode != 0:
         raise RuntimeError(f"{backend} exited {r.returncode}: {(r.stderr or r.stdout)[-400:]}")
     return out
+
+
+# OpenAI-style chat APIs: backend -> (endpoint, environment variable with the key)
+_OPENAI_COMPAT = {"openrouter": ("https://openrouter.ai/api/v1/chat/completions", "OPENROUTER_API_KEY"),
+                  "inception": ("https://api.inceptionlabs.ai/v1/chat/completions", "INCEPTION_API_KEY")}
+
+
+def _chat(backend, model, prompt):
+    import urllib.request
+    # uv's Python doesn't know NixOS's CA bundle (as hub/mimi_hub.py; this may run on its own)
+    if not os.environ.get("SSL_CERT_FILE") and os.path.exists("/etc/ssl/certs/ca-certificates.crt"):
+        os.environ["SSL_CERT_FILE"] = "/etc/ssl/certs/ca-certificates.crt"
+    url, var = _OPENAI_COMPAT[backend]
+    key = os.environ.get(var)
+    if not key:
+        raise RuntimeError(f"{var} not set")
+    body = json.dumps({"model": model, "messages": [{"role": "user", "content": prompt}], "temperature": 0})
+    req = urllib.request.Request(url, data=body.encode(),
+                                 headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"})
+    import urllib.error
+    for attempt in range(6):  # 429: the provider's rate limit (OpenRouter's keys share a pool); back off
+        try:
+            with urllib.request.urlopen(req, timeout=TIMEOUT_S) as r:
+                out = json.load(r)
+            break
+        except urllib.error.HTTPError as e:
+            if e.code != 429 or attempt == 5:
+                raise RuntimeError(f"{backend} HTTP {e.code}: {e.read().decode()[:300]}") from None
+            time.sleep(2 * 2 ** attempt)
+    if "error" in out:
+        raise RuntimeError(f"{backend}: {out['error']}")
+    return out["choices"][0]["message"]["content"] or ""
 
 
 def _parse(text, lo, hi):
