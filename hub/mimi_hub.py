@@ -245,6 +245,9 @@ def _load_models():
         dev = "mps" if torch.backends.mps.is_available() else "cpu"
     m["device"] = dev
     m["mimi"] = mimi_file.load_model(dev)
+    if MIMI_FP16 and dev != "cpu":  # the encoder's conv / linear weights as autocast uses them: the same codes
+        from hub.autocast_weights import half_weights
+        half_weights(m["mimi"].encoder)
     # onnxruntime's default spin-waiting threads starve torch's: on a 15 min clip (scripts/bench_overlap.py)
     # ASR alone went 50 -> 31 s with spinning off, and encode || ASR 87 -> 39 s
     so = ort.SessionOptions()
@@ -259,11 +262,8 @@ def _load_models():
             if os.environ.get("MIMI_HUB_ASR_ENCODER", "native") == "native":
                 from hub import parakeet_native
                 model_dir = parakeet_native.convert(ASR_MODEL, MODELS_DIR / f"{ASR_MODEL}-hf")
-                encoder = parakeet_native.load(model_dir, dev)
-                # fp16 weights: 1.2 GB less GPU memory per process (more processes fit), same speed; 545/548
-                # segments of a 43.8 min episode identical (the rest a comma or a word). Off by default.
-                if os.environ.get("MIMI_HUB_ASR_HALF", "0") == "1":
-                    encoder = encoder.half()
+                # its linear / conv weights in fp16, as autocast uses them: identical output, 1.2 GB less GPU memory
+                encoder = parakeet_native.load(model_dir, dev, half=True)
                 asr.asr._encoder = parakeet_native.NativeEncoder(encoder)
                 # identical tokens and timestamps to onnx_asr's loop (548/548 segments of a 43.8 min episode;
                 # scripts/parakeet_decoder_check.py). It frees the CPU: on Modal's L40S (CPU-bound) pipeline

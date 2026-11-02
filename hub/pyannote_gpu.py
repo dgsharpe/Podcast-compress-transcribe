@@ -61,6 +61,33 @@ def _freeze_bn(module):
             _freeze_bn(child)
 
 
+def _fold_bn(module):
+    """Fold each eval-mode BatchNorm2d into the Conv2d before it (WeSpeaker's convN / bnN pairs and its
+    Sequential(conv, bn) shortcuts): the conv's weights scaled per channel, the norm's shift as its bias."""
+    nn = torch.nn
+
+    def fold(conv, bn):
+        scale = bn.weight / torch.sqrt(bn.running_var + bn.eps)
+        bias = bn.bias - bn.running_mean * scale
+        if conv.bias is not None:
+            bias = bias + conv.bias * scale
+        conv.weight.data.mul_(scale.view(-1, 1, 1, 1))
+        conv.bias = nn.Parameter(bias.detach())
+
+    for child in module.children():
+        _fold_bn(child)
+    for k in range(1, 4):
+        conv, bn = getattr(module, f"conv{k}", None), getattr(module, f"bn{k}", None)
+        if isinstance(conv, nn.Conv2d) and isinstance(bn, nn.BatchNorm2d):
+            fold(conv, bn)
+            setattr(module, f"bn{k}", nn.Identity())
+    if isinstance(module, nn.Sequential):
+        for k in range(len(module) - 1):
+            if isinstance(module[k], nn.Conv2d) and isinstance(module[k + 1], nn.BatchNorm2d):
+                fold(module[k], module[k + 1])
+                module[k + 1] = nn.Identity()
+
+
 def _without_miopen(module):
     forward = module.forward
 
@@ -75,6 +102,13 @@ def _without_miopen(module):
 # embedding step 1.4x faster on an L40S, 1.3x on an H100, diarization unchanged (DER 0). auto: on with NVIDIA.
 # (CUDA graphs for it and the segmentation model gained nothing: both are compute-bound, not launch-bound.)
 CHANNELS_LAST = os.environ.get("MIMI_HUB_DIAR_CL", "auto")
+# The ResNet's batch norms folded into its convolutions: the separate normalization kernels were ~6% of a loaded
+# H100's GPU time; on the server the embedding step went 10.9 -> 9.0 s, diarization unchanged (DER 0).
+FOLD_BN = os.environ.get("MIMI_HUB_DIAR_FOLD", "1") == "1"
+# The segmentation model's LSTM under fp16 / bf16 autocast: 1.3x faster segmentation on an L40S and an H100, DER
+# 0.0002 (also on the server, where it's slower without MIOpen). auto: fp16 on NVIDIA, else fp32. (The whole model in
+# fp16, its SincNet front end too, changed a 43.8 min episode's diarization by DER 0.11.)
+SEG_DTYPE = os.environ.get("MIMI_HUB_SEG_DTYPE", "auto")
 
 
 def _frames_mode(device):
@@ -184,6 +218,8 @@ def load(device="cuda", path=None, segmentation_device=None):
     from huggingface_hub import snapshot_download
     from pyannote.audio import Pipeline
     pipeline = Pipeline.from_pretrained(path or snapshot_download(MODEL, local_files_only=True))
+    if FOLD_BN:
+        _fold_bn(pipeline._embedding.model_.eval())
     pipeline.to(torch.device(device))
     if segmentation_device:
         pipeline._segmentation.to(torch.device(segmentation_device))
@@ -194,7 +230,22 @@ def load(device="cuda", path=None, segmentation_device=None):
     pipeline.get_embeddings = types.MethodType(get_embeddings, pipeline)
     pipeline._segmentation.step = STEP_FRAC * pipeline._segmentation.duration
     nvidia = torch.device(device).type == "cuda" and not torch.version.hip
+    from hub.autocast_weights import half_weights
+    seg_dtype = _DTYPES.get(SEG_DTYPE if SEG_DTYPE != "auto" else ("fp16" if nvidia else "fp32"))
+    if seg_dtype is not None and pipeline._segmentation.device.type != "cpu":
+        lstms = pipeline._segmentation.model.lstm
+        for lstm in (lstms if isinstance(lstms, torch.nn.ModuleList) else [lstms]):
+            half_weights(lstm, dtype=seg_dtype)  # what autocast computes with: no per-call conversion
+            def lstm_forward(x, *a, _forward=lstm.forward, **k):
+                with torch.autocast(x.device.type, dtype=seg_dtype):
+                    out, state = _forward(x, *a, **k)
+                return out.float(), state
+            lstm.forward = lstm_forward
+    resnet = pipeline._embedding.model_.resnet
     if CHANNELS_LAST == "1" or (CHANNELS_LAST == "auto" and nvidia):
-        resnet = pipeline._embedding.model_.resnet.to(memory_format=torch.channels_last)
+        resnet.to(memory_format=torch.channels_last)
         resnet.conv1.register_forward_pre_hook(lambda m, args: (args[0].contiguous(memory_format=torch.channels_last),))
+    frames_dtype = _DTYPES.get(_frames_mode(torch.device(device)))
+    if frames_dtype is not None:  # the layers forward_frames runs under autocast; the embedding head stays fp32
+        half_weights(resnet.conv1, resnet.layer1, resnet.layer2, resnet.layer3, resnet.layer4, dtype=frames_dtype)
     return pipeline

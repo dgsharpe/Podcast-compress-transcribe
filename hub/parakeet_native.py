@@ -76,8 +76,10 @@ def convert(asr_model, out_dir):
     return out_dir
 
 
-def load(model_dir, device="cuda"):
-    """ParakeetEncoder with the converted weights (strict: every weight must map), eval, on [device]."""
+def load(model_dir, device="cuda", half=False):
+    """ParakeetEncoder with the converted weights (strict: every weight must map), eval, on [device]. [half]: its
+    linear and conv weights in fp16 (hub/autocast_weights.py: what autocast computes with anyway, so the same
+    output, in half the memory), converted before it's moved."""
     from safetensors.torch import load_file
     from transformers import ParakeetEncoder, ParakeetEncoderConfig
 
@@ -93,6 +95,9 @@ def load(model_dir, device="cuda"):
     if torch.version.hip:  # MIOpen's batch norm fails to compile on gfx1151 (as in pyannote_gpu)
         from hub.pyannote_gpu import _freeze_bn
         _freeze_bn(encoder)
+    if half:
+        from hub.autocast_weights import half_weights
+        half_weights(encoder)
     return encoder.to(device)
 
 

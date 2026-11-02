@@ -12,9 +12,11 @@ cache). Results: outputs/modal_hub_bench.jsonl (one line per run).
 import json
 import os
 import re
+import signal
 import subprocess
 import sys
 import time
+import types
 from pathlib import Path
 
 import modal
@@ -66,9 +68,11 @@ image = (
     .add_local_file(ROOT / "scripts/diar_precision_check.py", f"{NA}/scripts/diar_precision_check.py")
     .add_local_file(ROOT / "scripts/roofline_server.py", f"{NA}/scripts/roofline_server.py")
     .add_local_file(ROOT / "scripts/mimi_pieces_check.py", f"{NA}/scripts/mimi_pieces_check.py")
+    .add_local_file(ROOT / "scripts/fp16_weights_check.py", f"{NA}/scripts/fp16_weights_check.py")
 )
 app = modal.App("mimi-hub-bench", image=image)
 
+MPS_ENV = {"MIMI_HUB_THREADS": "1", "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True", "MPS": "1"}
 # name -> runs: (args, extra env); args are throughput_server.py's unless they start with another script's name
 PLANS = {
     "baseline": [
@@ -158,6 +162,29 @@ PLANS = {
                                                                 "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True",
                                                                 "MPS": "1"}),
     ],
+    # the segmentation model's LSTM in fp16 (DER 0.0002 on the server), with MPS
+    "push9": [
+        (["diar_precision_check.py", "fp16:32:cl1", "fp16:32:cl1:seg16"], {}),
+        (["--clips", "64", "--workers", "1", "--procs", "16"], {"MIMI_HUB_THREADS": "1", "MIMI_HUB_ASR_HALF": "1",
+                                                                "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True",
+                                                                "MIMI_HUB_SEG_DTYPE": "fp16", "MPS": "1"}),
+    ],
+    # MPS on an H100: 20 / 24 processes (fp16 weights converted before the GPU, 4 loading at a time), and a profile
+    # of one process's kernels under full load
+    "push10": [
+        (["--clips", "64", "--workers", "1", "--procs", "16", "--torch-profile"], MPS_ENV),
+        (["--clips", "80", "--workers", "1", "--procs", "20"], MPS_ENV),
+        (["--clips", "96", "--workers", "1", "--procs", "24"], MPS_ENV),
+    ],
+    # new defaults: fp16-stored autocast weights (identical), folded batch norms, fp16 segmentation LSTM
+    "push11": [
+        (["fp16_weights_check.py"], {}),
+        (["diar_precision_check.py", "fp16:32:cl1", "fp16:32:cl1:seg16:fold"], {}),
+        (["parakeet_decoder_check.py"], {}),
+        (["--clips", "64", "--workers", "1", "--procs", "16"], MPS_ENV),
+        (["--clips", "80", "--workers", "1", "--procs", "20"], MPS_ENV),
+        (["--clips", "96", "--workers", "1", "--procs", "24"], MPS_ENV),
+    ],
     # pushing one GPU: where its time goes, then a 32-clip backlog (160 min) at more processes
     "push1": [
         (["roofline_server.py"], {}),
@@ -170,7 +197,12 @@ PLANS = {
 }
 
 
-@app.function(gpu="L40S", cpu=16.0, memory=MEM_GIB * 1024, timeout=3600)
+# Guards against a hung run billing a GPU: each run is killed (with the worker processes it spawned) after
+# RUN_TIMEOUT_S, the container after 25 min, and the local entrypoint cancels its calls when it gives up or is stopped.
+RUN_TIMEOUT_S = 900
+
+
+@app.function(gpu="L40S", cpu=16.0, memory=MEM_GIB * 1024, timeout=25 * 60)
 def bench(gpu: str, runs: list) -> list:
     import torch
     sys.path.insert(0, NA)
@@ -204,7 +236,15 @@ def bench(gpu: str, runs: list) -> list:
             env.update(mps_env)
         cmd = ([f"{NA}/scripts/{args[0]}", *args[1:]] if args and args[0].endswith(".py")
                else [f"{NA}/scripts/throughput_server.py", "--label", gpu, *args])
-        p = subprocess.run([sys.executable, *cmd], cwd=NA, env={**os.environ, **env}, capture_output=True, text=True)
+        proc = subprocess.Popen([sys.executable, *cmd], cwd=NA, env={**os.environ, **env}, stdout=subprocess.PIPE,
+                                stderr=subprocess.PIPE, text=True, start_new_session=True)
+        try:
+            stdout, stderr = proc.communicate(timeout=RUN_TIMEOUT_S)
+        except subprocess.TimeoutExpired:
+            os.killpg(proc.pid, signal.SIGKILL)  # the run and every process it started
+            stdout, stderr = proc.communicate()
+            stderr += f"\nkilled after {RUN_TIMEOUT_S} s"
+        p = types.SimpleNamespace(returncode=proc.returncode, stdout=stdout, stderr=stderr)
         rows = [{"tag": ln.split(" ", 1)[0], **json.loads(ln.split(" ", 1)[1])} for ln in p.stdout.splitlines()
                 if re.match(r"^[A-Z]+ \{", ln)]
         if p.returncode or not rows:
@@ -213,6 +253,8 @@ def bench(gpu: str, runs: list) -> list:
             continue
         if use_mps:
             mps(False)
+        if any(r.get("error") for r in rows):  # e.g. a worker process that died: why
+            print(f"RUN STDERR {args}:\n{p.stderr[-4000:]}", flush=True)
         for r in rows:
             r = {**info, **r, "args": args, "env": env, "mps": use_mps, "run_s": round(time.time() - t)}
             print("RESULT " + json.dumps(r), flush=True)
@@ -221,41 +263,51 @@ def bench(gpu: str, runs: list) -> list:
 
 
 @app.local_entrypoint()
-def main(gpus: str = "L40S,H100", plan: str = "baseline", cpu: float = 16.0, mem: int = MEM_GIB, wait_min: float = 45):
+def main(gpus: str = "L40S,H100", plan: str = "baseline", cpu: float = 16.0, mem: int = MEM_GIB, wait_min: float = 25):
     runs = PLANS[plan]
     names = [g for g in (x.strip() for x in gpus.split(",")) if g]
     calls = {g: bench.with_options(gpu=g, cpu=cpu, memory=mem * 1024).spawn(g, runs) for g in names}
+
+    def stop(*_):  # stopped from outside (SIGTERM / SIGHUP): don't leave the containers running
+        for call in calls.values():
+            call.cancel()
+        raise SystemExit("stopped; remote calls cancelled")
+    signal.signal(signal.SIGTERM, stop)
+    signal.signal(signal.SIGHUP, stop)
     out = ROOT / "outputs/modal_hub_bench.jsonl"
     out.parent.mkdir(exist_ok=True)
-    deadline = time.time() + wait_min * 60
-    while calls and time.time() < deadline:  # as they finish: one GPU type without capacity mustn't block the rest
-        for g, call in list(calls.items()):
-            try:
-                rows = call.get(timeout=0)
-            except (TimeoutError, modal.exception.TimeoutError):
-                continue
-            except Exception as e:
-                rows = [{"gpu": g, "error": f"{type(e).__name__}: {e}"}]
-            del calls[g]
-            with open(out, "a") as f:
-                for r in rows:
-                    r["plan"], r["cpu"], r["mem_gib"] = plan, cpu, mem
-                    f.write(json.dumps(r) + "\n")
-                    if "error" in r:
-                        print(f"{g:6s} ERROR {r.get('args')} {r['error'][-300:]}", flush=True)
-                        continue
-                    if r.get("tag") != "RESULT":
-                        keep = {k: v for k, v in r.items() if k not in ("gpu", "device", "vcpus", "cpu_model", "args",
-                                                                         "env", "plan", "cpu", "mem_gib")}
-                        print(f"{g:6s} {json.dumps(keep)}", flush=True)
-                        continue
-                    usd_h = (PRICE.get(g, 0) + cpu * CPU_PRICE + mem * MEM_PRICE) * 3600 / r["x_rt"]
-                    print(f"{g:6s} procs={r['procs']} workers={r['workers']} env={r['env']} "
-                          f"{r['x_rt']:6.1f}x  gpu {r['gpu_busy_pct']:5.1f}%  cpu {r['cpu_cores_used']:4.1f} cores  "
-                          f"${usd_h:.4f}/audio h  stages {r['clip_stage_s']}  "
-                          f"peak {r.get('gpu_peak_gb_per_proc')} GB/proc",
-                          flush=True)
-        time.sleep(5)
-    for g, call in calls.items():
-        call.cancel()
-        print(f"{g}: no result within {wait_min:g} min; cancelled", flush=True)
+    try:
+        deadline = time.time() + wait_min * 60
+        while calls and time.time() < deadline:  # as they finish: one GPU type without capacity mustn't block the rest
+            for g, call in list(calls.items()):
+                try:
+                    rows = call.get(timeout=0)
+                except (TimeoutError, modal.exception.TimeoutError):
+                    continue
+                except Exception as e:
+                    rows = [{"gpu": g, "error": f"{type(e).__name__}: {e}"}]
+                del calls[g]
+                with open(out, "a") as f:
+                    for r in rows:
+                        r["plan"], r["cpu"], r["mem_gib"] = plan, cpu, mem
+                        f.write(json.dumps(r) + "\n")
+                        if "error" in r:
+                            print(f"{g:6s} ERROR {r.get('args')} {r['error'][-300:]}", flush=True)
+                            continue
+                        if r.get("tag") != "RESULT":
+                            skip = ("gpu", "device", "vcpus", "cpu_model", "args", "env", "plan", "cpu", "mem_gib")
+                            keep = {k: v for k, v in r.items() if k not in skip}
+                            print(f"{g:6s} {json.dumps(keep)}", flush=True)
+                            continue
+                        usd_h = (PRICE.get(g, 0) + cpu * CPU_PRICE + mem * MEM_PRICE) * 3600 / r["x_rt"]
+                        print(f"{g:6s} procs={r['procs']} workers={r['workers']} env={r['env']} "
+                              f"{r['x_rt']:6.1f}x  gpu {r['gpu_busy_pct']:5.1f}%  "
+                              f"cpu {r['cpu_cores_used']:4.1f} cores  "
+                              f"${usd_h:.4f}/audio h  stages {r['clip_stage_s']}  "
+                              f"peak {r.get('gpu_peak_gb_per_proc')} GB/proc",
+                              flush=True)
+            time.sleep(5)
+    finally:  # however this ends (deadline, error, Ctrl-C): nothing left running in the cloud
+        for g, call in calls.items():
+            call.cancel()
+            print(f"{g}: no result within {wait_min:g} min (or stopped); cancelled", flush=True)

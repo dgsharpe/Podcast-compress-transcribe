@@ -199,15 +199,47 @@ def profile_hooks(m):
         wrap(pipe, "get_embeddings", "embeddings")
 
 
-def _proc(a, ks, workers, barrier, results):
+def _proc(a, ks, workers, barrier, results, index=0, loading=None):
     """One of --procs processes: its own models, its share [ks] of the clips."""
     clips = load_clips(a.wav, None, a.clip_min, ks)
-    m = setup(a.tf32)
-    baseline_episode(m, *clips[0])  # warm-up
+    if loading is not None:  # a few at a time: loading peaks at several GB of RAM per process
+        loading.acquire()
+    try:
+        m = setup(a.tf32)
+        baseline_episode(m, *clips[0])  # warm-up
+    finally:
+        if loading is not None:
+            loading.release()
     barrier.wait(timeout=900)
     t = time.time()
-    wall, _, out, errors, cpu_s = run_backlog(baseline_episode, m, clips, workers)
+    if a.torch_profile and index == 0:
+        wall, _, out, errors, cpu_s = _profiled(lambda: run_backlog(baseline_episode, m, clips, workers))
+    else:
+        wall, _, out, errors, cpu_s = run_backlog(baseline_episode, m, clips, workers)
     results.put((t, t + wall, list(out.values()), errors, cpu_s, _gpu_peak_gb()))
+
+
+def _profiled(f):
+    """f() under torch.profiler: prints the GPU kernels taking the most time."""
+    import torch
+    from torch.profiler import ProfilerActivity, profile
+    try:  # the work runs in worker threads
+        cfg = {"experimental_config": torch._C._profiler._ExperimentalConfig(profile_all_threads=True)}
+    except (AttributeError, TypeError):
+        cfg = {}
+    with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA], **cfg) as prof:
+        r = f()
+    ev = prof.key_averages()
+
+    def selfdev(e):
+        return getattr(e, "self_device_time_total", None) or getattr(e, "self_cuda_time_total", 0)
+    kernels = sorted((e for e in ev if selfdev(e) > 0), key=selfdev, reverse=True)
+    total = sum(selfdev(e) for e in kernels)
+    top = [{"kernel": e.key[:90], "ms": round(selfdev(e) / 1000, 1), "calls": e.count,
+            "pct": round(100 * selfdev(e) / max(1, total), 1)} for e in kernels[:25]]
+    print("TORCHPROF " + json.dumps({"wall_s": round(r[0], 1), "kernel_ms_total": round(total / 1000, 1),
+                                     "top": top}), flush=True)
+    return r
 
 
 def _gpu_peak_gb():
@@ -258,6 +290,7 @@ def main():
     ap.add_argument("--label", default="E0")
     ap.add_argument("--tf32", action="store_true")
     ap.add_argument("--profile", action="store_true", help="component times (one process; per clip)")
+    ap.add_argument("--torch-profile", action="store_true", help="profile process 0's share of the backlog")
     ap.add_argument("--stage-cpu", action="store_true",
                     help="each stage alone over all clips: CPU-seconds and wall seconds per audio-second")
     ap.add_argument("--wav", default=str(ROOT / "data/ref/ref_24k.wav"))
@@ -284,9 +317,10 @@ def main():
         else:
             import multiprocessing as mp
             ctx = mp.get_context("spawn")
-            barrier, q = ctx.Barrier(a.procs + 1), ctx.Queue()
+            barrier, q, loading = ctx.Barrier(a.procs + 1), ctx.Queue(), ctx.Semaphore(4)
             shares = [list(range(a.clips))[p::a.procs] for p in range(a.procs)]
-            ps = [ctx.Process(target=_proc, args=(a, ks, workers, barrier, q)) for ks in shares]
+            ps = [ctx.Process(target=_proc, args=(a, ks, workers, barrier, q, k, loading))
+                  for k, ks in enumerate(shares)]
             [p.start() for p in ps]
             got, dead = [], []
             try:

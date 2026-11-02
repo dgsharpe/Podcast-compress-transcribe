@@ -1,8 +1,8 @@
 """pyannote community-1 (hub/pyannote_gpu.py) with the embedding ResNet's frames in fp32 / tf32 / fp16 / bf16 /
-coreml, batch sizes and memory layout, on the reference episode (43.8 min): time and DER against the first variant's
-run (how much the output changes, not accuracy against ground truth).
+coreml, batch sizes, memory layout and the segmentation model's precision, on the reference episode (43.8 min):
+time and DER against the first variant's run (how much the output changes, not accuracy against ground truth).
 
-    python scripts/diar_precision_check.py [fp32:32 fp16:32 fp16:32:cl1 ...]     (dtype:batch[:cl1 = channels-last])
+    python scripts/diar_precision_check.py [fp32:32 fp16:32:cl1 ...]    (dtype:batch[:cl1][:seg16|segbf16][:fold])
 
 TPUT_PYANNOTE_PATH: a local copy of the model instead of the HF cache.
 """
@@ -34,12 +34,16 @@ def main():
     pipes = {}
     ref = None
     for dtype, batch, *rest in variants:
-        cl = rest[0] == "cl1" if rest else False  # cl1: the ResNet in channels-last layout (set up at load)
+        cl = "cl1" in rest  # the ResNet in channels-last layout (set up at load)
+        fold = "fold" in rest  # its batch norms folded into the convolutions
+        seg = next((f[3:] for f in rest if f.startswith("seg")), "fp32")  # seg16 / segbf16: segmentation autocast
+        seg = {"16": "fp16", "bf16": "bf16"}.get(seg, seg)
         pyannote_gpu.FRAMES_DTYPE, pyannote_gpu.BATCH_CHUNKS = dtype, int(batch)
-        pyannote_gpu.CHANNELS_LAST = "1" if cl else "0"
-        if cl not in pipes:
-            pipes[cl] = pyannote_gpu.load(device, path=os.environ.get("TPUT_PYANNOTE_PATH"))
-        pipe = pipes[cl]
+        pyannote_gpu.CHANNELS_LAST, pyannote_gpu.SEG_DTYPE, pyannote_gpu.FOLD_BN = "1" if cl else "0", seg, fold
+        key = (dtype, cl, seg, fold)  # all set up at load (the ResNet's weights are stored in its dtype)
+        if key not in pipes:
+            pipes[key] = pyannote_gpu.load(device, path=os.environ.get("TPUT_PYANNOTE_PATH"))
+        pipe = pipes[key]
         pipe({"waveform": torch.from_numpy(w16[: 120 * 16000])[None], "sample_rate": 16000})  # warm-up
         f = {"waveform": torch.from_numpy(w16)[None], "sample_rate": 16000}
         sync()
@@ -52,7 +56,8 @@ def main():
         ref = ann if ref is None else ref
         top = sorted((round(ann.label_duration(k) / 60, 1) for k in ann.labels()), reverse=True)[:4]
         name = torch.cuda.get_device_name(0) if device == "cuda" else device
-        res = {"device": name, "dtype": dtype, "batch": int(batch), "channels_last": cl, "wall_s": round(wall, 2),
+        res = {"device": name, "dtype": dtype, "batch": int(batch), "channels_last": cl, "seg": seg, "fold": fold,
+               "wall_s": round(wall, 2),
                **{k: round(v, 2) for k, v in f["timing"].items() if k != "total"},
                "der_vs_first": round(DiarizationErrorRate()(ref, ann), 4), "speakers_min": top}
         print("DIAR " + json.dumps(res), flush=True)
