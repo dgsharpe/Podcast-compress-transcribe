@@ -37,6 +37,7 @@ def main():
     ap.add_argument("--tol", type=float, default=8.0)
     ap.add_argument("--context", type=float, default=25.0)
     ap.add_argument("--episode", default=None)
+    ap.add_argument("--data", default="hub_data")
     a = ap.parse_args()
     from hub import segments
     runs = json.loads(Path(a.runs).read_text())
@@ -46,8 +47,8 @@ def main():
     for i in episodes:
         if a.episode and not i.startswith(a.episode):
             continue
-        rec = json.loads((ROOT / "hub_data" / f"{i}.json").read_text())
-        cues = segments.read_cues((ROOT / "hub_data" / f"{i}.vtt").read_text())
+        rec = json.loads((ROOT / a.data / f"{i}.json").read_text())
+        cues = segments.read_cues((ROOT / a.data / f"{i}.vtt").read_text())
         have = [s for s in specs if i in runs[s]]
         cs = clusters({s: runs[s][i] for s in have})
         print(f"\n######## {i[:8]} {rec.get('title', '')[:70]} ({rec.get('duration_s', 0) / 60:.0f} min, "

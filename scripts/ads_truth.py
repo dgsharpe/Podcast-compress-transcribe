@@ -7,6 +7,8 @@ true break covered), missed, extra (candidate breaks overlapping no true break),
 
     python scripts/ads_truth.py runs.json
     python scripts/ads_truth.py --score other_runs.json     (score against the saved data/ads_truth.json)
+    python scripts/ads_truth.py --fresh runs.json / --fresh --score runs.json
+        (the episodes in data/fresh_hub, scripts/fresh_episodes.py: JUDGED_FRESH, data/ads_truth_fresh.json)
 """
 import json
 import statistics
@@ -43,6 +45,31 @@ JUDGED = {
 }
 
 
+# The same for the fresh episodes (data/fresh_hub: scripts/fresh_episodes.py, shows the v2 prompt wasn't written
+# from), judged 2026-11-02 by the same rules; a cluster can hold several breaks (a list).
+JUDGED_FRESH = {
+    ("12f7b588", 3): (1110, 1111),  # Freakonomics' video on YouTube / Instagram; not the next-episode preview
+    ("12f7b588", 4): (1144, 1187),  # post-roll Ozempic, Mazda, Nurtec, Southwest
+    ("41ed1f09", 3): (1504, 1518),  # live-event and Incognito Mode pitch; not the host's tip for a friend's show
+    ("41ed1f09", 4): [(1541, 1549), (1552, 1569)],  # Incognito Mode paid feed and merch; post-roll Vistaprint
+    ("96e6ecb4", 2): (666, 669),    # the producer's other show, Hyperfixed
+    ("96e6ecb4", 3): (695, 717),    # Cohesity, SimpliSafe, SiriusXM Podcast Plus pitch
+    ("b1048773", 2): (790, 820),    # FM, iREN, OutSystems; not "we're going to go to break"
+    ("c031ca05", 3): (1926, 1928),  # post-roll Pfizer
+    ("db0b7a74", 1): (493, 583),    # host-read Hyundai (from its award banter), T-Mobile, Pluto TV
+    ("db0b7a74", 3): (1553, 1574),  # rate and review / SiriusXM / subscribe pitch, then Old Navy, SimpliSafe
+    ("e3f77b52", 0): (0, 26),       # Happy Hour trailer, Harvey, Deepgram; not the cold-open quote
+    ("e3f77b52", 1): None,          # the hosts chatting about their event
+    ("e3f77b52", 2): [(274, 296), (339, 390)],  # tour and Pivot Post pitch (not the book banter after); ads
+    ("e3f77b52", 3): [(859, 914), (1135, 1173)],  # Pivot Post promo, DeleteMe, Today Explained; Vox / Criminal promos
+    ("e3f77b52", 4): (1318, 1330),  # YouTube / Pivot Post plug and tour invitation
+    ("e3f77b52", 5): None,          # "follow Pivot" inside the credits
+    ("f203f5ef", 0): (348, 389),    # Capital One, Bombas, Ear Hustle; not "we'll be right back"
+    ("f203f5ef", 1): (599, 626),    # BetterHelp, Ear Hustle
+    ("f203f5ef", 2): (1125, 1143),  # ElevenLabs, Mercedes-Benz
+}
+
+
 def overlap(a, b):
     return max(0.0, min(a[1], b[1]) - max(a[0], b[0]))
 
@@ -51,23 +78,27 @@ def main():
     import ads_bench
     import ads_disagree
     from hub import segments
-    if sys.argv[1] == "--score":
-        runs = json.loads(Path(sys.argv[2]).read_text())
-        return score(json.loads((ROOT / "data/ads_truth.json").read_text()), runs)
-    runs = json.loads(Path(sys.argv[1]).read_text())
+    args = sys.argv[1:]
+    fresh = args[:1] == ["--fresh"]
+    args = args[1:] if fresh else args
+    data, judged = ("data/fresh_hub", JUDGED_FRESH) if fresh else ("hub_data", JUDGED)
+    truth_file = ROOT / ("data/ads_truth_fresh.json" if fresh else "data/ads_truth.json")
+    if args[0] == "--score":
+        return score(json.loads(truth_file.read_text()), json.loads(Path(args[1]).read_text()))
+    runs = json.loads(Path(args[0]).read_text())
     specs = list(runs)
     truth, judged_used = {}, set()
     for i in sorted({i for v in runs.values() for i in v}):
-        cues = segments.read_cues((ROOT / "hub_data" / f"{i}.vtt").read_text())
+        cues = segments.read_cues((ROOT / data / f"{i}.vtt").read_text())
         times = lambda f, l: (cues[f][0], cues[l + 1][0] if l + 1 < len(cues) else cues[l][1])  # noqa: E731
         have = [s for s in specs if i in runs[s]]
         breaks = []
         for k, (start, end, members) in enumerate(ads_disagree.clusters({s: runs[s][i] for s in have})):
             key = (i[:8], k)
-            if key in JUDGED:
+            if key in judged:
                 judged_used.add(key)
-                if JUDGED[key] is not None:
-                    f, l = JUDGED[key]
+                ranges = judged[key] if isinstance(judged[key], list) else [judged[key]] * (judged[key] is not None)
+                for f, l in ranges:
                     breaks.append({"first": f, "last": l, "judged": True})
             elif len(members) == len(have):
                 breaks.append({"first": round(statistics.median(m["first"] for m in members.values())),
@@ -78,12 +109,12 @@ def main():
         for b in breaks:
             b["start"], b["end"] = (round(x, 2) for x in times(b["first"], b["last"]))
         truth[i] = breaks
-    if missing := set(JUDGED) - judged_used:
+    if missing := set(judged) - judged_used:
         raise SystemExit(f"judgments for clusters that don't exist: {sorted(missing)}")
     (ROOT / "data").mkdir(exist_ok=True)
-    (ROOT / "data/ads_truth.json").write_text(json.dumps(truth, indent=1))
+    truth_file.write_text(json.dumps(truth, indent=1))
     print(f"truth: {sum(len(v) for v in truth.values())} breaks in {len(truth)} episodes "
-          f"({sum(b['judged'] for v in truth.values() for b in v)} judged) -> data/ads_truth.json")
+          f"({sum(b['judged'] for v in truth.values() for b in v)} judged) -> {truth_file.relative_to(ROOT)}")
     score(truth, runs)
 
 

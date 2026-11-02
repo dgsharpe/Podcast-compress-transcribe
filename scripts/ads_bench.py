@@ -46,17 +46,18 @@ def main():
     ap.add_argument("--prompt", default="v1", choices=["v1", "v2"])
     ap.add_argument("--batch", type=int, default=1, help="episodes per request (v2 rules)")
     ap.add_argument("--label", default="", help="appended to the spec's name in the output / saved file")
+    ap.add_argument("--data", default="hub_data", help="the episodes' directory (fresh ones have no hub labels)")
     a = ap.parse_args()
     from hub import segments
-    data = ROOT / "hub_data"
+    data = ROOT / a.data
     eps = []
-    for p in sorted(data.glob("*.segments.json")):
-        i = p.name.split(".")[0]
-        vtt = data / f"{i}.vtt"
+    for vtt in sorted(data.glob("*.vtt")):
+        i = vtt.name.split(".")[0]
         rec = json.loads((data / f"{i}.json").read_text()) if (data / f"{i}.json").exists() else {}
-        if vtt.exists():
-            eps.append((i, rec.get("title", "")[:40], segments.read_cues(vtt.read_text()),
-                        [(s["start"], s["end"]) for s in json.loads(p.read_text())["segments"]]))
+        labels = data / f"{i}.segments.json"
+        ref = [(s["start"], s["end"]) for s in json.loads(labels.read_text())["segments"]] if labels.exists() else None
+        if ref is not None or a.data != "hub_data":  # hub_data: the labelled ones only, as before
+            eps.append((i, rec.get("title", "")[:40], segments.read_cues(vtt.read_text()), ref or []))
     eps = sorted(eps, key=lambda e: -len(e[3]))[:a.episodes]  # the ones with the most breaks first
     print(f"{len(eps)} episodes: " + "; ".join(f"{t} ({len(r)} breaks)" for _, t, _, r in eps), flush=True)
     for spec in a.specs:
