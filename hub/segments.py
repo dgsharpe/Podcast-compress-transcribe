@@ -60,6 +60,54 @@ or {"segments": []} if there are none.
 Transcript:
 """
 
+# v2: the same task, with the patterns the models missed most spelled out (scripts/ads_truth.py: sponsored inserts and
+# teasers inside a break, post-roll ads, whole breaks as one segment) and what not to mark listed more fully.
+# MIMI_HUB_SEGMENTS_PROMPT=v2 (default v1).
+RULES_V2 = """You are marking the parts of a podcast episode that a listener would want to skip: ad breaks and the
+show's self-promotion. The transcript is automatic, one cue per line: [cue index] mm:ss speaker: text. Speaker labels
+come from automatic diarization and can be wrong; ASR errors, misspelled brand names especially, are common.
+
+Mark every segment of these kinds:
+- "ad": advertising. Pre-recorded or inserted ads, host-read sponsor messages ("this episode is brought to you
+  by...", promo codes, "go to example.com/podcast"), trailers and promos for other podcasts or shows, and sponsored
+  content placed in an ad break even when it sounds like content: a short news bulletin or feature "brought to you
+  by" a sponsor, or a teaser for a sponsored segment or series ("...find out more later in the podcast"). Ads often
+  also play after the closing credits; mark those too.
+- "promo": the show's own self-promotion: pitches for its subscription, membership or ad-free tier, Patreon, merch,
+  newsletter, Discord or community, live shows, tours or events, its video version, "rate and review us", the hosts'
+  books or other projects.
+
+An ad break is usually several ads back to back, often in other voices, between parts of the show. Mark a whole
+break as one "ad" segment, from the first cue of its first ad or teaser to the last cue of its last ad, including
+any sponsored bulletin or teaser at its start or in its middle. A run of the show's promos is one "promo" segment;
+when ads follow it directly, one "ad" segment covering both.
+
+Do not mark: the content itself, even where it discusses products, companies or the hosts' other shows; news
+rundowns that are part of the show; the show's intro or theme; the hosts' lead-in ("we'll be right back") or return
+("welcome back"); a network's audio logo ("... Audio Studios", "... Podcast Network"); short listener-feedback
+invitations ("email us at...", "call our hotline"); closing credits; a call to action that is part of the
+conversation (a guest on how to apply, where to find their work).
+"""
+
+REPLY_ONE = """Reply with only JSON, no prose or code fences:
+{"segments": [{"first": <cue index>, "last": <cue index>, "kind": "ad" | "promo", "label": "<sponsors or what is promoted>"}]}
+or {"segments": []} if there are none.
+
+Transcript:
+"""
+
+REPLY_MANY = """Below are {n} episodes' transcripts, each starting with a line "### Episode <number>"; cue indices
+restart at 0 in each. Mark each episode on its own.
+Reply with only JSON, no prose or code fences:
+{{"episodes": [{{"episode": <number>, "segments": [{{"first": <cue index>, "last": <cue index>, "kind": "ad" | "promo", "label": "<sponsors or what is promoted>"}}]}}, ...]}}
+listing every episode, with "segments": [] for one with none.
+
+Transcripts:
+"""
+
+PROMPTS = {"v1": PROMPT, "v2": RULES_V2 + "\n" + REPLY_ONE}
+PROMPT_VERSION = os.environ.get("MIMI_HUB_SEGMENTS_PROMPT", "v1")
+
 _CUE = re.compile(
     r"(\d+):(\d\d):(\d\d\.\d+) --> (\d+):(\d\d):(\d\d\.\d+)[^\n]*\n(?:<v ([^>]+)>)?([^\n]*)"
 )
@@ -214,15 +262,16 @@ def _merge(segs, cues):
     return out
 
 
-def _ask(segmenter, lines, log):
+def _ask(segmenter, lines, log, prompt=None):
     """Cue ranges from the first backend in the comma-separated [segmenter] list that answers."""
     errors = []
+    head = PROMPTS[prompt or PROMPT_VERSION]
     for choice in [c.strip() for c in segmenter.split(",") if c.strip()]:
         backend, _, model = choice.partition(":")
         try:
             found = []
             for lo, hi in _windows(lines):
-                found += _parse(_run(backend, model, PROMPT + "\n".join(lines[lo:hi]) + "\n"), lo, hi)
+                found += _parse(_run(backend, model, head + "\n".join(lines[lo:hi]) + "\n"), lo, hi)
             return choice, found
         except Exception as e:  # expired login, timeout, unparseable reply: try the next one
             log(f"segments: {choice} failed: {e}")
@@ -230,11 +279,7 @@ def _ask(segmenter, lines, log):
     raise RuntimeError("; ".join(errors) or "no segmenter configured")
 
 
-def detect(cues, segmenter=SEGMENTER, log=print):
-    """Skip ranges for [cues]: {"model", "segments": [{"start", "end", "kind", "label", "first", "last"}]}."""
-    lines = [_line(i, c) for i, c in enumerate(cues)]
-    t0 = time.time()
-    used, found = _ask(segmenter, lines, log)
+def _finish(found, cues):
     segs = []
     for s in _merge(found, cues):
         start = cues[s["first"]][0]
@@ -242,8 +287,43 @@ def detect(cues, segmenter=SEGMENTER, log=print):
         end = cues[s["last"] + 1][0] if s["last"] + 1 < len(cues) else cues[s["last"]][1]
         if end - start >= MIN_S:
             segs.append({"start": round(start, 2), "end": round(end, 2), **s})
+    return segs
+
+
+def detect(cues, segmenter=SEGMENTER, log=print, prompt=None):
+    """Skip ranges for [cues]: {"model", "segments": [{"start", "end", "kind", "label", "first", "last"}]}."""
+    lines = [_line(i, c) for i, c in enumerate(cues)]
+    t0 = time.time()
+    used, found = _ask(segmenter, lines, log, prompt)
+    segs = _finish(found, cues)
     log(f"segments: {len(segs)} via {used} in {time.time() - t0:.0f} s")
     return {"model": used, "segments": segs}
+
+
+def detect_many(episodes, segmenter=SEGMENTER, log=print):
+    """detect() for several episodes' cues in one request per backend tried (the v2 rules; whole transcripts, no
+    windows: for backends with long contexts): a list of results in the same order."""
+    blocks = [f"### Episode {k + 1}\n" + "\n".join(_line(i, c) for i, c in enumerate(cues))
+              for k, cues in enumerate(episodes)]
+    prompt = RULES_V2 + "\n" + REPLY_MANY.format(n=len(episodes)) + "\n\n".join(blocks) + "\n"
+    errors = []
+    for choice in [c.strip() for c in segmenter.split(",") if c.strip()]:
+        backend, _, model = choice.partition(":")
+        try:
+            text = _run(backend, model, prompt)
+            m = re.search(r"\{.*\}", text, re.S)
+            if not m:
+                raise ValueError(f"no JSON in reply: {text[:200]!r}")
+            by_ep = {int(e["episode"]): e.get("segments", []) for e in json.loads(m[0]).get("episodes", [])}
+            out = []
+            for k, cues in enumerate(episodes):
+                found = _parse(json.dumps({"segments": by_ep.get(k + 1, [])}), 0, len(cues))
+                out.append({"model": choice, "segments": _finish(found, cues)})
+            return out
+        except Exception as e:  # noqa: BLE001
+            log(f"segments: {choice} failed: {e}")
+            errors.append(f"{choice}: {e}")
+    raise RuntimeError("; ".join(errors) or "no segmenter configured")
 
 
 if __name__ == "__main__":

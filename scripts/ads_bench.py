@@ -5,7 +5,9 @@ codex:gpt-6.1-sol at high effort, which matched hand labels on six episodes).
 Agreement: skipped seconds in common / in either (IoU) over all episodes, and per reference break whether a
 candidate break covers half of it (found) plus candidate breaks covering nothing of the reference (extra).
 
-    python scripts/ads_bench.py [--episodes 6] [spec ...]       (spec as MIMI_HUB_SEGMENTER, e.g. codex:gpt-6.1-sol+low)
+    python scripts/ads_bench.py [--episodes 6] [--prompt v2] [--batch N] [spec ...]
+        (spec as MIMI_HUB_SEGMENTER, e.g. codex:gpt-6.1-sol+low; --batch: N episodes per request, hub/segments.py's
+        detect_many; an episode's time is then its request's divided by N)
 """
 import argparse
 import json
@@ -41,6 +43,9 @@ def main():
     ap.add_argument("--episodes", type=int, default=6)
     ap.add_argument("--parallel", type=int, default=3, help="episodes at once per spec")
     ap.add_argument("--save", default=None, help="JSON file: every spec's segments per episode (merged into it)")
+    ap.add_argument("--prompt", default="v1", choices=["v1", "v2"])
+    ap.add_argument("--batch", type=int, default=1, help="episodes per request (v2 rules)")
+    ap.add_argument("--label", default="", help="appended to the spec's name in the output / saved file")
     a = ap.parse_args()
     from hub import segments
     data = ROOT / "hub_data"
@@ -55,17 +60,24 @@ def main():
     eps = sorted(eps, key=lambda e: -len(e[3]))[:a.episodes]  # the ones with the most breaks first
     print(f"{len(eps)} episodes: " + "; ".join(f"{t} ({len(r)} breaks)" for _, t, _, r in eps), flush=True)
     for spec in a.specs:
-        def one(ep):
-            i, title, cues, ref = ep
+        def group(g):
             t = time.time()
             try:
-                full = segments.detect(cues, spec, log=lambda m: None)["segments"]
-                got = [(s["start"], s["end"]) for s in full]
+                if a.batch > 1:
+                    res = segments.detect_many([e[2] for e in g], spec, log=lambda m: None)
+                else:
+                    res = [segments.detect(g[0][2], spec, log=lambda m: None, prompt=a.prompt)]
             except Exception as e:  # noqa: BLE001
-                return {"id": i, "error": f"{type(e).__name__}: {str(e)[:200]}"}
-            return {"id": i, "s": round(time.time() - t, 1), "ref": ref, "got": got, "segments": full}
+                return [{"id": ep[0], "error": f"{type(e).__name__}: {str(e)[:200]}"} for ep in g]
+            el = round((time.time() - t) / len(g), 1)
+            return [{"id": ep[0], "s": el, "ref": ep[3], "got": [(s["start"], s["end"]) for s in r["segments"]],
+                     "segments": r["segments"]} for ep, r in zip(g, res, strict=True)]
+        groups = [eps[k:k + a.batch] for k in range(0, len(eps), a.batch)]
+        t_all = time.time()
         with ThreadPoolExecutor(a.parallel) as ex:
-            rows = list(ex.map(one, eps))
+            rows = [r for rs in ex.map(group, groups) for r in rs]
+        wall = round(time.time() - t_all, 1)
+        name = spec + a.label
         ok = [r for r in rows if "error" not in r]
         inter = sum(sum(overlap(x, y) for x in r["ref"] for y in r["got"]) for r in ok)
         either = sum(union_len(r["ref"] + r["got"]) for r in ok)
@@ -75,10 +87,11 @@ def main():
         times = sorted(r["s"] for r in ok)
         if a.save:
             saved = json.loads(Path(a.save).read_text()) if Path(a.save).exists() else {}
-            saved[spec] = {r["id"]: r["segments"] for r in ok}
+            saved[name] = {r["id"]: r["segments"] for r in ok}
             Path(a.save).write_text(json.dumps(saved, indent=1))
         print("ADS " + json.dumps({
-            "spec": spec, "episodes": len(ok), "errors": [r["error"] for r in rows if "error" in r][:2],
+            "spec": name, "episodes": len(ok), "requests": len(groups), "wall_s": wall,
+            "errors": [r["error"] for r in rows if "error" in r][:2],
             "iou": round(inter / either, 3) if either else None, "found": f"{found}/{refs}", "extra": extra,
             "median_s": times[len(times) // 2] if times else None, "max_s": times[-1] if times else None}),
             flush=True)
