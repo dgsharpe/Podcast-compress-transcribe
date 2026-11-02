@@ -96,36 +96,63 @@ _PATH = os.pathsep.join([os.environ.get("PATH", ""), os.path.expanduser("~/.loca
                          f"/etc/profiles/per-user/{pwd.getpwuid(os.getuid()).pw_name}/bin", "/run/current-system/sw/bin"])
 
 
-def _run(backend, model, prompt):
+def _tail(text, n):
+    """The last [n] chars of a CLI's output, where the reason for a failure usually is."""
+    if isinstance(text, bytes):
+        text = text.decode(errors="replace")
+    text = (text or "").strip()
+    return text if len(text) <= n else "..." + text[-n:]
+
+
+def _run(backend, model, prompt, log=None):
+    """[prompt]'s reply from the agent CLI. Errors name the cause (timeout, exit code, empty reply) with the CLI's
+    stderr, never the command line: agy takes the whole prompt as an argument. [log] gets one line per call."""
     env = dict(os.environ, PATH=_PATH)
     exe = shutil.which(backend, path=_PATH) or backend
-    with tempfile.TemporaryDirectory(prefix="mimi-seg-") as tmp:
-        if backend == "claude":
-            cmd = [exe, "-p", "--model", model, "--tools", "", "--no-session-persistence",
-                   "--setting-sources", "", "--strict-mcp-config", "--output-format", "text"]
-            r = subprocess.run(cmd, input=prompt, capture_output=True, text=True, cwd=tmp, env=env, timeout=TIMEOUT_S)
-            out = r.stdout
-        elif backend == "codex":
-            last = os.path.join(tmp, "last.txt")
-            cmd = [exe, "exec", "--skip-git-repo-check", "--ephemeral", "-s", "read-only",
-                   "-m", model, "-o", last, "-"]
-            r = subprocess.run(cmd, input=prompt, capture_output=True, text=True, cwd=tmp, env=env, timeout=TIMEOUT_S)
-            out = open(last).read() if os.path.exists(last) else ""
-        elif backend == "agy":
-            cmd = [exe, "--model", model, "--output-format", "text", "-p", prompt]
-            r = subprocess.run(cmd, capture_output=True, text=True, cwd=tmp, env=env, timeout=TIMEOUT_S)
-            out = r.stdout
-        else:
-            raise ValueError(f"unknown segmenter backend {backend!r}")
+    t0 = time.time()
+    try:
+        with tempfile.TemporaryDirectory(prefix="mimi-seg-") as tmp:
+            if backend == "claude":
+                cmd = [exe, "-p", "--model", model, "--tools", "", "--no-session-persistence",
+                       "--setting-sources", "", "--strict-mcp-config", "--output-format", "text"]
+                r = subprocess.run(cmd, input=prompt, capture_output=True, text=True, cwd=tmp, env=env,
+                                   timeout=TIMEOUT_S)
+                out = r.stdout
+            elif backend == "codex":
+                last = os.path.join(tmp, "last.txt")
+                cmd = [exe, "exec", "--skip-git-repo-check", "--ephemeral", "-s", "read-only",
+                       "-m", model, "-o", last, "-"]
+                r = subprocess.run(cmd, input=prompt, capture_output=True, text=True, cwd=tmp, env=env,
+                                   timeout=TIMEOUT_S)
+                out = open(last).read() if os.path.exists(last) else ""
+            elif backend == "agy":
+                cmd = [exe, "--model", model, "--output-format", "text", "-p", prompt]
+                r = subprocess.run(cmd, capture_output=True, text=True, cwd=tmp, env=env, timeout=TIMEOUT_S)
+                out = r.stdout
+            else:
+                raise ValueError(f"unknown segmenter backend {backend!r}")
+    except subprocess.TimeoutExpired as e:
+        msg = f"{backend} timed out after {TIMEOUT_S} s (prompt {len(prompt):,} chars)"
+        if log:
+            log(f"{backend}:{model}: {msg}; stderr: {_tail(e.stderr, 2000)!r}")
+        raise RuntimeError(f"{msg}; stderr: {_tail(e.stderr, 200)!r}") from None
+    dt = time.time() - t0
+    failed = r.returncode != 0 or not out.strip()
+    if log:
+        line = (f"{backend}:{model}: exit {r.returncode} in {dt:.0f} s, prompt {len(prompt):,} chars, "
+                f"reply {len(out):,} chars")
+        log(line + (f"; stderr: {_tail(r.stderr, 2000)!r}" if failed else ""))
     if r.returncode != 0:
-        raise RuntimeError(f"{backend} exited {r.returncode}: {(r.stderr or r.stdout)[-400:]}")
+        raise RuntimeError(f"{backend} exited {r.returncode} after {dt:.0f} s: {_tail(r.stderr or r.stdout, 300)!r}")
+    if not out.strip():
+        raise RuntimeError(f"{backend} replied with nothing (exit 0, {dt:.0f} s); stderr: {_tail(r.stderr, 300)!r}")
     return out
 
 
 def _parse(text, lo, hi):
     m = re.search(r"\{.*\}", text, re.S)
     if not m:
-        raise ValueError(f"no JSON in reply: {text[:200]!r}")
+        raise ValueError(f"no JSON in reply ({len(text):,} chars): {text[:200]!r}")
     found = []
     for s in json.loads(m[0]).get("segments", []):
         first, last = int(s["first"]), int(s["last"])
@@ -162,8 +189,11 @@ def _ask(segmenter, lines, log):
         backend, _, model = choice.partition(":")
         try:
             found = []
-            for lo, hi in _windows(lines):
-                found += _parse(_run(backend, model, PROMPT + "\n".join(lines[lo:hi]) + "\n"), lo, hi)
+            windows = _windows(lines)
+            for k, (lo, hi) in enumerate(windows, 1):
+                tag = f"segments: window {k}/{len(windows)} (cues {lo}-{hi - 1})"
+                reply = _run(backend, model, PROMPT + "\n".join(lines[lo:hi]) + "\n", log=lambda m: log(f"{tag}: {m}"))
+                found += _parse(reply, lo, hi)
             return choice, found
         except Exception as e:  # expired login, timeout, unparseable reply: try the next one
             log(f"segments: {choice} failed: {e}")
