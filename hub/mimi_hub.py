@@ -72,6 +72,10 @@ if not os.environ.get("SSL_CERT_FILE") and os.path.exists("/etc/ssl/certs/ca-cer
 
 # MIOpen (ROCm's conv library) otherwise tunes every new input shape exhaustively; Parakeet's batches all differ
 os.environ.setdefault("MIOPEN_FIND_MODE", "FAST")
+# torch.compile's kernels (MIMI_HUB_COMPILE) kept across restarts: the first start compiles (Parakeet's encoder took
+# 4.5 min on the server's CPU), later ones load from here
+os.environ.setdefault("TORCHINDUCTOR_CACHE_DIR", str(Path(os.environ.get("MIMI_HUB_MODELS", ROOT / "hub_models"))
+                                                     / "inductor-cache"))
 
 DATA = Path(os.environ.get("MIMI_HUB_DATA", ROOT / "hub_data"))
 DEVICE = os.environ.get("MIMI_HUB_DEVICE", "auto")
@@ -230,8 +234,13 @@ def _load_models():
     m = {}
     import onnx_asr
     import onnxruntime as ort
+    import threadpoolctl
     import torch
     torch.set_num_threads(THREADS)
+    # onnx_asr computes Parakeet's features with NumPy on the CPU, and OpenBLAS's default (a spin-waiting thread
+    # per core) turned their small matrix products into most of the hub's CPU use: ASR 47 -> 19 CPU-ms per audio
+    # second on the server with one BLAS thread, at the same speed
+    threadpoolctl.threadpool_limits(int(os.environ.get("MIMI_HUB_BLAS_THREADS", "1")), user_api="blas")
     if DEVICE != "auto":
         dev = DEVICE
     elif torch.cuda.is_available():
@@ -244,6 +253,9 @@ def _load_models():
             m["mimi"] = mimi_file.load_model(dev)
         except Exception as e:
             print(f"Warning: could not load mimi model: {e}")
+    if "mimi" in m and MIMI_FP16 and dev != "cpu":  # the encoder's conv / linear weights as autocast uses them: the same codes
+        from hub.autocast_weights import half_weights
+        half_weights(m["mimi"].encoder)
     # onnxruntime's default spin-waiting threads starve torch's: on a 15 min clip (scripts/bench_overlap.py)
     # ASR alone went 50 -> 31 s with spinning off, and encode || ASR 87 -> 39 s
     so = ort.SessionOptions()
@@ -258,7 +270,12 @@ def _load_models():
             if os.environ.get("MIMI_HUB_ASR_ENCODER", "native") == "native":
                 from hub import parakeet_native
                 model_dir = parakeet_native.convert(ASR_MODEL, MODELS_DIR / f"{ASR_MODEL}-hf")
-                asr.asr._encoder = parakeet_native.NativeEncoder(parakeet_native.load(model_dir, dev))
+                # its linear / conv weights in fp16, as autocast uses them: identical output, 1.2 GB less GPU memory
+                encoder = parakeet_native.load(model_dir, dev, half=True)
+                # compiled ahead of time (hub/aoti.py, fixed-length buckets): 1.7x on an H100; with the ResNet's
+                # (hub/pyannote_gpu.py) torch.compile took the server's pipeline 86 -> 99x. MIMI_HUB_COMPILE.
+                from hub import aoti
+                asr.asr._encoder = parakeet_native.NativeEncoder(encoder, compile=aoti.mode(dev))
                 # identical tokens and timestamps to onnx_asr's loop (548/548 segments of a 43.8 min episode;
                 # scripts/parakeet_decoder_check.py). It frees the CPU: on Modal's L40S (CPU-bound) pipeline
                 # throughput went 214 -> 268x, on an M5 Mac 43 -> 47x; the server (ROCm) is GPU-bound and ~3%
@@ -510,12 +527,18 @@ def diarize(wav16):
                 traceback.print_exc()  # e.g. pyannote missing or its model not cached: use sherpa
         if segs is None:
             segs, name = _sherpa_turns(wav16), SHERPA_NAME
+    return number_turns(segs), name
+
+
+def number_turns(segs):
+    """A diarizer's [(start_s, end_s, label)] as the hub keeps them: speakers with under DIAR_MIN_TALK_S in all
+    merged into the nearest kept turn's, then numbered 1.. by first appearance."""
     total = {}
     for a, b, k in segs:
         total[k] = total.get(k, 0.0) + b - a
     keep = [(a, b, k) for a, b, k in segs if total[k] >= DIAR_MIN_TALK_S]
     if not keep:
-        return [], name
+        return []
     out = []
     for a, b, k in segs:
         if total[k] < DIAR_MIN_TALK_S:  # fragment: take the speaker of the nearest kept turn
@@ -524,7 +547,19 @@ def diarize(wav16):
     number = {}
     for _, _, k in out:
         number.setdefault(k, len(number) + 1)
-    return [(a, b, number[k]) for a, b, k in out], name
+    return [(a, b, number[k]) for a, b, k in out]
+
+
+def write_vtt(path, all_cues, turns):
+    """[all_cues] ([(start_s, end_s, text)]) as a WebVTT file, each cue voiced by its speaker in [turns]."""
+    tmp = Path(path).with_suffix(".vtt.tmp")
+    with open(tmp, "w") as f:
+        f.write("WEBVTT\n\n")
+        for a, b, text in all_cues:
+            text = text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+            who = speaker_for(a, b, turns)
+            f.write(f"{vtt_time(a)} --> {vtt_time(b)}\n{f'<v Speaker {who}>' if who else ''}{text}\n\n")
+    tmp.replace(path)
 
 
 def speaker_for(a, b, turns):
@@ -1020,13 +1055,7 @@ def run(i):
         if "cues" not in tx:
             raise pcm.error or RuntimeError("transcription did not run")
         all_cues, turns = tx["cues"], tx["turns"]
-        with open(DATA / f"{i}.vtt.tmp", "w") as f:
-            f.write("WEBVTT\n\n")
-            for a, b, text in all_cues:
-                text = text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
-                who = speaker_for(a, b, turns)
-                f.write(f"{vtt_time(a)} --> {vtt_time(b)}\n{f'<v Speaker {who}>' if who else ''}{text}\n\n")
-        (DATA / f"{i}.vtt.tmp").replace(DATA / f"{i}.vtt")
+        write_vtt(DATA / f"{i}.vtt", all_cues, turns)
         mark("ready")
         with lock:  # merged: ad detection may have added its time already
             rec = load(i)

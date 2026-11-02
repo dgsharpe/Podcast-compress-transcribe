@@ -77,12 +77,37 @@ Environment variables, e.g. `Environment=` lines in the unit:
 | `MIMI_HUB_ASR_ENCODER` | `native` | `onnx2torch` for the converted ONNX encoder |
 | `MIMI_HUB_ASR_DECODER` | `native`; `onnx` on ROCm | `native`: TDT decoding batched on the GPU, same output as onnx_asr's CPU loop; frees the CPU |
 | `MIMI_HUB_DIAR_DTYPE` | `fp16` on NVIDIA, `coreml` on macOS, `fp32` on ROCm | precision of pyannote's embedding ResNet (`fp32` / `tf32` / `fp16` / `bf16` / `coreml`: the Neural Engine, default on macOS; same diarization) |
+| `MIMI_HUB_COMPILE` | `auto`: `aot` on CUDA and ROCm GPUs | Parakeet's encoder and pyannote's embedding ResNet compiled: `aot` = AOTInductor packages (`hub/aoti.py`, built on first use into `hub_models/aoti`: minutes; needs the CUDA toolkit or `rocm[devel]`), `jit` = `torch.compile` (slow on free-threaded Python), `0` = eager. Server 89 → 97× real time; H100 16 processes 1,646 → 1,942×, bulk mode 1,416 → 1,902× |
 | `MIMI_HUB_MIMI_FP16` | `1` | `0`: Mimi encoder in fp32 on the GPU (fp16 is ~1.7x faster; the coarse codes nearly all match) |
 | `MIMI_HUB_PROCS` | `1` | worker processes, each with its own models: a fast GPU needs several (Modal L40S: 1 -> 6 processes 170 -> 441x; M5 Mac: 1 -> 2, 67 -> 77x; the server: +3%) |
 | `MIMI_HUB_WORKERS` | `2` | episodes at a time per process |
+| `MIMI_HUB_BLAS_THREADS` | `1` | OpenBLAS threads (Parakeet's features are computed with NumPy) |
 | `MIMI_HUB_STREAM_ASR` | `0` | `1`: transcribe during the download (same transcript; pays off only where the GPU has room to spare, not on the server) |
 | `MIMI_HUB_TOKEN` | (none) | require `Authorization: Bearer <token>` |
 | `MIMI_HUB_DATA` | `hub_data/` | where `.mimi` / `.vtt` / records live |
+
+### Batch conversion
+
+`hub/bulk.py` converts many files or URLs at once, outside the hub, into the hub's `.mimi` and `.vtt` files:
+
+```sh
+.venv-rocm/bin/python -m hub.bulk out/ episode1.mp3 episode2.mp3 ...
+```
+
+One process holds one copy of the models and batches each model's GPU work across all the episodes in flight
+(Mimi in lockstep pieces, Parakeet's segments sorted by length, pyannote's windows through shared batchers); decoding,
+VAD and features run in a pool of processes. Transcripts and speaker turns match the hub's (word similarity
+0.998-1.0, DER 0); Mimi codes ~96% (batched fp16 rounds differently).
+
+On NVIDIA, Mimi's streaming runs as CUDA graphs (`hub/mimi_static.py`: fixed-size state, one replay per 20 s chunk
+of a batch). The process is still limited by Python launching GPU work, so it runs best on free-threaded Python
+(3.14t, no GIL). On an H100: Python 3.12 ~440x real time; 3.14t ~790x, ~890x with `MIMI_BULK_IN_FLIGHT=96`
+(for comparison, 16 hub-style processes under NVIDIA MPS: ~1,500x, but with 16 copies of the models). The
+free-threaded environment is built in `scripts/modal_hub_bench.py`'s image: uv's `cpython-3.14.10+freethreaded`,
+torch 2.14.1+cu130 (`cp314t`), protobuf's C extensions removed (they segfault without the GIL) and
+`PYTHON_GIL=0`. On the Radeon 8060S it makes no difference (~90x vs ~80x for the hub; GPU-bound).
+Settings: `MIMI_BULK_*` at the top of `hub/bulk.py`. `scripts/bulk_bench.py` measures it and checks it against the
+hub.
 
 ## Build the app
 

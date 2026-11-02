@@ -14,6 +14,7 @@ norms become fixed per-channel scale + shift (eval mode). fp16 is not used: it m
 import math
 import os
 import sys
+import threading
 import types
 from pathlib import Path
 
@@ -37,6 +38,9 @@ COREML_DIR = Path(os.environ.get("MIMI_HUB_MODELS", Path(__file__).resolve().par
 # output by DER 0.042 vs the default (hosts 17.5 / 14.9 -> 17.5 / 15.4 min). 0.25: 13.7 s, DER 0.057.
 # scripts/diar_variants_server.py.
 STEP_FRAC = float(os.environ.get("MIMI_HUB_DIAR_STEP", "0.2"))
+# The ResNet's frames compiled (dynamic batch size, at load): 256 x 10 s on an H100 69 -> 41 ms, on the server 1.5x.
+# MIMI_HUB_COMPILE (hub/aoti.py's mode(): AOTInductor by default on GPUs), as hub/mimi_hub.py's Parakeet encoder.
+# scripts/compile_check.py, scripts/aoti_check.py.
 
 
 class FrozenBN(torch.nn.Module):
@@ -61,6 +65,33 @@ def _freeze_bn(module):
             _freeze_bn(child)
 
 
+def _fold_bn(module):
+    """Fold each eval-mode BatchNorm2d into the Conv2d before it (WeSpeaker's convN / bnN pairs and its
+    Sequential(conv, bn) shortcuts): the conv's weights scaled per channel, the norm's shift as its bias."""
+    nn = torch.nn
+
+    def fold(conv, bn):
+        scale = bn.weight / torch.sqrt(bn.running_var + bn.eps)
+        bias = bn.bias - bn.running_mean * scale
+        if conv.bias is not None:
+            bias = bias + conv.bias * scale
+        conv.weight.data.mul_(scale.view(-1, 1, 1, 1))
+        conv.bias = nn.Parameter(bias.detach())
+
+    for child in module.children():
+        _fold_bn(child)
+    for k in range(1, 4):
+        conv, bn = getattr(module, f"conv{k}", None), getattr(module, f"bn{k}", None)
+        if isinstance(conv, nn.Conv2d) and isinstance(bn, nn.BatchNorm2d):
+            fold(conv, bn)
+            setattr(module, f"bn{k}", nn.Identity())
+    if isinstance(module, nn.Sequential):
+        for k in range(len(module) - 1):
+            if isinstance(module[k], nn.Conv2d) and isinstance(module[k + 1], nn.BatchNorm2d):
+                fold(module[k], module[k + 1])
+                module[k + 1] = nn.Identity()
+
+
 def _without_miopen(module):
     forward = module.forward
 
@@ -69,6 +100,19 @@ def _without_miopen(module):
             return forward(*a, **k)
 
     module.forward = wrapped
+
+
+# The ResNet in channels-last memory layout, the one cuDNN's fp16 tensor-core convolutions use natively: the
+# embedding step 1.4x faster on an L40S, 1.3x on an H100, diarization unchanged (DER 0). auto: on with NVIDIA.
+# (CUDA graphs for it and the segmentation model gained nothing: both are compute-bound, not launch-bound.)
+CHANNELS_LAST = os.environ.get("MIMI_HUB_DIAR_CL", "auto")
+# The ResNet's batch norms folded into its convolutions: the separate normalization kernels were ~6% of a loaded
+# H100's GPU time; on the server the embedding step went 10.9 -> 9.0 s, diarization unchanged (DER 0).
+FOLD_BN = os.environ.get("MIMI_HUB_DIAR_FOLD", "1") == "1"
+# The segmentation model's LSTM under fp16 / bf16 autocast: 1.3x faster segmentation on an L40S and an H100, DER
+# 0.0002 (also on the server, where it's slower without MIOpen). auto: fp16 on NVIDIA, else fp32. (The whole model in
+# fp16, its SincNet front end too, changed a 43.8 min episode's diarization by DER 0.11.)
+SEG_DTYPE = os.environ.get("MIMI_HUB_SEG_DTYPE", "auto")
 
 
 def _frames_mode(device):
@@ -113,6 +157,20 @@ def _coreml_frames(resnet, fbank_shape):
     return ct.models.MLModel(str(path), compute_units=ct.ComputeUnit.CPU_AND_NE)
 
 
+FRAMES_FN = None  # replaces resnet_frames in get_embeddings when set
+# WeSpeaker's compute_fbank runs torchaudio's kaldi.fbank under torch.vmap, whose state is shared: entered from many
+# threads at once (hub/bulk.py's diarization threads on free-threaded Python, no GIL to take turns) it deadlocked
+_FBANK_LOCK = threading.Lock()
+
+
+def resnet_frames(model, fbank, mode):
+    """The ResNet's frames of an fbank batch, in [mode]'s precision."""
+    dtype = _DTYPES[mode]
+    cudnn = torch.backends.cudnn.flags(enabled=torch.backends.cudnn.enabled, allow_tf32=mode == "tf32")
+    with torch.autocast(fbank.device.type, dtype=dtype or torch.float32, enabled=dtype is not None), cudnn:
+        return model.resnet.forward_frames(fbank)
+
+
 def get_embeddings(self, file, binary_segmentations, exclude_overlap=False, hook=None):
     """Drop-in for SpeakerDiarization.get_embeddings: (num_chunks, num_speakers, dimension) array."""
     sr = self._embedding.sample_rate
@@ -150,7 +208,8 @@ def get_embeddings(self, file, binary_segmentations, exclude_overlap=False, hook
         for k, c0 in enumerate(range(0, num_chunks, BATCH_CHUNKS), 1):
             c1 = min(num_chunks, c0 + BATCH_CHUNKS)
             chunks = w[starts[c0:c1, None] + offsets][:, None]  # (batch, 1, samples)
-            fbank = model.compute_fbank(chunks)
+            with _FBANK_LOCK:  # vmap inside: not safe to enter from several threads at once
+                fbank = model.compute_fbank(chunks)
             mode = _frames_mode(device)
             if mode == "coreml":  # fixed batch: the last one is zero-padded
                 shape = (BATCH_CHUNKS, *fbank.shape[1:])
@@ -159,11 +218,10 @@ def get_embeddings(self, file, binary_segmentations, exclude_overlap=False, hook
                 x = np.zeros(shape, dtype=np.float32)
                 x[:len(fbank)] = fbank.float().cpu().numpy()
                 frames = torch.from_numpy(self._coreml[1].predict({"fbank": x})["frames"][:len(fbank)]).to(device)
+            elif FRAMES_FN is not None:  # e.g. hub/bulk.py's batcher, shared by many episodes' pipelines
+                frames = FRAMES_FN(fbank)
             else:
-                dtype = _DTYPES[mode]
-                cudnn = torch.backends.cudnn.flags(enabled=torch.backends.cudnn.enabled, allow_tf32=mode == "tf32")
-                with torch.autocast(device.type, dtype=dtype or torch.float32, enabled=dtype is not None), cudnn:
-                    frames = model.resnet.forward_frames(fbank)
+                frames = resnet_frames(model, fbank, mode)
             frames = frames.float()
             emb = model.resnet.forward_embedding(frames, weights=weights[c0:c1].to(device))[1]
             out.append(emb.float().cpu().numpy())  # (batch, speakers, dimension)
@@ -178,6 +236,8 @@ def load(device="cuda", path=None, segmentation_device=None):
     from huggingface_hub import snapshot_download
     from pyannote.audio import Pipeline
     pipeline = Pipeline.from_pretrained(path or snapshot_download(MODEL, local_files_only=True))
+    if FOLD_BN:
+        _fold_bn(pipeline._embedding.model_.eval())
     pipeline.to(torch.device(device))
     if segmentation_device:
         pipeline._segmentation.to(torch.device(segmentation_device))
@@ -187,4 +247,65 @@ def load(device="cuda", path=None, segmentation_device=None):
         _freeze_bn(pipeline._embedding.model_)
     pipeline.get_embeddings = types.MethodType(get_embeddings, pipeline)
     pipeline._segmentation.step = STEP_FRAC * pipeline._segmentation.duration
+    nvidia = torch.device(device).type == "cuda" and not torch.version.hip
+    from hub.autocast_weights import half_weights
+    seg_dtype = _DTYPES.get(SEG_DTYPE if SEG_DTYPE != "auto" else ("fp16" if nvidia else "fp32"))
+    if seg_dtype is not None and pipeline._segmentation.device.type != "cpu":
+        lstms = pipeline._segmentation.model.lstm
+        for lstm in (lstms if isinstance(lstms, torch.nn.ModuleList) else [lstms]):
+            half_weights(lstm, dtype=seg_dtype)  # what autocast computes with: no per-call conversion
+            def lstm_forward(x, *a, _forward=lstm.forward, **k):
+                with torch.autocast(x.device.type, dtype=seg_dtype):
+                    out, state = _forward(x, *a, **k)
+                return out.float(), state
+            lstm.forward = lstm_forward
+    resnet = pipeline._embedding.model_.resnet
+    if CHANNELS_LAST == "1" or (CHANNELS_LAST == "auto" and nvidia):
+        resnet.to(memory_format=torch.channels_last)
+        resnet.conv1.register_forward_pre_hook(lambda m, args: (args[0].contiguous(memory_format=torch.channels_last),))
+    frames_dtype = _DTYPES.get(_frames_mode(torch.device(device)))
+    if frames_dtype is not None:  # the layers forward_frames runs under autocast; the embedding head stays fp32
+        half_weights(resnet.conv1, resnet.layer1, resnet.layer2, resnet.layer3, resnet.layer4, dtype=frames_dtype)
+    from hub import aoti
+    how = aoti.mode(torch.device(device).type)
+    if how:
+        compile_frames(pipeline._embedding.model_, torch.device(device), how)
     return pipeline
+
+
+class _AotFrames(torch.nn.Module):
+    """resnet.forward_frames as resnet_frames runs it (autocast), for torch.export."""
+
+    def __init__(self, resnet, frames, dtype):
+        super().__init__()
+        self.resnet, self.frames, self.dtype = resnet, frames, dtype
+
+    def forward(self, fbank):
+        with torch.autocast(fbank.device.type, dtype=self.dtype or torch.float32, enabled=self.dtype is not None):
+            return self.frames(fbank)
+
+
+def compile_frames(model, device, how="aot"):
+    """model.resnet.forward_frames compiled now for any batch size: an AOTInductor package (hub/aoti.py), or
+    torch.compile (batches of 1 and 2+ are separate graphs: both traced here, not by the first episodes, possibly
+    from several threads at once)."""
+    resnet = model.resnet
+    eager = resnet.forward_frames
+    mode = _frames_mode(device)
+    try:
+        with torch.inference_mode():
+            fbank = model.compute_fbank(torch.zeros(3, 1, 160000, device=device))
+        if how == "aot":
+            from hub import aoti
+            module = _AotFrames(resnet, eager, _DTYPES.get(mode)).eval()
+            n = torch.export.Dim("windows", min=1, max=4096)
+            resnet.forward_frames = aoti.load("pyannote-resnet-frames", module, (fbank.clone(),), ({0: n},),
+                                              num_runners=4)
+        else:
+            resnet.forward_frames = torch.compile(eager, dynamic=True)
+            with torch.inference_mode():
+                for k in (1, 3):
+                    resnet_frames(model, fbank[:k], mode)
+    except Exception as e:  # noqa: BLE001 - e.g. no compiler toolchain: eager
+        print(f"pyannote_gpu: {how} compile failed, eager: {type(e).__name__}: {e}"[:300], flush=True)
+        resnet.forward_frames = eager
