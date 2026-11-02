@@ -28,6 +28,7 @@ SEGMENTER = os.environ.get("MIMI_HUB_SEGMENTER", "codex:gpt-6.1-sol,claude:claud
 CHUNK_CHARS = 90_000  # agy takes the prompt as one argv string (Linux caps those at 128 KiB)
 OVERLAP_CUES = 40
 TIMEOUT_S = 600
+ATTEMPTS = 2  # per call: the CLIs fail intermittently (timeouts, empty or non-JSON replies)
 GAP_CUES, GAP_S = 2, 10.0  # ads this close together are one break (the gap is "Uh-huh." / a jingle)
 MIN_S = 6.0  # shorter plugs mid-conversation aren't worth a jarring skip
 
@@ -104,7 +105,20 @@ def _tail(text, n):
     return text if len(text) <= n else "..." + text[-n:]
 
 
-def _run(backend, model, prompt, log=None):
+def _run(backend, model, prompt, log=None, check=None):
+    """[prompt]'s reply from the agent CLI, tried up to ATTEMPTS times. With [check], the reply goes through it and a
+    reply it rejects (raises on) is retried too; returns what [check] returns."""
+    for attempt in range(1, ATTEMPTS + 1):
+        try:
+            out = _call(backend, model, prompt, log)
+            return check(out) if check else out
+        except Exception as e:
+            if attempt == ATTEMPTS:
+                raise
+            (log or print)(f"{backend}:{model}: attempt {attempt}/{ATTEMPTS} failed ({e}); retrying")
+
+
+def _call(backend, model, prompt, log=None):
     """[prompt]'s reply from the agent CLI. Errors name the cause (timeout, exit code, empty reply) with the CLI's
     stderr, never the command line: agy takes the whole prompt as an argument. [log] gets one line per call."""
     env = dict(os.environ, PATH=_PATH)
@@ -192,8 +206,8 @@ def _ask(segmenter, lines, log):
             windows = _windows(lines)
             for k, (lo, hi) in enumerate(windows, 1):
                 tag = f"segments: window {k}/{len(windows)} (cues {lo}-{hi - 1})"
-                reply = _run(backend, model, PROMPT + "\n".join(lines[lo:hi]) + "\n", log=lambda m: log(f"{tag}: {m}"))
-                found += _parse(reply, lo, hi)
+                found += _run(backend, model, PROMPT + "\n".join(lines[lo:hi]) + "\n", log=lambda m: log(f"{tag}: {m}"),
+                              check=lambda reply, lo=lo, hi=hi: _parse(reply, lo, hi))
             return choice, found
         except Exception as e:  # expired login, timeout, unparseable reply: try the next one
             log(f"segments: {choice} failed: {e}")
