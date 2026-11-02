@@ -6,15 +6,16 @@ CLI on the server (claude / codex / agy) in print mode, from an empty temp dir w
 per episode and needs no API key in the hub.
 
     MIMI_HUB_SEGMENTER = "<backend>:<model>[+<flag>...][,<backend>:<model>...]"   tried in order until one works;
-        default codex:gpt-6.1-sol,claude:claude-haiku-5-5 (also agy:gemini-4-argon-high), or "off"
+        default claude:claude-opus-5-5,codex:gpt-5.6-terra+low (also agy:gemini-4-argon-high), or "off"
         codex flags: minimal / low / medium / high / xhigh (reasoning effort; without one, ~/.codex/config.toml's),
         fast / priority / flex / default (service tier); e.g. codex:gpt-6.1-sol+low+fast
         claude flags: low / medium / high / xhigh / max (--effort), fast (fast mode); e.g. claude:claude-opus-5-5+fast
         openrouter:<model id> (OpenRouter's API, key in OPENROUTER_API_KEY); e.g. openrouter:inception/mercury-3
         inception:<model id> (Inception Labs' API, key in INCEPTION_API_KEY); e.g. inception:mercury-3
 
-On six episodes (2026-10-31) Sol and Haiku found the same ad breaks, matching hand labels; Sol ~6-15 s,
-Haiku ~2-17 s, Argon ~220 s per episode.
+Against a ground truth of 50 breaks in 13 episodes (2026-11-02; scripts/ads_truth.py) Opus 5.5 found all 50 with
+nothing extra in ~7 s an episode (gpt-5.6-terra at low effort, the fallback: 50, ~8 s); the previous default, Sol at
+high effort, 48 in ~12 s. scripts/ads_bench.py runs the comparison.
 
 CLI: python -m hub.segments <episode.vtt> [backend:model]   (prints the segments JSON)
 """
@@ -29,7 +30,7 @@ import sys
 import tempfile
 import time
 
-SEGMENTER = os.environ.get("MIMI_HUB_SEGMENTER", "codex:gpt-6.1-sol,claude:claude-haiku-5-5")
+SEGMENTER = os.environ.get("MIMI_HUB_SEGMENTER", "claude:claude-opus-5-5,codex:gpt-5.6-terra+low")
 CHUNK_CHARS = 90_000  # agy takes the prompt as one argv string (Linux caps those at 128 KiB)
 OVERLAP_CUES = 40
 TIMEOUT_S = 600
