@@ -8,6 +8,7 @@ weights are mapped onto ParakeetEncoder here: model_config.yaml and model_weight
 (models/parakeet/convert_nemo_to_hf.py), and cached as a safetensors state dict.
 """
 
+import math
 import re
 import tarfile
 from pathlib import Path
@@ -105,13 +106,29 @@ class NativeEncoder:
     """Stands in for onnx_asr's encoder session: run(names, {"audio_signal": (B, mels, T), "length": (B,)})
     -> [encoder outputs (B, D, T'), encoded lengths (B,)], like the exported ONNX encoder."""
 
+    # Compiled, the time dim is padded up to a multiple of BUCKET frames (100 / s; segments are <= 20 s) and kept
+    # static, the batch dim dynamic: on an H100 (64 x 20 s) static shapes 111 -> 67 ms, a dynamic batch 119 -> 77 ms,
+    # a dynamic time dim 119 -> 146 ms (slower than eager), both dynamic 0.84x. The encoder masks padded frames in
+    # every layer, so the padding doesn't change the output. A batch of 1 is padded to 2 (one graph less).
+    BUCKET = 512
+
     def __init__(self, encoder, dtype=torch.float16, compile=False):
-        self.encoder, self.dtype = encoder, dtype
-        if compile:
+        self.encoder, self.dtype, self.compiled = encoder, dtype, compile
+        if compile and torch.version.hip:
             import torch._inductor.config as inductor
-            # its memory-coalescing tiling analysis asserts on these dynamic shapes (torch 2.12 nightly, ROCm)
+            # its memory-coalescing tiling analysis asserted on dynamic shapes (torch 2.12 nightly, ROCm)
             inductor.triton.coalesce_tiling_analysis = False
-        self.forward = torch.compile(encoder, dynamic=True) if compile else encoder
+        self.forward = torch.compile(encoder) if compile else encoder
+        if compile:  # every bucket traced now, not by the workers mid-run (two threads in one recompile failed)
+            device = next(encoder.parameters()).device
+            try:
+                for t in range(self.BUCKET, 2048 + 1, self.BUCKET):
+                    for b in (2, 3):  # a second batch size: the recompile with the batch dim dynamic, here
+                        self.encode(torch.zeros(b, t, encoder.config.num_mel_bins, device=device),
+                                    torch.full((b,), t, device=device))
+            except Exception as e:  # noqa: BLE001 - e.g. a Python torch.compile doesn't support: eager
+                print(f"parakeet_native: torch.compile failed, eager: {type(e).__name__}: {e}"[:300], flush=True)
+                self.forward, self.compiled = encoder, False
 
     def run(self, names, feeds):
         import numpy as np
@@ -123,10 +140,29 @@ class NativeEncoder:
         """x (B, T, F) features, lengths (B,): encoder outputs (B, T', D) and their lengths, on the GPU."""
         device = next(self.encoder.parameters()).device
         x, lengths = x.to(device, non_blocking=True), lengths.to(device, non_blocking=True)
-        mask = torch.arange(x.shape[1], device=device)[None, :] < lengths[:, None]
+        B, T = x.shape[:2]
+        # the compiled graphs' inputs always alike (inference tensors, contiguous): a tensor made outside
+        # inference_mode, or a stride-0 expand, is a different input to torch.compile, compiled again mid-run
+        with torch.inference_mode():
+            if self.compiled:
+                x = torch.nn.functional.pad(x, (0, 0, 0, -T % self.BUCKET))
+                if B == 1:
+                    x, lengths = x.repeat(2, 1, 1), lengths.repeat(2)
+            mask = torch.arange(x.shape[1], device=device)[None, :] < lengths[:, None]
+            if self.compiled:
+                for v in (x, mask):
+                    torch._dynamo.maybe_mark_dynamic(v, 0)
+                    torch._dynamo.mark_static(v, 1)
         with torch.inference_mode(), torch.autocast(device.type, dtype=self.dtype, enabled=self.dtype != torch.float32):
             out = self.forward(input_features=x, attention_mask=mask)
-        return out.last_hidden_state, out.attention_mask.sum(-1)
+        hidden, lens = out.last_hidden_state[:B], out.attention_mask[:B].sum(-1)
+        if self.compiled:  # the frames eager would return for T (each subsampling conv's output length)
+            c, t = self.encoder.config, T
+            k, stride = c.subsampling_conv_kernel_size, c.subsampling_conv_stride
+            for _ in range(int(math.log2(c.subsampling_factor))):
+                t = (t + 2 * ((k - 1) // 2) - k) // stride + 1
+            hidden = hidden[:, :t]
+        return hidden, lens
 
 
 # ---------- TDT decoding ----------

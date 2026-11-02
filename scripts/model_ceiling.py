@@ -44,6 +44,8 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--compile", choices=["parakeet", "resnet", "segmentation", "mimi_seanet"],
                     help="only this model, eager vs torch.compile")
+    ap.add_argument("--dynamic", default="static", choices=["static", "all", "batch", "time"],
+                    help="shapes compiled for: these exact ones, any (dynamic=True), or a dynamic batch / time dim")
     ap.add_argument("--mode", default=None, help="torch.compile mode (default, max-autotune-no-cudagraphs, ...)")
     a = ap.parse_args()
     import torch
@@ -147,13 +149,16 @@ def compiled(a, res, report, enc, pipe, model):
         return g
     name = a.compile
     report(name, timed(run(module)), audio_s)
+    if a.dynamic in ("batch", "time"):  # mark that dim of the inputs dynamic, the rest static
+        for v in (*args, *kwargs.values()):
+            torch._dynamo.mark_dynamic(v, 0 if a.dynamic == "batch" else 1)
     t = time.perf_counter()
     try:
-        f = torch.compile(module, mode=a.mode)
+        f = torch.compile(module, mode=a.mode, dynamic=True if a.dynamic == "all" else None)
         run(f)()
         torch.cuda.synchronize()
         res["compile_s"] = round(time.perf_counter() - t, 1)
-        report(f"{name}_compiled_{a.mode or 'default'}", timed(run(f)), audio_s)
+        report(f"{name}_compiled_{a.mode or 'default'}_{a.dynamic}", timed(run(f)), audio_s)
     except Exception as e:  # noqa: BLE001
         res[name + "_compiled"] = f"{type(e).__name__}: {str(e)[:300]}"
         print("CEIL " + json.dumps({"model": name + "_compiled", "error": res[name + "_compiled"]}), flush=True)

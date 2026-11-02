@@ -90,6 +90,7 @@ image = (
     .add_local_file(ROOT / "scripts/mimi_static_check.py", f"{NA}/scripts/mimi_static_check.py")
     .add_local_file(ROOT / "scripts/model_ceiling.py", f"{NA}/scripts/model_ceiling.py")
     .add_local_file(ROOT / "scripts/seg_profile.py", f"{NA}/scripts/seg_profile.py")
+    .add_local_file(ROOT / "scripts/compile_check.py", f"{NA}/scripts/compile_check.py")
 )
 app = modal.App("mimi-hub-bench", image=image)
 
@@ -385,6 +386,27 @@ PLANS = {
         (["model_ceiling.py", "--compile", "resnet", "--mode", "max-autotune-no-cudagraphs"], {}),
         (["model_ceiling.py", "--compile", "segmentation", "--mode", "max-autotune-no-cudagraphs"], {}),
     ],
+    # the compiled Parakeet encoder and ResNet in the pipeline (MIMI_HUB_COMPILE, on by default on NVIDIA): checked
+    # against eager first (which also fills the container's inductor cache for the processes after it), then the
+    # 16-process MPS setup and bulk mode (expandable segments: 10 of 1,024 episodes failed in ASR with GPU memory full)
+    "comp1": [
+        (["compile_check.py"], {}),
+        (["--clips", "64", "--workers", "1", "--procs", "16"], {**MPS_ENV, "MIMI_HUB_DIAR_STEP": "0.5"}),
+        (["bulk_bench.py", "--clips", "1024", "--check", "0", "--prep", "32", "--subtype", "PCM_16"],
+         {**FT_ENV, "BULK_WATCHDOG_S": "850", "MIMI_BULK_IN_FLIGHT": "96", "MIMI_HUB_DIAR_STEP": "0.5",
+          "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True"}),
+    ],
+    # bulk mode alone (its free-threaded Python compiles its own kernels; after the others it ran out of time)
+    "comp3": [
+        (["bulk_bench.py", "--clips", "1024", "--check", "0", "--prep", "32", "--subtype", "PCM_16"],
+         {**FT_ENV, "BULK_WATCHDOG_S": "880", "MIMI_BULK_IN_FLIGHT": "96", "MIMI_HUB_DIAR_STEP": "0.5",
+          "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True"}),
+    ],
+    # Parakeet's encoder compiled with dynamic shapes was slower than eager on the H100 (0.84x; static 1.66x): which
+    # dynamic dim costs it
+    "comp2": [
+        (["model_ceiling.py", "--compile", "parakeet", "--dynamic", d], {}) for d in ("batch", "time", "all")
+    ],
     # pushing one GPU: where its time goes, then a 32-clip backlog (160 min) at more processes
     "push1": [
         (["roofline_server.py"], {}),
@@ -400,11 +422,14 @@ PLANS = {
 # Guards against a hung run billing a GPU: each run is killed (with the worker processes it spawned) after
 # RUN_TIMEOUT_S, the container after 25 min, and the local entrypoint cancels its calls when it gives up or is stopped.
 RUN_TIMEOUT_S = 900
+# torch.compile's kernels (hub MIMI_HUB_COMPILE) kept between containers: compiling Parakeet's buckets took ~6 min
+CACHE = modal.Volume.from_name("mimi-hub-inductor-cache", create_if_missing=True)
 
 
-@app.function(gpu="L40S", cpu=16.0, memory=MEM_GIB * 1024, timeout=25 * 60)
+@app.function(gpu="L40S", cpu=16.0, memory=MEM_GIB * 1024, timeout=25 * 60, volumes={"/cache": CACHE})
 def bench(gpu: str, runs: list) -> list:
     import torch
+    os.environ["TORCHINDUCTOR_CACHE_DIR"] = "/cache/inductor"
     sys.path.insert(0, NA)
     info = {"gpu": gpu, "device": torch.cuda.get_device_name(0), "vcpus": os.cpu_count(),
             "cpu_model": next((ln.split(":", 1)[1].strip() for ln in open("/proc/cpuinfo")
@@ -446,6 +471,7 @@ def bench(gpu: str, runs: list) -> list:
             stdout, stderr = proc.communicate()
             stderr += f"\nkilled after {RUN_TIMEOUT_S} s"
         p = types.SimpleNamespace(returncode=proc.returncode, stdout=stdout, stderr=stderr)
+        CACHE.commit()  # what this run compiled (even if it then failed), for the next containers
         rows = [{"tag": ln.split(" ", 1)[0], **json.loads(ln.split(" ", 1)[1])} for ln in p.stdout.splitlines()
                 if re.match(r"^[A-Z]+ \{", ln)]
         if p.returncode or not rows:

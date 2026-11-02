@@ -77,6 +77,7 @@ Environment variables, e.g. `Environment=` lines in the unit:
 | `MIMI_HUB_ASR_ENCODER` | `native` | `onnx2torch` for the converted ONNX encoder |
 | `MIMI_HUB_ASR_DECODER` | `native`; `onnx` on ROCm | `native`: TDT decoding batched on the GPU, same output as onnx_asr's CPU loop; frees the CPU |
 | `MIMI_HUB_DIAR_DTYPE` | `fp16` on NVIDIA, `coreml` on macOS, `fp32` on ROCm | precision of pyannote's embedding ResNet (`fp32` / `tf32` / `fp16` / `bf16` / `coreml`: the Neural Engine, default on macOS; same diarization) |
+| `MIMI_HUB_COMPILE` | `auto`: on for CUDA and ROCm GPUs (off on free-threaded Python, where it halved bulk mode's throughput) | Parakeet's encoder and pyannote's embedding ResNet through `torch.compile`, compiled at load and cached in `hub_models/inductor-cache` (first start: minutes). Server 86 → 99× real time; H100 encoder 1.66×, ResNet 1.7× |
 | `MIMI_HUB_MIMI_FP16` | `1` | `0`: Mimi encoder in fp32 on the GPU (fp16 is ~1.7x faster; the coarse codes nearly all match) |
 | `MIMI_HUB_PROCS` | `1` | worker processes, each with its own models: a fast GPU needs several (Modal L40S: 1 -> 6 processes 170 -> 441x; M5 Mac: 1 -> 2, 67 -> 77x; the server: +3%) |
 | `MIMI_HUB_WORKERS` | `2` | episodes at a time per process |

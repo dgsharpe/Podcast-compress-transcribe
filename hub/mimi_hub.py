@@ -72,6 +72,10 @@ if not os.environ.get("SSL_CERT_FILE") and os.path.exists("/etc/ssl/certs/ca-cer
 
 # MIOpen (ROCm's conv library) otherwise tunes every new input shape exhaustively; Parakeet's batches all differ
 os.environ.setdefault("MIOPEN_FIND_MODE", "FAST")
+# torch.compile's kernels (MIMI_HUB_COMPILE) kept across restarts: the first start compiles (Parakeet's encoder took
+# 4.5 min on the server's CPU), later ones load from here
+os.environ.setdefault("TORCHINDUCTOR_CACHE_DIR", str(Path(os.environ.get("MIMI_HUB_MODELS", ROOT / "hub_models"))
+                                                     / "inductor-cache"))
 
 DATA = Path(os.environ.get("MIMI_HUB_DATA", ROOT / "hub_data"))
 DEVICE = os.environ.get("MIMI_HUB_DEVICE", "auto")
@@ -264,7 +268,14 @@ def _load_models():
                 model_dir = parakeet_native.convert(ASR_MODEL, MODELS_DIR / f"{ASR_MODEL}-hf")
                 # its linear / conv weights in fp16, as autocast uses them: identical output, 1.2 GB less GPU memory
                 encoder = parakeet_native.load(model_dir, dev, half=True)
-                asr.asr._encoder = parakeet_native.NativeEncoder(encoder)
+                # through torch.compile (fixed-length buckets, compiled at load): 64 x 20 s on an H100 111 -> 77 ms;
+                # with the ResNet's (hub/pyannote_gpu.py) the server's pipeline 86 -> 99x. MIMI_HUB_COMPILE: auto
+                # (CUDA and ROCm GPUs, with the GIL: free-threaded hub/bulk.py on an H100 went 1,416 -> 801x with
+                # it) | 1 | 0.
+                comp = os.environ.get("MIMI_HUB_COMPILE", "auto")
+                gil = getattr(sys, "_is_gil_enabled", lambda: True)()
+                comp = comp == "1" or (comp == "auto" and dev == "cuda" and gil)
+                asr.asr._encoder = parakeet_native.NativeEncoder(encoder, compile=comp)
                 # identical tokens and timestamps to onnx_asr's loop (548/548 segments of a 43.8 min episode;
                 # scripts/parakeet_decoder_check.py). It frees the CPU: on Modal's L40S (CPU-bound) pipeline
                 # throughput went 214 -> 268x, on an M5 Mac 43 -> 47x; the server (ROCm) is GPU-bound and ~3%

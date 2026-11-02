@@ -38,6 +38,11 @@ COREML_DIR = Path(os.environ.get("MIMI_HUB_MODELS", Path(__file__).resolve().par
 # output by DER 0.042 vs the default (hosts 17.5 / 14.9 -> 17.5 / 15.4 min). 0.25: 13.7 s, DER 0.057.
 # scripts/diar_variants_server.py.
 STEP_FRAC = float(os.environ.get("MIMI_HUB_DIAR_STEP", "0.2"))
+# The ResNet's frames through torch.compile (dynamic batch size, compiled at load): 256 x 10 s on an H100 69 -> 41 ms,
+# on the server 1.5x. MIMI_HUB_COMPILE: auto (CUDA and ROCm GPUs, with the GIL) | 1 | 0, as hub/mimi_hub.py's
+# Parakeet encoder.
+# scripts/compile_check.py.
+COMPILE = os.environ.get("MIMI_HUB_COMPILE", "auto")
 
 
 class FrozenBN(torch.nn.Module):
@@ -263,4 +268,24 @@ def load(device="cuda", path=None, segmentation_device=None):
     frames_dtype = _DTYPES.get(_frames_mode(torch.device(device)))
     if frames_dtype is not None:  # the layers forward_frames runs under autocast; the embedding head stays fp32
         half_weights(resnet.conv1, resnet.layer1, resnet.layer2, resnet.layer3, resnet.layer4, dtype=frames_dtype)
+    gil = getattr(sys, "_is_gil_enabled", lambda: True)()
+    if COMPILE == "1" or (COMPILE == "auto" and torch.device(device).type == "cuda" and gil):
+        compile_frames(pipeline._embedding.model_, torch.device(device))
     return pipeline
+
+
+def compile_frames(model, device):
+    """model.resnet.forward_frames through torch.compile, compiled now for any batch size (batches of 1 and 2+ are
+    separate graphs: both traced here, not by the first episodes, possibly from several threads at once)."""
+    resnet = model.resnet
+    eager = resnet.forward_frames
+    resnet.forward_frames = torch.compile(eager, dynamic=True)
+    mode = _frames_mode(device)
+    try:
+        with torch.inference_mode():
+            for n in (1, 3):
+                fbank = model.compute_fbank(torch.zeros(n, 1, 160000, device=device))
+                resnet_frames(model, fbank, mode)
+    except Exception as e:  # noqa: BLE001 - e.g. a Python torch.compile doesn't support: eager
+        print(f"pyannote_gpu: torch.compile failed, eager: {type(e).__name__}: {e}"[:300], flush=True)
+        resnet.forward_frames = eager
