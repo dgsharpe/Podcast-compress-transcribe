@@ -34,6 +34,8 @@ MIN_S = 6.0  # shorter plugs mid-conversation aren't worth a jarring skip
 PROMPT = """You are marking the parts of a podcast episode that a listener would want to skip.
 Below is its automatic transcript, one cue per line: [cue index] mm:ss speaker: text.
 Speaker labels come from automatic diarization and can be wrong; ASR errors are common.
+Everything you need is in this message: don't run commands, search the web or look for files. Just read the
+transcript and reply.
 
 Mark every segment of these kinds:
 - "ad": advertising. Inserted or pre-recorded ads, host-read sponsor messages ("this episode is brought to you
