@@ -233,3 +233,115 @@ class NativeTdtDecoder:
         for b in range(B):
             m = emits[:, b]
             yield toks[m, b].tolist(), times[m, b].tolist(), lps[m, b].tolist() if need_logprobs else None
+
+    # ---- the same search as CUDA graphs (hub/bulk.py): 16 steps per launch ----
+
+    GRAPH_STEPS = 16  # decoding steps per graph replay (one host check for "any segment still active" per replay)
+    _capture_lock = __import__("threading").Lock()  # one capture at a time, across threads
+
+    GRAPH_SIZES = (8, 16, 32, 64)  # batch sizes (segments; a batch pads to the next)
+    GRAPH_FRAMES = 64  # lengths pad to a multiple of this many encoder frames
+
+    def capture_graphs(self, slot, max_batch=64, max_frames=256):
+        """Capture the graphs [slot] (one per worker thread: a graph replays into its own buffers) will use, now:
+        torch.cuda.graph() synchronizes the device and empties the allocator's cache, which mid-run stalls every
+        other stream (capturing on demand cost ~25% of bulk mode's throughput)."""
+        for B in (b for b in self.GRAPH_SIZES if b <= max_batch):
+            for T in range(self.GRAPH_FRAMES, max_frames + 1, self.GRAPH_FRAMES):
+                self._graph_state(slot, B, T)
+
+    def _graph_state(self, slot, B, T):
+        """Static buffers and a captured GRAPH_STEPS-step graph for batches of B segments of up to T frames."""
+        key = (slot, B, T)
+        if key in getattr(self, "_graphs", {}):
+            return self._graphs[key]
+        with self._capture_lock:
+            return self._capture(key, B, T)
+
+    def _capture(self, key, B, T):
+        import types
+        dev, H = self.device, self.H
+        with torch.inference_mode():
+            g = types.SimpleNamespace(
+                f=torch.zeros(B, T, self.enc_w.shape[1], device=dev), lens=torch.zeros(B, dtype=torch.long, device=dev),
+                h=torch.zeros(2, B, H, device=dev), c=torch.zeros(2, B, H, device=dev),
+                pred=torch.zeros(B, self.pred_w.shape[1], device=dev), t=torch.zeros(B, dtype=torch.long, device=dev),
+                emitted=torch.zeros(B, dtype=torch.long, device=dev),
+                active=torch.zeros(B, dtype=torch.bool, device=dev),
+                s=torch.zeros((), dtype=torch.long, device=dev), rows=torch.arange(B, device=dev))
+            S = T * (self.max_symbols + 1) + self.GRAPH_STEPS  # steps never exceed T x (max_symbols + 1)
+            g.toks = torch.zeros(S, B, dtype=torch.long, device=dev)
+            g.times = torch.zeros(S, B, dtype=torch.long, device=dev)
+            g.emits = torch.zeros(S, B, dtype=torch.bool, device=dev)
+
+            def steps():
+                for _ in range(self.GRAPH_STEPS):
+                    self._graph_step(g)
+
+            side = torch.cuda.Stream()
+            side.wait_stream(torch.cuda.current_stream())
+            with torch.cuda.stream(side):
+                steps()  # warm-up (on zeros: every segment inactive, nothing recorded that matters)
+            torch.cuda.current_stream().wait_stream(side)
+            g.s.zero_()
+            g.graph = torch.cuda.CUDAGraph()
+            # its own memory pool: graphs sharing one must replay in their capture order, batches don't
+            with torch.cuda.graph(g.graph, capture_error_mode="thread_local"):
+                steps()
+        self._graphs = {**getattr(self, "_graphs", {}), key: g}
+        return g
+
+    def _graph_step(self, g):
+        T = g.f.shape[1]
+        logits = torch.addmm(self.out_b, torch.relu(g.f[g.rows, g.t.clamp(max=T - 1)] + g.pred), self.out_w)
+        tok = logits[:, :self.V].argmax(-1)
+        dur = self.durations[logits[:, self.V:].argmax(-1)]
+        emit = g.active & (tok != self.blank)
+        at = g.s.view(1)
+        g.toks.index_copy_(0, at, tok[None])
+        g.times.index_copy_(0, at, g.t[None])
+        g.emits.index_copy_(0, at, emit[None])
+        g2, h2, c2 = self._lstm(tok, g.h, g.c)
+        g.pred.copy_(torch.where(emit[:, None], torch.addmm(self.pred_b, g2, self.pred_w), g.pred))
+        g.h.copy_(torch.where(emit[None, :, None], h2, g.h))
+        g.c.copy_(torch.where(emit[None, :, None], c2, g.c))
+        emitted = g.emitted + emit
+        adv = torch.where(dur > 0, dur, ((tok == self.blank) | (emitted >= self.max_symbols)).long())
+        g.emitted.copy_(torch.where(adv > 0, 0, emitted))
+        g.t.add_(adv * g.active)
+        g.active.copy_(g.t < g.lens)
+        g.s.add_(1)
+
+    def decode_graphed(self, encoder_out, encoder_out_lens, slot=0):
+        """As __call__ (tokens and frame indices per segment; no logprobs) for GPU tensors (B, T, D) / (B,), with the
+        search replayed as CUDA graphs: the batch is padded to a GRAPH_SIZES size (inactive segments) and T to a
+        multiple of GRAPH_FRAMES (never reached), so a few graphs serve every batch. [slot]: the calling worker's."""
+        B0, T0 = encoder_out.shape[:2]
+        B = next((b for b in self.GRAPH_SIZES if b >= B0), 1 << max(0, (B0 - 1).bit_length()))
+        T = -(-T0 // self.GRAPH_FRAMES) * self.GRAPH_FRAMES
+        g = self._graph_state(slot, B, T)
+        with torch.inference_mode():
+            enc = encoder_out.to(self.device, torch.float32)
+            g.f.zero_()
+            g.f[:B0, :T0] = torch.addmm(self.enc_b, enc.reshape(B0 * T0, -1), self.enc_w).reshape(B0, T0, -1)
+            g.lens.zero_()
+            g.lens[:B0] = encoder_out_lens.to(self.device)
+            for x in (g.t, g.emitted, g.s):
+                x.zero_()
+            zeros = torch.zeros(2, B, self.H, device=self.device)
+            first, h, c = self._lstm(torch.full((B,), self.blank, device=self.device), zeros, zeros.clone())
+            g.h.copy_(h)
+            g.c.copy_(c)
+            g.pred.copy_(torch.addmm(self.pred_b, first, self.pred_w))
+            g.active.copy_(g.t < g.lens)
+            for _ in range(g.toks.shape[0] // self.GRAPH_STEPS):  # the most steps a batch can take
+                g.graph.replay()
+                if not bool(g.active.any()):
+                    break
+            else:
+                raise RuntimeError(f"TDT graph search did not finish ({B} x {T})")
+            n = int(g.s.item())
+            toks, times, emits = (x[:n, :B0].cpu().numpy() for x in (g.toks, g.times, g.emits))
+        for b in range(B0):
+            m = emits[:, b]
+            yield toks[m, b].tolist(), times[m, b].tolist(), None

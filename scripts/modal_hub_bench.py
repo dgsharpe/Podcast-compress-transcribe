@@ -58,6 +58,23 @@ image = (
                  "librosa", "soundfile", "scipy", "fastapi>=0.162", "python-multipart", "httpx", "uvicorn",
                  "huggingface_hub", "safetensors", "nvidia-ml-py")
     .run_function(_download)
+    # a free-threaded Python (3.14t, no GIL) with the same packages, for runs with PY=FT_PYTHON
+    .run_commands(
+        "pip install -q uv==0.13.6",  # its interpreter list must include 3.14.10
+        # pinned: torch's cp314t wheel needs a 3.14 C API (PyCriticalSection_BeginMutex) "3.14t" didn't resolve to
+        "uv python install cpython-3.14.10+freethreaded",
+        "uv venv -q /ft --python cpython-3.14.10+freethreaded",
+        "uv pip install -q --python /ft/bin/python torch==2.14.1 torchaudio --index-url "
+        "https://download.pytorch.org/whl/cu130",
+        "uv pip install -q --python /ft/bin/python torch==2.14.1 transformers==5.22.1 'onnx-asr[cpu,hub]==0.12.0' "
+        "onnxruntime==1.31.1 pyannote-audio==4.0.7 librosa soundfile scipy 'fastapi>=0.162' python-multipart httpx "
+        "uvicorn huggingface_hub safetensors nvidia-ml-py threadpoolctl soxr",
+        # protobuf's C extensions (imported via pyannote's telemetry) segfault without the GIL, even when only probed
+        # (before PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION is read): removed, and the build-time constant protobuf reads
+        # first (api_version 0 = pure Python) set, so it doesn't probe at all
+        "rm -rf /ft/lib/python3.14t/site-packages/google/_upb /ft/lib/python3.14t/site-packages/google/protobuf/pyext",
+        "echo 'api_version = 0' > /ft/lib/python3.14t/site-packages/google/protobuf/internal/_api_implementation.py",
+    )
     .env(ENV)
     .add_local_dir(ROOT / "data/modal_pyannote", "/models/pyannote")
     .add_local_file(ROOT / "data/ref/ref_24k.wav", f"{NA}/data/ref/ref_24k.wav")
@@ -70,9 +87,14 @@ image = (
     .add_local_file(ROOT / "scripts/mimi_pieces_check.py", f"{NA}/scripts/mimi_pieces_check.py")
     .add_local_file(ROOT / "scripts/fp16_weights_check.py", f"{NA}/scripts/fp16_weights_check.py")
     .add_local_file(ROOT / "scripts/bulk_bench.py", f"{NA}/scripts/bulk_bench.py")
+    .add_local_file(ROOT / "scripts/mimi_static_check.py", f"{NA}/scripts/mimi_static_check.py")
 )
 app = modal.App("mimi-hub-bench", image=image)
 
+FT_PYTHON = "/ft/bin/python"
+# PYTHON_GIL=0: keep the GIL off even if an extension module asks for it; protobuf's C extension (imported by
+# pyannote's telemetry) segfaults on import without the GIL, so its pure-Python implementation
+FT_ENV = {"PY": FT_PYTHON, "PYTHON_GIL": "0", "PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION": "python"}
 MPS_ENV = {"MIMI_HUB_THREADS": "1", "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True", "MPS": "1"}
 # name -> runs: (args, extra env); args are throughput_server.py's unless they start with another script's name
 PLANS = {
@@ -230,6 +252,98 @@ PLANS = {
           "MIMI_BULK_DIAR_THREADS": "8", "MIMI_BULK_IN_FLIGHT": "16",
           "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True", "MPS": "1"}),
     ],
+    # bulk mode on free-threaded Python 3.14t (no GIL) vs 3.12, same container; then more threads
+    "ft1": [
+        (["bulk_bench.py", "--clips", "96", "--check", "1", "--prep", "24"], {}),
+        (["bulk_bench.py", "--clips", "96", "--check", "1", "--prep", "24"], FT_ENV),
+        (["bulk_bench.py", "--clips", "128", "--check", "0", "--prep", "24"],
+         {**FT_ENV, "MIMI_BULK_MIMI_WORKERS": "2", "MIMI_BULK_ASR_WORKERS": "4", "MIMI_BULK_DIAR_THREADS": "24"}),
+    ],
+    "ft2": [
+        (["bulk_bench.py", "--clips", "96", "--check", "1", "--prep", "24"], FT_ENV),
+        (["bulk_bench.py", "--clips", "128", "--check", "0", "--prep", "24"],
+         {**FT_ENV, "MIMI_BULK_MIMI_WORKERS": "2", "MIMI_BULK_ASR_WORKERS": "4", "MIMI_BULK_DIAR_THREADS": "24"}),
+    ],
+    # free-threaded crash hunt: a stack on a segfault (faulthandler), and once without forcing the GIL off (Python
+    # then names any extension module that needs it)
+    "ft3": [
+        (["bulk_bench.py", "--clips", "16", "--check", "0", "--prep", "8"], {**FT_ENV, "PYTHONFAULTHANDLER": "1"}),
+        (["bulk_bench.py", "--clips", "16", "--check", "0", "--prep", "8"],
+         {"PY": FT_PYTHON, "PYTHONFAULTHANDLER": "1", "PYTHONWARNINGS": "always"}),
+    ],
+    "ft4": [
+        (["bulk_bench.py", "--clips", "16", "--check", "0", "--prep", "8"], {**FT_ENV, "PYTHONFAULTHANDLER": "1"}),
+    ],
+    "ft5": [
+        (["bulk_bench.py", "--clips", "96", "--check", "1", "--prep", "24"], {**FT_ENV, "PYTHONFAULTHANDLER": "1"}),
+        (["bulk_bench.py", "--clips", "128", "--check", "0", "--prep", "24"],
+         {**FT_ENV, "PYTHONFAULTHANDLER": "1", "MIMI_BULK_MIMI_WORKERS": "2", "MIMI_BULK_ASR_WORKERS": "4",
+          "MIMI_BULK_DIAR_THREADS": "24"}),
+    ],
+    # bulk mode with Mimi as CUDA graphs, on Python 3.12 and free-threaded 3.14t (protobuf's C extension removed)
+    "ft6": [
+        (["bulk_bench.py", "--clips", "96", "--check", "1", "--prep", "24"], {}),
+        (["bulk_bench.py", "--clips", "96", "--check", "1", "--prep", "24"], {**FT_ENV, "PYTHONFAULTHANDLER": "1"}),
+        (["bulk_bench.py", "--clips", "128", "--check", "0", "--prep", "24"],
+         {**FT_ENV, "PYTHONFAULTHANDLER": "1", "MIMI_BULK_MIMI_WORKERS": "2", "MIMI_BULK_ASR_WORKERS": "4",
+          "MIMI_BULK_DIAR_THREADS": "24"}),
+    ],
+    "ft7": [
+        (["bulk_bench.py", "--clips", "96", "--check", "1", "--prep", "24"], {**FT_ENV, "PYTHONFAULTHANDLER": "1"}),
+        (["bulk_bench.py", "--clips", "128", "--check", "0", "--prep", "24"],
+         {**FT_ENV, "PYTHONFAULTHANDLER": "1", "MIMI_BULK_ASR_WORKERS": "4", "MIMI_BULK_DIAR_THREADS": "24"}),
+    ],
+    # both CUDA graphs (Mimi, TDT decoder) with free-threaded 3.14t, and on 3.12 for comparison
+    "ft8": [
+        (["bulk_bench.py", "--clips", "96", "--check", "1", "--prep", "24"], {**FT_ENV, "PYTHONFAULTHANDLER": "1"}),
+        (["bulk_bench.py", "--clips", "128", "--check", "0", "--prep", "24"],
+         {**FT_ENV, "PYTHONFAULTHANDLER": "1", "MIMI_BULK_ASR_WORKERS": "3", "MIMI_BULK_DIAR_THREADS": "24"}),
+        (["bulk_bench.py", "--clips", "96", "--check", "0", "--prep", "24"], {}),
+    ],
+    # decoder graphs captured at load (mid-run capture stalled the device); deeper pipelines (IN_FLIGHT)
+    "ft9": [
+        (["bulk_bench.py", "--clips", "96", "--check", "1", "--prep", "24"], {**FT_ENV, "PYTHONFAULTHANDLER": "1"}),
+        (["bulk_bench.py", "--clips", "128", "--check", "0", "--prep", "32"],
+         {**FT_ENV, "PYTHONFAULTHANDLER": "1", "MIMI_BULK_IN_FLIGHT": "96"}),
+        (["bulk_bench.py", "--clips", "160", "--check", "0", "--prep", "32"],
+         {**FT_ENV, "PYTHONFAULTHANDLER": "1", "MIMI_BULK_IN_FLIGHT": "128", "MIMI_BULK_DIAR_THREADS": "24"}),
+    ],
+    # the hang with load-time decoder graphs: free-threaded / 3.12, under a watchdog that prints every thread's stack
+    "ft10": [
+        (["bulk_bench.py", "--clips", "32", "--check", "0", "--prep", "16"], {**FT_ENV, "BULK_WATCHDOG_S": "240"}),
+        (["bulk_bench.py", "--clips", "32", "--check", "0", "--prep", "16"], {"BULK_WATCHDOG_S": "240"}),
+        (["bulk_bench.py", "--clips", "96", "--check", "0", "--prep", "24"],
+         {**FT_ENV, "BULK_WATCHDOG_S": "400", "MIMI_BULK_ASR_GRAPH": "0"}),
+    ],
+    # free-threaded with the fbank (vmap) lock: both graphs, then a deeper pipeline
+    "ft11": [
+        (["bulk_bench.py", "--clips", "96", "--check", "1", "--prep", "24"], {**FT_ENV, "BULK_WATCHDOG_S": "500"}),
+        (["bulk_bench.py", "--clips", "128", "--check", "0", "--prep", "32"],
+         {**FT_ENV, "BULK_WATCHDOG_S": "500", "MIMI_BULK_IN_FLIGHT": "96"}),
+    ],
+    # Python 3.12 (stable) with both CUDA graphs captured at load, and a deeper pipeline
+    "g1": [
+        (["bulk_bench.py", "--clips", "96", "--check", "1", "--prep", "24"], {"BULK_WATCHDOG_S": "500"}),
+        (["bulk_bench.py", "--clips", "128", "--check", "0", "--prep", "32"],
+         {"BULK_WATCHDOG_S": "500", "MIMI_BULK_IN_FLIGHT": "96"}),
+    ],
+    # both graphs captured at load, each decoder graph in its own pool (a shared one corrupted out-of-order replays)
+    "g2": [
+        (["bulk_bench.py", "--clips", "96", "--check", "1", "--prep", "24"], {"BULK_WATCHDOG_S": "400"}),
+        (["bulk_bench.py", "--clips", "96", "--check", "1", "--prep", "24"], {**FT_ENV, "BULK_WATCHDOG_S": "400"}),
+        (["bulk_bench.py", "--clips", "128", "--check", "0", "--prep", "32"],
+         {**FT_ENV, "BULK_WATCHDOG_S": "400", "MIMI_BULK_IN_FLIGHT": "96"}),
+    ],
+    "g3": [
+        (["bulk_bench.py", "--clips", "32", "--check", "0", "--prep", "16"], {"BULK_WATCHDOG_S": "240"}),
+    ],
+    # the candidate: free-threaded 3.14t + Mimi graphs, eager TDT search; twice, and with a deeper pipeline
+    "g4": [
+        (["bulk_bench.py", "--clips", "96", "--check", "1", "--prep", "24"], {**FT_ENV, "BULK_WATCHDOG_S": "300"}),
+        (["bulk_bench.py", "--clips", "128", "--check", "0", "--prep", "32"],
+         {**FT_ENV, "BULK_WATCHDOG_S": "300", "MIMI_BULK_IN_FLIGHT": "96"}),
+        (["bulk_bench.py", "--clips", "96", "--check", "0", "--prep", "24"], {**FT_ENV, "BULK_WATCHDOG_S": "300"}),
+    ],
     # pushing one GPU: where its time goes, then a 32-clip backlog (160 min) at more processes
     "push1": [
         (["roofline_server.py"], {}),
@@ -276,12 +390,13 @@ def bench(gpu: str, runs: list) -> list:
         t = time.time()
         env = dict(env)
         use_mps = env.pop("MPS", None) == "1"
+        python = env.pop("PY", sys.executable)
         if use_mps:
             print(f"MPS start: {mps(True)}", flush=True)
             env.update(mps_env)
         cmd = ([f"{NA}/scripts/{args[0]}", *args[1:]] if args and args[0].endswith(".py")
                else [f"{NA}/scripts/throughput_server.py", "--label", gpu, *args])
-        proc = subprocess.Popen([sys.executable, *cmd], cwd=NA, env={**os.environ, **env}, stdout=subprocess.PIPE,
+        proc = subprocess.Popen([python, *cmd], cwd=NA, env={**os.environ, **env}, stdout=subprocess.PIPE,
                                 stderr=subprocess.PIPE, text=True, start_new_session=True)
         try:
             stdout, stderr = proc.communicate(timeout=RUN_TIMEOUT_S)
@@ -293,7 +408,11 @@ def bench(gpu: str, runs: list) -> list:
         rows = [{"tag": ln.split(" ", 1)[0], **json.loads(ln.split(" ", 1)[1])} for ln in p.stdout.splitlines()
                 if re.match(r"^[A-Z]+ \{", ln)]
         if p.returncode or not rows:
-            print(f"RUN FAILED {args} {env}:\n{p.stderr[-3000:]}", flush=True)
+            fatal = p.stderr.find("Fatal Python error")  # faulthandler: the crash and every thread's stack
+            if fatal < 0:
+                fatal = p.stderr.find("--- thread ")  # scripts/bulk_bench.py's watchdog: where every thread was
+            shown = p.stderr[fatal:fatal + 20000] if fatal >= 0 else p.stderr[-3000:]
+            print(f"RUN FAILED {args} {env} (exit {p.returncode}):\n{shown}", flush=True)
             out.append({**info, "args": args, "env": env, "error": p.stderr[-1500:]})
             continue
         if use_mps:

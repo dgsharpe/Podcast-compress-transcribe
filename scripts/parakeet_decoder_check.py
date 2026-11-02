@@ -23,6 +23,7 @@ def main():
     ap.add_argument("--seconds", type=float, default=0, help="only the first N s (0: all)")
     a = ap.parse_args()
     import librosa
+    import numpy as np
     import soundfile as sf
     import torch
     from hub import mimi_hub, parakeet_native
@@ -45,7 +46,11 @@ def main():
         stats["onnx_s"] += time.perf_counter() - t
         torch.cuda.synchronize()
         t = time.perf_counter()
-        new = list(native(enc, lens, **kw))
+        if os.environ.get("DECODER_GRAPH") == "1":  # the CUDA-graph search (hub/bulk.py)
+            new = list(native.decode_graphed(torch.from_numpy(np.ascontiguousarray(enc)).cuda(),
+                                             torch.from_numpy(np.asarray(lens))))
+        else:
+            new = list(native(enc, lens, **kw))
         torch.cuda.synchronize()
         stats["native_s"] += time.perf_counter() - t
         for (rt, rs, _), (nt, ns, _) in zip(ref, new, strict=True):
@@ -68,6 +73,7 @@ def main():
     list(mimi_hub.models()["asr"].recognize(w16, sample_rate=16000))
     stats["audio_s"] = round(len(w16) / 16000, 1)
     stats["onnx_s"], stats["native_s"] = round(stats["onnx_s"], 2), round(stats["native_s"], 2)
+    stats["graph"] = os.environ.get("DECODER_GRAPH") == "1"
     print("DECODER " + json.dumps(stats), flush=True)
 
 

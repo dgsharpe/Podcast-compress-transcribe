@@ -14,6 +14,7 @@ norms become fixed per-channel scale + shift (eval mode). fp16 is not used: it m
 import math
 import os
 import sys
+import threading
 import types
 from pathlib import Path
 
@@ -154,6 +155,9 @@ def _coreml_frames(resnet, fbank_shape):
 
 
 FRAMES_FN = None  # replaces resnet_frames in get_embeddings when set
+# WeSpeaker's compute_fbank runs torchaudio's kaldi.fbank under torch.vmap, whose state is shared: entered from many
+# threads at once (hub/bulk.py's diarization threads on free-threaded Python, no GIL to take turns) it deadlocked
+_FBANK_LOCK = threading.Lock()
 
 
 def resnet_frames(model, fbank, mode):
@@ -201,7 +205,8 @@ def get_embeddings(self, file, binary_segmentations, exclude_overlap=False, hook
         for k, c0 in enumerate(range(0, num_chunks, BATCH_CHUNKS), 1):
             c1 = min(num_chunks, c0 + BATCH_CHUNKS)
             chunks = w[starts[c0:c1, None] + offsets][:, None]  # (batch, 1, samples)
-            fbank = model.compute_fbank(chunks)
+            with _FBANK_LOCK:  # vmap inside: not safe to enter from several threads at once
+                fbank = model.compute_fbank(chunks)
             mode = _frames_mode(device)
             if mode == "coreml":  # fixed batch: the last one is zero-padded
                 shape = (BATCH_CHUNKS, *fbank.shape[1:])

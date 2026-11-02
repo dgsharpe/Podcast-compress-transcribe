@@ -95,7 +95,28 @@ def multi(a, sources, work):
                                              for g in got]}), flush=True)
 
 
+def _watchdog(seconds):
+    """After [seconds], print every thread's stack (a hang shows where; works with the GIL off, unlike faulthandler's
+    all-threads dump) and exit."""
+    import threading
+    import traceback
+
+    def run():
+        time.sleep(seconds)
+        names = {t.ident: t.name for t in threading.enumerate()}
+        frames = sorted(sys._current_frames().items(), key=lambda kv: "diar" in str(names.get(kv[0], "")))
+        for ident, frame in frames:  # the innermost frames, the diarization threads (many, alike) last
+            print(f"--- thread {names.get(ident, ident)}", file=sys.stderr)
+            for fs in traceback.extract_stack(frame)[-6:]:
+                print(f"  {fs.filename.split('site-packages/')[-1]}:{fs.lineno} {fs.name}: {fs.line}", file=sys.stderr)
+        sys.stderr.flush()
+        os._exit(3)
+    threading.Thread(target=run, daemon=True, name="watchdog").start()
+
+
 def main():
+    if os.environ.get("BULK_WATCHDOG_S"):
+        _watchdog(float(os.environ["BULK_WATCHDOG_S"]))
     ap = argparse.ArgumentParser()
     ap.add_argument("--clips", type=int, default=48)
     ap.add_argument("--clip-min", type=float, default=5.0)

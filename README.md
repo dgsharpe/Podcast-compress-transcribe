@@ -96,10 +96,17 @@ Environment variables, e.g. `Environment=` lines in the unit:
 One process holds one copy of the models and batches each model's GPU work across all the episodes in flight
 (Mimi in lockstep pieces, Parakeet's segments sorted by length, pyannote's windows through shared batchers); decoding,
 VAD and features run in a pool of processes. Transcripts and speaker turns match the hub's (word similarity
-0.998-1.0, DER 0); Mimi codes ~96% (batched fp16 rounds differently). It is limited by Python (one process launches
-the GPU kernels; ~550-640x real time on an H100 vs ~1,500x for 16 hub-style processes under MPS, and ~90x vs ~80x
-on the Radeon 8060S), and its batches take a lot of GPU memory (one process at the defaults: ~58 GB on an H100).
-Settings: `MIMI_BULK_*` at the top of the file. `scripts/bulk_bench.py` measures it and checks it against the hub.
+0.998-1.0, DER 0); Mimi codes ~96% (batched fp16 rounds differently).
+
+On NVIDIA, Mimi's streaming runs as CUDA graphs (`hub/mimi_static.py`: fixed-size state, one replay per 20 s chunk
+of a batch). The process is still limited by Python launching GPU work, so it runs best on free-threaded Python
+(3.14t, no GIL). On an H100: Python 3.12 ~440x real time; 3.14t ~790x, ~890x with `MIMI_BULK_IN_FLIGHT=96`
+(for comparison, 16 hub-style processes under NVIDIA MPS: ~1,500x, but with 16 copies of the models). The
+free-threaded environment is built in `scripts/modal_hub_bench.py`'s image: uv's `cpython-3.14.10+freethreaded`,
+torch 2.14.1+cu130 (`cp314t`), protobuf's C extensions removed (they segfault without the GIL) and
+`PYTHON_GIL=0`. On the Radeon 8060S it makes no difference (~90x vs ~80x for the hub; GPU-bound).
+Settings: `MIMI_BULK_*` at the top of `hub/bulk.py`. `scripts/bulk_bench.py` measures it and checks it against the
+hub.
 
 ## Build the app
 

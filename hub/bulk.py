@@ -44,8 +44,16 @@ WARMUP_FRAMES = 250  # Mimi's transformer context (20 s)
 CHUNK_FRAMES = int(os.environ.get("MIMI_BULK_CHUNK_FRAMES", "250"))
 MIMI_BATCH = int(os.environ.get("MIMI_BULK_MIMI_BATCH", "16"))
 MIMI_WORKERS = int(os.environ.get("MIMI_BULK_MIMI_WORKERS", "1"))  # threads, each on its own CUDA stream
+# Mimi through hub/mimi_static.py: fixed-size streaming state, each chunk of a batch one CUDA graph replay instead of
+# hundreds of kernel launches (codes as transformers' streaming to ~98%: attention rounds a little differently).
+# auto: on NVIDIA (launch-bound there); the server's ROCm GPU is compute-bound and gained nothing.
+MIMI_GRAPH = os.environ.get("MIMI_BULK_MIMI_GRAPH", "auto")
 ASR_BATCH = int(os.environ.get("MIMI_BULK_ASR_BATCH", "64"))
 ASR_WORKERS = int(os.environ.get("MIMI_BULK_ASR_WORKERS", "2"))  # threads, each on its own CUDA stream
+# the TDT search as CUDA graphs (hub/parakeet_native.NativeTdtDecoder.decode_graphed): 16 steps per launch, the same
+# tokens and timestamps (548/548 segments). Off by default: on an H100 it was no faster than the eager search (590x
+# vs 789x end to end), and graphs captured at load hung on replay from the worker threads (on demand they didn't).
+ASR_GRAPH = os.environ.get("MIMI_BULK_ASR_GRAPH", "0")
 DIAR_ROWS = int(os.environ.get("MIMI_BULK_DIAR_ROWS", "256"))  # segmentation / ResNet windows per GPU call
 DIAR_THREADS = int(os.environ.get("MIMI_BULK_DIAR_THREADS", "16"))
 IN_FLIGHT = int(os.environ.get("MIMI_BULK_IN_FLIGHT", "32"))  # episodes prepared and not yet written
@@ -225,9 +233,25 @@ class Models:
         seg = pipe._segmentation.model
         seg.forward = Batcher(seg.forward, DIAR_ROWS, name="bulk-segmentation")
         self.pipe, self.batchers = pipe, {"resnet": frames, "segmentation": seg.forward}
+        if ASR_GRAPH == "1" or (ASR_GRAPH == "auto" and not torch.version.hip):  # captured now, not mid-run
+            for k in range(ASR_WORKERS):
+                self.asr._decoding.capture_graphs(k, max_batch=ASR_BATCH)
+        self.mimi_static = []
+        # one set per Mimi worker, captured now, before any worker runs on the GPU
+        if MIMI_GRAPH == "1" or (MIMI_GRAPH == "auto" and not torch.version.hip):
+            from hub.mimi_static import StaticMimiEncoder
+            L = PIECE_FRAMES + WARMUP_FRAMES
+            assert L % CHUNK_FRAMES == 0, f"a piece ({L} frames) must be whole chunks of {CHUNK_FRAMES} for the graph"
+            sizes = sorted({max(1, MIMI_BATCH // d) for d in (1, 2, 4)})  # a partial batch pads to the next size
+            for _ in range(MIMI_WORKERS):
+                encs = {}
+                for b in sizes:
+                    encs[b] = StaticMimiEncoder(self.mimi, b, CHUNK_FRAMES)
+                    encs[b].capture()
+                self.mimi_static.append(encs)
 
 
-def mimi_worker(models, pieces, name="mimi"):
+def mimi_worker(models, pieces, name="mimi", index=0):
     """Lockstep batches of up to MIMI_BATCH pieces (episode, k) from any episodes."""
     import numpy as np
     import torch
@@ -235,6 +259,9 @@ def mimi_worker(models, pieces, name="mimi"):
     from hub import mimi_hub
     spf, L = mimi_file.SPF, PIECE_FRAMES + WARMUP_FRAMES
     stream = torch.cuda.Stream()
+    # this worker's captured encoders by batch size (reused by the next convert(): the previous one's workers sit idle
+    # on their queue)
+    statics = models.mimi_static[index] if index < len(models.mimi_static) else None
     while True:
         batch = [pieces.get()]
         while len(batch) < MIMI_BATCH:
@@ -244,19 +271,26 @@ def mimi_worker(models, pieces, name="mimi"):
                 break
         t0 = time.perf_counter()
         try:
-            x = np.zeros((len(batch), L * spf), np.float32)
+            static = statics[min(b for b in statics if b >= len(batch))] if statics else None
+            x = np.zeros((static.B if static is not None else len(batch), L * spf), np.float32)
             for b, (ep, k) in enumerate(batch):
                 a = 0 if k == 0 else k * PIECE_FRAMES - WARMUP_FRAMES
                 seg = ep.w24[a * spf:(a + L) * spf]
                 x[b, :len(seg)] = seg
             with torch.cuda.stream(stream):
                 xt = torch.from_numpy(x).pin_memory().to("cuda", non_blocking=True)[:, None]
-                kv, pad, out = None, None, []
-                for c0 in range(0, L, CHUNK_FRAMES):
-                    o = mimi_hub.mimi_encode(models.mimi, xt[..., c0 * spf:(c0 + CHUNK_FRAMES) * spf],
-                                             encoder_past_key_values=kv, padding_cache=pad, use_streaming=True)
-                    kv, pad = o.encoder_past_key_values, o.padding_cache
-                    out.append(o.audio_codes.transpose(1, 2))  # (B, frames, 32)
+                out = []
+                if static is not None:
+                    static.reset()
+                    for c0 in range(0, L, CHUNK_FRAMES):
+                        out.append(static.encode(xt[..., c0 * spf:(c0 + CHUNK_FRAMES) * spf]).transpose(1, 2))
+                else:
+                    kv, pad = None, None
+                    for c0 in range(0, L, CHUNK_FRAMES):
+                        o = mimi_hub.mimi_encode(models.mimi, xt[..., c0 * spf:(c0 + CHUNK_FRAMES) * spf],
+                                                 encoder_past_key_values=kv, padding_cache=pad, use_streaming=True)
+                        kv, pad = o.encoder_past_key_values, o.padding_cache
+                        out.append(o.audio_codes.transpose(1, 2))  # (B, frames, 32)
                 codes = torch.cat(out, dim=1).cpu().numpy()
         except Exception as e:  # noqa: BLE001
             for ep, _ in batch:
@@ -271,13 +305,14 @@ def mimi_worker(models, pieces, name="mimi"):
         _busy(name, t0)
 
 
-def asr_worker(models, segments, name="asr"):
+def asr_worker(models, segments, name="asr", slot=0):
     """Segments (episode, j) of any episodes, pooled and sorted by length, ASR_BATCH at a time. The features go to
     the GPU in one pinned copy and the encoder's output stays there for the decoder."""
     import numpy as np
     import torch
     from onnx_asr.vad import TimestampedSegmentResult
     asr, stream, pending = models.asr, torch.cuda.Stream(), []
+    graphed = ASR_GRAPH == "1" or (ASR_GRAPH == "auto" and not torch.version.hip)
     encoder = asr._encoder  # hub/parakeet_native.NativeEncoder
     while True:
         if not pending:
@@ -301,7 +336,9 @@ def asr_worker(models, segments, name="asr"):
             try:
                 with torch.cuda.stream(stream):
                     enc, enc_lens = encoder.encode(x, lens)
-                    results = list(map(asr._decode_tokens, *zip(*asr._decoding(enc, enc_lens, need_logprobs=True))))
+                    found = (asr._decoding.decode_graphed(enc, enc_lens, slot) if graphed
+                             else asr._decoding(enc, enc_lens, need_logprobs=True))
+                    results = list(map(asr._decode_tokens, *zip(*found)))
             except Exception as e:  # noqa: BLE001
                 for ep, _ in batch:
                     ep.fail("asr", e)
@@ -358,10 +395,10 @@ def convert(sources, out_dir, prep_workers=None, models=None, log=print):
     models = models or Models()
     pieces, segments = queue.Queue(), queue.Queue()
     for k in range(MIMI_WORKERS):
-        threading.Thread(target=mimi_worker, args=(models, pieces, f"mimi{k}"), daemon=True,
+        threading.Thread(target=mimi_worker, args=(models, pieces, f"mimi{k}", k), daemon=True,
                          name=f"bulk-mimi{k}").start()
     for k in range(ASR_WORKERS):
-        threading.Thread(target=asr_worker, args=(models, segments, f"asr{k}"), daemon=True,
+        threading.Thread(target=asr_worker, args=(models, segments, f"asr{k}", k), daemon=True,
                          name=f"bulk-asr{k}").start()
     diar = ThreadPoolExecutor(DIAR_THREADS, thread_name_prefix="bulk-diar")
     writers = ThreadPoolExecutor(4, thread_name_prefix="bulk-write")
@@ -435,6 +472,9 @@ def convert(sources, out_dir, prep_workers=None, models=None, log=print):
     failed = [s for s in stats if s.get("error")]
     summary["failed"] = len(failed)
     summary["gpu_reserved_peak_gb"] = round(models.torch.cuda.max_memory_reserved() / 2**30, 1)
+    import sysconfig
+    summary["python"] = sys.version.split()[0] + ("t" if sysconfig.get_config_var("Py_GIL_DISABLED") else "")
+    summary["gil"] = sys._is_gil_enabled() if hasattr(sys, "_is_gil_enabled") else True
     if failed:
         summary["first_error"] = failed[0]["error"][:300]
     return summary, stats
