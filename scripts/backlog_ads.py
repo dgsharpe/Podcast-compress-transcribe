@@ -10,6 +10,10 @@ already says segments_state "ready" are skipped, so it can be rerun.
 
 RESULTS: modal_backlog.py's results ([{"uuid", ...}]). Haiku 5.5 through the claude CLI found all 98 judged breaks of
 scripts/ads_truth.py's 24 episodes.
+
+    --recheck 240 [--segmenter claude:claude-opus-5-5]   redo, with that model, episodes (over 20 min) whose found
+        segments include one over 240 s: Haiku now and then ran a break on through the content after it (a Weeds
+        episode: a 40 s break marked as the last 17 min), on 2 of the first 559 backlog episodes
 """
 import argparse
 import fcntl
@@ -86,6 +90,7 @@ def main():
     ap.add_argument("--volume", default=None, help="a Modal hub's data Volume instead of --data")
     ap.add_argument("--segmenter", default="claude:claude-haiku-5-5")
     ap.add_argument("--threads", type=int, default=8)
+    ap.add_argument("--recheck", type=float, default=0, help="redo episodes with a segment over this many seconds")
     a = ap.parse_args()
     lib = Volume(a.volume) if a.volume else Local(a.data)
     ids = [r["uuid"] for f in a.results for r in json.loads(Path(f).read_text()) if not r.get("error")]
@@ -99,7 +104,14 @@ def main():
                 stats["failed"] += 1
             print(f"{i}: no record ({type(e).__name__})", flush=True)
             return
-        if rec.get("segments_state") == "ready":
+        if a.recheck:
+            found = json.loads(lib.read(f"{i}.segments.json"))["segments"] if rec.get("segments_state") == "ready" else []
+            if rec.get("duration_s", 0) < 20 * 60 or not any(x["end"] - x["start"] > a.recheck for x in found):
+                with lock:
+                    stats["skipped"] += 1
+                return
+            before = [(round(x["start"]), round(x["end"])) for x in found]
+        elif rec.get("segments_state") == "ready":
             with lock:
                 stats["skipped"] += 1
             return
@@ -112,6 +124,9 @@ def main():
             print(f"{i}: {type(e).__name__}: {e}"[:300], flush=True)
             return
         skippable = round(sum(s["end"] - s["start"] for s in res["segments"]), 1)
+        if a.recheck:
+            print(f"{i} {rec.get('title', '')[:50]}: {before} -> "
+                  f"{[(round(x['start']), round(x['end'])) for x in res['segments']]}", flush=True)
         lib.update(i, json.dumps(res, indent=1), dict(
             segments_state="ready", segments=len(res["segments"]), segments_model=res["model"], skippable_s=skippable,
             segments_error=None, updated=time.time(), timing={**(rec.get("timing") or {}),
