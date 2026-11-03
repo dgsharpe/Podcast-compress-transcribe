@@ -46,8 +46,36 @@ hub/fetch_models.sh        # CPU speaker diarization models (sherpa-onnx), into 
 - **Try it:** `hub/serve.sh --host 127.0.0.1 --port 8765`, then
   `curl -X POST localhost:8765/v1/convert -H 'Content-Type: application/json' -d '{"url": "<episode audio URL or pca.st link>"}'`
   and poll `GET /v1/episodes/<id>`. `hub/serve.sh` uses `.venv-rocm` or `.venv-cuda` if present, else the uv `.venv`.
-- **Network:** the patched app sends no token, so bind the hub to a private address (a Tailscale IP works well)
-  rather than the internet.
+- **Network:** bind the hub to a private address (a Tailscale IP works well) rather than the internet, or set
+  `MIMI_HUB_TOKEN` and give the app the URL with the token in it, `https://<server>/t/<token>` (the app sends no
+  header of its own).
+
+### Or: your own server on Modal
+
+No machine of your own: `hub/modal_app.py` runs the hub on a [Modal](https://modal.com) GPU that's only up (and
+billed) while it works, with ad detection through an OpenRouter key.
+
+```sh
+pip install modal && modal setup
+modal secret create mimi-hub MIMI_HUB_TOKEN=$(python3 -c 'import secrets; print(secrets.token_urlsafe(32))') \
+  OPENROUTER_API_KEY=<your key> [HF_TOKEN=<token>]   # HF_TOKEN: pyannote's speaker labels (below)
+modal deploy hub/modal_app.py       # prints https://<workspace>--mimi-hub-serve.<region>.modal.run
+```
+
+In the app, Settings > Advanced > Mimi server: `https://<workspace>--mimi-hub-serve.<region>.modal.run/t/<token>`
+(`modal secret` doesn't show the token again: keep it). The app wakes the server when it comes to the foreground.
+
+- **First start:** converts the models and compiles their kernels, ~5-10 min, kept on the `mimi-hub-models` Volume.
+- **Cold start after that** (L40S, the default): the server answers in ~8 s and has its models loaded at ~45 s. A
+  43 min episode then plays after ~2 s and is fully transcribed after ~13 s (+ a few seconds for ads); requested
+  with no warm-up, the first audio comes after ~33 s (the app streams the original meanwhile). An H100 was no
+  faster.
+- **Cost:** Modal bills while the container is up: an L40S with 16 cores ~$3 an hour, about $0.10 per episode or
+  warm-up (it stays up 60 s after the last request; the app wakes it at most every 15 min). Modal's free plan
+  includes $30 a month. `MIMI_MODAL_GPU` / `MIMI_MODAL_CPU` at deploy pick others (see `hub/modal_app.py`).
+- **Speaker labels:** pyannote's community-1 model is gated: accept its conditions on huggingface.co and put
+  `HF_TOKEN` in the secret (or keep its snapshot in `data/modal_pyannote`); otherwise the CPU diarizer.
+- `scripts/remote_episode.py <url>/t/<token>` times a cold start and one episode against a running server.
 
 ### Run it as a service
 

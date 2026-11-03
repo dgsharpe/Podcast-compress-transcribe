@@ -2,7 +2,8 @@
 
 Serve on the Tailscale address only, e.g.
     uv run uvicorn hub.mimi_hub:app --host <tailscale-ip> --port 8765
-Optional auth: set MIMI_HUB_TOKEN; clients then send `Authorization: Bearer <token>`.
+Optional auth: set MIMI_HUB_TOKEN; clients then send `Authorization: Bearer <token>`, or put it in the URL:
+/t/<token>/v1/... is /v1/... with the token sent (for a client that's only given a server URL, as the app is).
 
 API (JSON unless noted):
   POST /v1/convert {"url": ...[, "id", "title", "priority"]}  enqueue (priority 0 = about to be streamed,
@@ -31,6 +32,13 @@ then keeps its source); records say "compressed": false.
                                                 pending | ready | failed | off. See hub/segments.py.
   POST /v1/episodes/{id}/segments               re-run that detection
   GET  /v1/episodes                             all jobs, newest first
+  POST /v1/warm                                 load the models now (in the background) and run each once, so the
+                                                next episode starts at full speed: {"models": cold | loading | ready
+                                                | failed}. A client calls it when it opens; MIMI_HUB_PRELOAD=1 does
+                                                it at startup (hub/modal_app.py, a server that scales to zero).
+  GET  /v1/hold?s=60                            returns once nothing is converting or waiting (or after s seconds):
+                                                a request in flight keeps a serverless container (Modal) alive
+                                                while the work it started in the background runs.
 Files live in $MIMI_HUB_DATA (default neural_audio/hub_data/): <id>.mimi, <id>.vtt, <id>.segments.json, <id>.json.
 
 GPU: run in .venv-rocm (hub/setup_rocm.sh; hub/serve.sh picks it) and the Mimi encoder and Parakeet's encoder run on
@@ -41,6 +49,7 @@ import atexit
 import contextlib
 import gzip
 import hashlib
+import hmac
 import itertools
 import json
 import os
@@ -231,6 +240,31 @@ def models():
             _models.update(_load_models())
             _vad_workers()  # (MIMI_HUB_VAD_SHARDS) started with the models, not by the first episode
     return _models
+
+
+_warm = {"models": "cold"}  # cold | loading | ready | failed (POST /v1/warm)
+_warm_lock = threading.Lock()
+PRELOAD = os.environ.get("MIMI_HUB_PRELOAD", "0") == "1"
+
+
+def warm():
+    """Load the models and run the lazily loaded and first-call-slow parts once (pyannote, ASR) on noise."""
+    with _warm_lock:
+        if _warm["models"] in ("loading", "ready"):
+            return
+        _warm["models"] = "loading"
+    t0 = time.time()
+    try:
+        import numpy as np
+        m = models()
+        noise = (0.05 * np.random.default_rng(0).standard_normal(16000 * 30)).astype(np.float32)
+        diarize(noise)
+        list(m["asr"].recognize(noise, sample_rate=16000))
+        _warm["models"] = "ready"
+        print(f"warm: models ready in {time.time() - t0:.1f} s", flush=True)
+    except Exception:
+        traceback.print_exc()
+        _warm["models"] = "failed"
 
 
 def _load_models():
@@ -482,8 +516,9 @@ _diar_lock = threading.Lock()
 def _pyannote_turns(wav16):
     import torch
     from hub import pyannote_gpu
-    if "diar_pyannote" not in _models:  # from the HF cache; no token at runtime
+    if "diar_pyannote" not in _models:  # from the HF cache (or MIMI_HUB_PYANNOTE_PATH, a copy); no token at runtime
         _models["diar_pyannote"] = pyannote_gpu.load(_models.get("device", "cpu"),
+                                                     path=os.environ.get("MIMI_HUB_PYANNOTE_PATH") or None,
                                                      segmentation_device=os.environ.get("MIMI_HUB_SEG_DEVICE") or None)
     out = _models["diar_pyannote"]({"waveform": torch.from_numpy(wav16)[None], "sample_rate": 16000})
     ann = getattr(out, "speaker_diarization", out)
@@ -1224,26 +1259,51 @@ def queue_segments(i, cues=None):
     seg_jobs.put((i, cues))
 
 
+_active = [0]  # conversions and ad detections in progress (busy())
+_active_lock = threading.Lock()
+
+
+@contextlib.contextmanager
+def _working():
+    with _active_lock:
+        _active[0] += 1
+    try:
+        yield
+    finally:
+        with _active_lock:
+            _active[0] -= 1
+
+
+def busy():
+    """Anything converting, detecting ads, warming up or waiting to (GET /v1/hold)."""
+    return _active[0] > 0 or not jobs.empty() or not seg_jobs.empty() or _warm["models"] == "loading"
+
+
 def segment_worker():
     while True:
         i, cues = seg_jobs.get()
-        try:
-            if cues is None:
-                cues = segments.read_cues((DATA / f"{i}.vtt").read_text())
-            res = segments.detect(cues, log=lambda m: print(f"[{i}] {m}", flush=True))
-            tmp = DATA / f"{i}.segments.json.tmp"
-            tmp.write_text(json.dumps(res, indent=1))
-            tmp.replace(DATA / f"{i}.segments.json")
-            with lock:
-                r = load(i)
-                timing = dict(r.get("timing") or {})
-                if r.get("timing_start"):
-                    timing["segments"] = round(time.time() - r["timing_start"], 2)
-                save(dict(r, segments_state="ready", segments=len(res["segments"]), segments_model=res["model"],
-                          skippable_s=round(sum(s["end"] - s["start"] for s in res["segments"]), 1), timing=timing))
-        except Exception as e:
-            traceback.print_exc()
-            update(i, segments_state="failed", segments_error=f"{type(e).__name__}: {e}"[:500])
+        with _working():
+            _segment(i, cues)
+
+
+def _segment(i, cues):
+    try:
+        if cues is None:
+            cues = segments.read_cues((DATA / f"{i}.vtt").read_text())
+        res = segments.detect(cues, log=lambda m: print(f"[{i}] {m}", flush=True))
+        tmp = DATA / f"{i}.segments.json.tmp"
+        tmp.write_text(json.dumps(res, indent=1))
+        tmp.replace(DATA / f"{i}.segments.json")
+        with lock:
+            r = load(i)
+            timing = dict(r.get("timing") or {})
+            if r.get("timing_start"):
+                timing["segments"] = round(time.time() - r["timing_start"], 2)
+            save(dict(r, segments_state="ready", segments=len(res["segments"]), segments_model=res["model"],
+                      skippable_s=round(sum(s["end"] - s["start"] for s in res["segments"]), 1), timing=timing))
+    except Exception as e:
+        traceback.print_exc()
+        update(i, segments_state="failed", segments_error=f"{type(e).__name__}: {e}"[:500])
 
 
 _seq = itertools.count()
@@ -1270,7 +1330,9 @@ def _take_job():
 
 def worker():
     while True:
-        run(_take_job())
+        i = _take_job()
+        with _working():
+            run(i)
 
 
 # ---------- worker processes (MIMI_HUB_PROCS > 1) ----------
@@ -1418,6 +1480,8 @@ def start():
         for k in range(WORKERS):
             threading.Thread(target=worker, daemon=True, name=f"mimi-worker-{k}").start()
     threading.Thread(target=segment_worker, daemon=True, name="mimi-segments").start()
+    if PRELOAD:
+        threading.Thread(target=warm, daemon=True, name="mimi-warm").start()
 
 
 @app.on_event("shutdown")
@@ -1427,6 +1491,26 @@ def stop():
 
 
 # ---------- HTTP ----------
+
+class _TokenPath:
+    """/t/<MIMI_HUB_TOKEN>/... served as /... with the token's Authorization header."""
+
+    def __init__(self, inner):
+        self.inner = inner
+
+    async def __call__(self, scope, receive, send):
+        if TOKEN and scope["type"] == "http" and scope["path"].startswith("/t/"):
+            given, _, rest = scope["path"][3:].partition("/")
+            if hmac.compare_digest(given, TOKEN):
+                path = "/" + rest
+                headers = [h for h in scope["headers"] if h[0] != b"authorization"]
+                scope = dict(scope, path=path, raw_path=path.encode(),
+                             headers=[*headers, (b"authorization", f"Bearer {TOKEN}".encode())])
+        await self.inner(scope, receive, send)
+
+
+app.add_middleware(_TokenPath)
+
 
 def auth(authorization):
     if TOKEN and authorization != f"Bearer {TOKEN}":
@@ -1474,6 +1558,26 @@ def upload(file: UploadFile = File(...), title: str = "", authorization: str | N
     if r.get("upload") != tmp:
         os.unlink(tmp)  # duplicate of an existing job
     return r
+
+
+@app.post("/v1/warm", status_code=202)
+def warm_up(authorization: str | None = Header(None)):
+    auth(authorization)
+    if _warm["models"] in ("cold", "failed"):
+        threading.Thread(target=warm, daemon=True, name="mimi-warm").start()
+    return {"models": "loading" if _warm["models"] == "cold" else _warm["models"]}
+
+
+@app.get("/v1/hold")
+async def hold(s: float = 60, authorization: str | None = Header(None)):
+    # async, so it can be cancelled: Modal cancels a request whose client is gone and kills the container if the
+    # handler doesn't stop within 30 s (a thread sleeping in a sync handler doesn't)
+    import asyncio
+    auth(authorization)
+    end = time.time() + min(max(s, 0), 3600)
+    while busy() and time.time() < end:
+        await asyncio.sleep(1)
+    return {"busy": busy()}
 
 
 @app.post("/v1/episodes/{i}/segments", status_code=202)
