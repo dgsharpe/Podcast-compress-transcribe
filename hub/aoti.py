@@ -20,11 +20,19 @@ import torch
 ROOT = Path(__file__).resolve().parent.parent
 DIR = Path(os.environ.get("MIMI_HUB_AOTI") or Path(os.environ.get("MIMI_HUB_MODELS", ROOT / "hub_models")) / "aoti")
 VERSION = 1  # bump when what a package is built from changes (wrappers, configs)
+# MIMI_HUB_AOTI_MARCH, e.g. x86-64-v3: build the packages' C++ for that CPU level instead of -march=native, so one
+# package serves every host that has it (Modal's vary; otherwise each new CPU type rebuilds, minutes on a cold start).
+# Inductor picks its vector instructions separately (AVX-512 where the building host has it: SIGILL on an AVX2 host),
+# so with MARCH also MIMI_HUB_AOTI_SIMDLEN bits (256, AVX2, x86-64-v3's).
+MARCH = os.environ.get("MIMI_HUB_AOTI_MARCH", "")
+SIMDLEN = int(os.environ.get("MIMI_HUB_AOTI_SIMDLEN", "256"))
 
 
 def _cpu():
     """The CPU, for the cache key: inductor builds a package's C++ with -march=native, so one built on another
-    CPU type can die with SIGILL here (Modal's hosts vary)."""
+    CPU type can die with SIGILL here (Modal's hosts vary). With MARCH, that level."""
+    if MARCH:
+        return f"march={MARCH} simdlen={SIMDLEN}"
     try:
         lines = Path("/proc/cpuinfo").read_text().split("\n\n")[0].splitlines()
         return " ".join(ln.split(":", 1)[1].strip() for ln in lines if ln.split(":")[0].strip() in ("model name",
@@ -59,6 +67,15 @@ def _toolchain():
             "hashlib.sha512(open(sys.argv[2], \"rb\").read()).hexdigest()))' \"$@\"\n")
         (shim / "openssl").chmod(0o755)
         os.environ["PATH"] = f"{shim}{os.pathsep}{os.environ.get('PATH', '')}"
+    if MARCH:  # inductor always passes -march=native: a compiler wrapper that swaps it
+        from torch._inductor import config
+        cxx = shutil.which(os.environ.get("CXX", "g++"))
+        shim = Path(tempfile.mkdtemp(prefix="mimi-cxx-")) / "g++"  # (inductor tells gcc from clang by --version)
+        shim.write_text(f'#!/bin/sh\nfor a; do shift; [ "$a" = -march=native ] && a=-march={MARCH}; '
+                        f'set -- "$@" "$a"; done\nexec {cxx} "$@"\n')
+        shim.chmod(0o755)
+        config.cpp.cxx = (None, str(shim))
+        config.cpp.simdlen = SIMDLEN
 
 
 def _no_exec_stack(package):

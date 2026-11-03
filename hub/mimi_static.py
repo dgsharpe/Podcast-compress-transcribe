@@ -44,7 +44,7 @@ class StaticMimiEncoder:
     """Streaming encode of [batch] streams [chunk_frames] Mimi frames (12.5 Hz) at a time:
     codes = encoder(chunk) for consecutive chunks of every stream; reset() starts new streams."""
 
-    def __init__(self, model, batch, chunk_frames, num_quantizers=32, dtype=torch.float16, graph=True):
+    def __init__(self, model, batch, chunk_frames, num_quantizers=32, dtype=torch.float16, graph=True, trt=False):
         enc = model.encoder
         self.model, self.enc, self.nq, self.dtype = model, enc, num_quantizers, dtype
         self.seanet, self.tr, self.down = enc.encoder_seanet, enc.encoder_transformer, enc.downsample
@@ -60,6 +60,11 @@ class StaticMimiEncoder:
             self.x = torch.zeros((batch, 1, self.samples), device=self.device)
         self.kv = None  # per layer: (keys, values), each (B, H, W, D)
         self.graph, self.use_graph = None, graph
+        # the SEANet as a TensorRT engine with its padding states as inputs / outputs (hub/trt_seanet.py)
+        self.trt = None
+        if trt:
+            from hub import trt_seanet
+            self.trt = trt_seanet.Engine(self.seanet, batch, self.samples, self.device)
 
     # ---- one chunk, eager (and as captured) ----
 
@@ -95,7 +100,7 @@ class StaticMimiEncoder:
 
     def _step(self):
         with torch.inference_mode(), torch.autocast(self.device.type, dtype=self.dtype, cache_enabled=False):
-            h = self.seanet(self.x, padding_cache=self.pad)
+            h = self.trt.step(self.x) if self.trt is not None else self.seanet(self.x, padding_cache=self.pad)
             h = self._transformer(h.transpose(1, 2))
             latents = self.down(h.transpose(1, 2), padding_cache=self.pad)
         with torch.inference_mode():
@@ -106,6 +111,8 @@ class StaticMimiEncoder:
     @torch.inference_mode()
     def reset(self):
         self.pad.reset()
+        if self.trt is not None:
+            self.trt.reset()
         self.pos.zero_()
         if self.kv is not None:
             for k, v in self.kv:
@@ -123,8 +130,11 @@ class StaticMimiEncoder:
         torch.cuda.current_stream().wait_stream(side)
         self.reset()
         self.graph = torch.cuda.CUDAGraph()
-        # thread_local: other threads may keep launching work (and allocating) while this one captures
-        with torch.cuda.graph(self.graph, capture_error_mode="thread_local"):
+        # thread_local: other threads may keep launching work (and allocating) while this one captures; on a stream
+        # no other graph was captured on, for a cuBLAS workspace of its own (hub/graph_stream.py)
+        from hub.graph_stream import capture_stream
+        self.capture_stream = capture_stream()
+        with torch.cuda.graph(self.graph, stream=self.capture_stream, capture_error_mode="thread_local"):
             self.codes = self._step()
         self.reset()
 

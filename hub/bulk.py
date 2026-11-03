@@ -1,6 +1,9 @@
 """Batch conversion: many episodes on one GPU at once, each model's work batched across episodes.
 
     python -m hub.bulk OUT_DIR AUDIO [AUDIO ...] [--prep N]      (files or URLs; ffmpeg on PATH)
+    python -m hub.bulk OUT_DIR --manifest episodes.json          ([{"id", "url"}, ...]: outputs named <id>)
+        [--no-compress]   no .mimi (and no Mimi at all): transcripts only, for the ad marks and the original audio
+        [--keep-source]   also the original audio as <id>.src, exactly the bytes processed
 
 The hub (hub/mimi_hub.py) runs one episode per job, so its GPU batches are one episode's: Mimi one stream (batch
 1), Parakeet up to 16 segments, pyannote 32 windows; filling a fast GPU took many processes, each with its own copy
@@ -36,6 +39,9 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(ROOT / "scripts"))
 os.environ.setdefault("HF_HUB_OFFLINE", "1")
+# .mimi files or not (--no-compress / MIMI_BULK_COMPRESS=0: transcripts only, no Mimi loaded): its own setting, not
+# the hub's MIMI_HUB_COMPRESS, which it sets to match before loading the hub's models
+COMPRESS = os.environ.get("MIMI_BULK_COMPRESS", "1") != "0"
 
 PIECE_FRAMES = int(os.environ.get("MIMI_BULK_PIECE_FRAMES", "3750"))  # 5 min of 12.5 Hz frames
 WARMUP_FRAMES = 250  # Mimi's transformer context (20 s)
@@ -48,14 +54,23 @@ MIMI_WORKERS = int(os.environ.get("MIMI_BULK_MIMI_WORKERS", "1"))  # threads, ea
 # hundreds of kernel launches (codes as transformers' streaming to ~98%: attention rounds a little differently).
 # auto: on NVIDIA (launch-bound there); the server's ROCm GPU is compute-bound and gained nothing.
 MIMI_GRAPH = os.environ.get("MIMI_BULK_MIMI_GRAPH", "auto")
+# ...with its SEANet as a TensorRT engine (hub/trt_seanet.py): an H100's Mimi step 38.3 -> 29.7 ms a chunk, the
+# codes decoding to audio as close to the original. auto: on for NVIDIA (cuDNN if TensorRT can't be set up)
+MIMI_TRT = os.environ.get("MIMI_BULK_MIMI_TRT", "auto")
 ASR_BATCH = int(os.environ.get("MIMI_BULK_ASR_BATCH", "64"))
 ASR_WORKERS = int(os.environ.get("MIMI_BULK_ASR_WORKERS", "2"))  # threads, each on its own CUDA stream
 # the TDT search as CUDA graphs (hub/parakeet_native.NativeTdtDecoder.decode_graphed): 16 steps per launch, the same
-# tokens and timestamps (548/548 segments). Off by default: on an H100 it was no faster than the eager search (590x
-# vs 789x end to end), and graphs captured at load hung on replay from the worker threads (on demand they didn't).
-ASR_GRAPH = os.environ.get("MIMI_BULK_ASR_GRAPH", "0")
+# tokens and timestamps (548/548 segments), decoding 2.7x faster; 1,024 episodes on one H100 1,754 -> 2,083x. They
+# used to hang the GPU beside Mimi's graph: both had been captured on one stream and so shared a cuBLAS workspace
+# (hub/graph_stream.py). auto: on for NVIDIA.
+ASR_GRAPH = os.environ.get("MIMI_BULK_ASR_GRAPH", "auto")
 DIAR_ROWS = int(os.environ.get("MIMI_BULK_DIAR_ROWS", "256"))  # segmentation / ResNet windows per GPU call
 DIAR_THREADS = int(os.environ.get("MIMI_BULK_DIAR_THREADS", "16"))
+# windows each diarization thread hands the batchers per call (pyannote's segmentation batch, the embedding batch:
+# 32 in the hub), and how long a batcher waits for more calls to merge: at 32 and 3 ms the batches averaged 41
+# (ResNet) and 79 (segmentation) windows of DIAR_ROWS, ~3x short of the models' large-batch speed
+DIAR_CALL = int(os.environ.get("MIMI_BULK_DIAR_CALL", "128"))
+BATCH_WAIT_S = float(os.environ.get("MIMI_BULK_BATCH_WAIT_MS", "10")) / 1000
 IN_FLIGHT = int(os.environ.get("MIMI_BULK_IN_FLIGHT", "32"))  # episodes prepared and not yet written
 
 
@@ -77,14 +92,52 @@ def _prep_init():
     _prep_models["features"] = NemoPreprocessorNumpy("nemo128")  # Parakeet TDT 0.6B v2's
 
 
-def _prep(src, spool):
+def _fetch(src, path):
+    """[src] (a URL) downloaded to [path], its tracking hops tried as the hub does: (url, MIME type, bytes)."""
+    import re
+    import shutil
+    import urllib.request
+    # as hub/mimi_hub.py's candidates() (not imported: a prep process doesn't load the hub): for a tracking-prefix
+    # chain (podtrac/pdst/pscrb/... URLs ending in .../real.host/path) the real host first, then the outer ones
+    parts = src.split("://", 1)[-1].split("/")
+    inner = ["https://" + "/".join(parts[k:]) for k in range(len(parts) - 2, 0, -1)
+             if "." in parts[k] and not re.search(r"\.(mp3|m4a|aac|ogg|opus|wav)$", parts[k], re.I)]
+    UA = {"User-Agent": "Mozilla/5.0 (mimi-hub)"}
+    err = None
+    for u in inner + [src]:
+        tmp = Path(f"{path}.part")
+        try:
+            with urllib.request.urlopen(urllib.request.Request(u, headers=UA), timeout=60) as r, open(tmp, "wb") as f:
+                ctype = r.headers.get_content_type()
+                shutil.copyfileobj(r, f, 1 << 20)
+            tmp.replace(path)
+            return u, ctype if ctype.startswith("audio/") else "audio/mpeg", Path(path).stat().st_size
+        except Exception as e:  # noqa: BLE001 - the next hop
+            tmp.unlink(missing_ok=True)
+            err = e
+    raise RuntimeError(f"cannot download {src}: {err}")
+
+
+def _prep(src, spool, keep=None):
     """Decode [src] to 24 kHz, resample to 16 kHz, find its speech (Silero VAD) and Parakeet's features of each
-    segment, as the hub does. The audio goes back in a spool file in [spool], the rest pickled."""
+    segment, as the hub does. The audio goes back in a spool file in [spool], the rest pickled. [keep]: download
+    the original there first and decode that (without a .mimi the app plays the original, and the hub serves or
+    re-fetches it, checking it's the same file by its size); None: ffmpeg reads [src] itself."""
     import uuid
     import numpy as np
     import soxr
     import mimi_file
     t = time.perf_counter()
+    source = {}
+    if keep is not None:
+        if str(src).startswith("http"):
+            url, ctype, n = _fetch(src, keep)
+        else:  # a local file
+            import shutil
+            shutil.copyfile(src, keep)
+            url, ctype, n = str(src), "audio/mpeg", Path(keep).stat().st_size
+        source = {"source_url": url, "source_type": ctype, "source_bytes": n, "source_path": str(keep)}
+        src = keep
     http = ["-user_agent", "Mozilla/5.0 (mimi-hub)"] if str(src).startswith("http") else []
     raw = subprocess.run(["ffmpeg", "-v", "error", *http, "-i", str(src), "-map", "0:a:0", "-ac", "1", "-ar",
                           str(mimi_file.SR), "-f", "f32le", "-"], capture_output=True, check=True).stdout
@@ -105,7 +158,7 @@ def _prep(src, spool):
         f, n = _prep_models["features"](w16[None, s:e].copy(), np.array([e - s]))
         feats.append((f[0], int(n[0])))  # (128, frames), valid frames
     return {"spool": str(path), "n24": n_frames * mimi_file.SPF, "n16": len(w16), "frames": n_frames,
-            "duration_s": len(w24) / mimi_file.SR, "segments": segments,
+            "duration_s": len(w24) / mimi_file.SR, "segments": segments, **source,
             "feats": feats, "prep_s": time.perf_counter() - t}
 
 
@@ -118,14 +171,14 @@ def _busy(name, t0):
     BUSY[name] = BUSY.get(name, 0.0) + time.perf_counter() - t0
 
 class Episode:
-    def __init__(self, src, out_dir, prep):
+    def __init__(self, src, out_dir, prep, name=None):
         import numpy as np
-        self.src, self.name = src, Path(str(src)).stem
+        self.src, self.name = src, name or Path(str(src)).stem
         self.out_dir, self.p = Path(out_dir), prep
         buf = np.load(prep["spool"], mmap_mode="r")
         self.w24, self.w16 = buf[:prep["n24"]], buf[prep["n24"]:]
-        self.codes = np.zeros((prep["frames"], 32), np.int64)
-        self.n_pieces = math.ceil(prep["frames"] / PIECE_FRAMES)
+        self.codes = np.zeros((prep["frames"], 32), np.int64) if COMPRESS else None
+        self.n_pieces = math.ceil(prep["frames"] / PIECE_FRAMES) if COMPRESS else 0
         self.asr = [None] * len(prep["segments"])
         self.lock = threading.Lock()
         self.left = {"mimi": self.n_pieces, "asr": len(self.asr)}
@@ -134,6 +187,8 @@ class Episode:
         self.turns, self.errors = [], []
         if not self.asr:
             self.done["asr"].set()
+        if not self.n_pieces:
+            self.done["mimi"].set()
 
     def fail(self, stage, e):
         """[stage] failed for this episode: it won't be written, and nothing waits on it."""
@@ -195,7 +250,8 @@ class Batcher:
                     with torch.cuda.stream(self.stream), torch.inference_mode():
                         for it in group:
                             self.stream.wait_event(it["ready"])
-                        y = self.fn(torch.cat([it["x"] for it in group]))
+                        with torch.profiler.record_function(f"stage:{self.name}"):  # for scripts/bulk_bench --profile
+                            y = self.fn(torch.cat([it["x"] for it in group]))
                         self.stream.synchronize()
                     k = 0
                     for it in group:
@@ -212,12 +268,13 @@ class Batcher:
 class Models:
     def __init__(self):
         import torch
+        os.environ["MIMI_HUB_COMPRESS"] = "1" if COMPRESS else "0"  # (the hub loads Mimi only when it compresses)
         from hub import mimi_hub, pyannote_gpu
         self.torch, self.hub = torch, mimi_hub
         m = mimi_hub.models()  # the hub's models and settings (fp16 weights, native encoder / decoder, ...)
         self.device = m["device"]
         assert self.device == "cuda", "hub/bulk.py needs a CUDA (or ROCm) GPU"
-        self.mimi, self.asr = m["mimi"], m["asr"].asr
+        self.mimi, self.asr = m.get("mimi"), m["asr"].asr
         from hub import parakeet_native
         if not isinstance(self.asr._decoding, parakeet_native.NativeTdtDecoder):
             # on ROCm the hub decodes on the CPU (it's GPU-bound); here that would all fall on this one process
@@ -228,17 +285,20 @@ class Models:
         pipe = pyannote_gpu.load(self.device, path=os.environ.get("TPUT_PYANNOTE_PATH"))
         mode = pyannote_gpu._frames_mode(torch.device(self.device))
         emb = pipe._embedding.model_
-        frames = Batcher(lambda fb: pyannote_gpu.resnet_frames(emb, fb, mode), DIAR_ROWS, name="bulk-resnet")
-        pyannote_gpu.FRAMES_FN = frames
+        # fbank + ResNet frames from the windows' audio, once per merged batch
+        frames = Batcher(lambda w: pyannote_gpu.wave_frames(emb, w, mode), DIAR_ROWS, BATCH_WAIT_S, name="bulk-resnet")
+        pyannote_gpu.WAVE_FRAMES_FN = frames
+        pyannote_gpu.BATCH_CHUNKS = DIAR_CALL
+        pipe.segmentation_batch_size = DIAR_CALL
         seg = pipe._segmentation.model
-        seg.forward = Batcher(seg.forward, DIAR_ROWS, name="bulk-segmentation")
+        seg.forward = Batcher(seg.forward, DIAR_ROWS, BATCH_WAIT_S, name="bulk-segmentation")
         self.pipe, self.batchers = pipe, {"resnet": frames, "segmentation": seg.forward}
         if ASR_GRAPH == "1" or (ASR_GRAPH == "auto" and not torch.version.hip):  # captured now, not mid-run
             for k in range(ASR_WORKERS):
                 self.asr._decoding.capture_graphs(k, max_batch=ASR_BATCH)
         self.mimi_static = []
         # one set per Mimi worker, captured now, before any worker runs on the GPU
-        if MIMI_GRAPH == "1" or (MIMI_GRAPH == "auto" and not torch.version.hip):
+        if COMPRESS and (MIMI_GRAPH == "1" or (MIMI_GRAPH == "auto" and not torch.version.hip)):
             from hub.mimi_static import StaticMimiEncoder
             L = PIECE_FRAMES + WARMUP_FRAMES
             assert L % CHUNK_FRAMES == 0, f"a piece ({L} frames) must be whole chunks of {CHUNK_FRAMES} for the graph"
@@ -246,7 +306,12 @@ class Models:
             for _ in range(MIMI_WORKERS):
                 encs = {}
                 for b in sizes:
-                    encs[b] = StaticMimiEncoder(self.mimi, b, CHUNK_FRAMES)
+                    trt = MIMI_TRT == "1" or (MIMI_TRT == "auto" and not torch.version.hip)
+                    try:
+                        encs[b] = StaticMimiEncoder(self.mimi, b, CHUNK_FRAMES, trt=trt)
+                    except Exception as e:  # noqa: BLE001 - no TensorRT / headers / build: cuDNN's convs
+                        print(f"bulk: Mimi without TensorRT: {type(e).__name__}: {e}"[:300], flush=True)
+                        encs[b] = StaticMimiEncoder(self.mimi, b, CHUNK_FRAMES)
                     encs[b].capture()
                 self.mimi_static.append(encs)
 
@@ -280,17 +345,18 @@ def mimi_worker(models, pieces, name="mimi", index=0):
             with torch.cuda.stream(stream):
                 xt = torch.from_numpy(x).pin_memory().to("cuda", non_blocking=True)[:, None]
                 out = []
-                if static is not None:
-                    static.reset()
-                    for c0 in range(0, L, CHUNK_FRAMES):
-                        out.append(static.encode(xt[..., c0 * spf:(c0 + CHUNK_FRAMES) * spf]).transpose(1, 2))
-                else:
-                    kv, pad = None, None
-                    for c0 in range(0, L, CHUNK_FRAMES):
-                        o = mimi_hub.mimi_encode(models.mimi, xt[..., c0 * spf:(c0 + CHUNK_FRAMES) * spf],
-                                                 encoder_past_key_values=kv, padding_cache=pad, use_streaming=True)
-                        kv, pad = o.encoder_past_key_values, o.padding_cache
-                        out.append(o.audio_codes.transpose(1, 2))  # (B, frames, 32)
+                with torch.profiler.record_function("stage:mimi"):  # for scripts/bulk_bench --profile
+                    if static is not None:
+                        static.reset()
+                        for c0 in range(0, L, CHUNK_FRAMES):
+                            out.append(static.encode(xt[..., c0 * spf:(c0 + CHUNK_FRAMES) * spf]).transpose(1, 2))
+                    else:
+                        kv, pad = None, None
+                        for c0 in range(0, L, CHUNK_FRAMES):
+                            o = mimi_hub.mimi_encode(models.mimi, xt[..., c0 * spf:(c0 + CHUNK_FRAMES) * spf],
+                                                     encoder_past_key_values=kv, padding_cache=pad, use_streaming=True)
+                            kv, pad = o.encoder_past_key_values, o.padding_cache
+                            out.append(o.audio_codes.transpose(1, 2))  # (B, frames, 32)
                 codes = torch.cat(out, dim=1).cpu().numpy()
         except Exception as e:  # noqa: BLE001
             for ep, _ in batch:
@@ -335,9 +401,11 @@ def asr_worker(models, segments, name="asr", slot=0):
             lens = torch.tensor([n for _, n in feats], dtype=torch.int64)
             try:
                 with torch.cuda.stream(stream):
-                    enc, enc_lens = encoder.encode(x, lens)
-                    found = (asr._decoding.decode_graphed(enc, enc_lens, slot) if graphed
-                             else asr._decoding(enc, enc_lens, need_logprobs=True))
+                    with torch.profiler.record_function("stage:asr-encode"):
+                        enc, enc_lens = encoder.encode(x, lens)
+                    with torch.profiler.record_function("stage:asr-decode"):
+                        found = (asr._decoding.decode_graphed(enc, enc_lens, slot) if graphed
+                                 else asr._decoding(enc, enc_lens, need_logprobs=True))
                     results = list(map(asr._decode_tokens, *zip(*found)))
             except Exception as e:  # noqa: BLE001
                 for ep, _ in batch:
@@ -375,9 +443,10 @@ def write_outputs(models, ep):
         ep.cues = 0
         ep.release()
         raise RuntimeError("; ".join(ep.errors))
-    meta = dict(title=ep.name, source=str(ep.src), id=ep.name, encoder="transformers MimiModel (hub/bulk.py)",
-                duration_s=ep.p["duration_s"])
-    mimi_file.write(ep.out_dir / f"{ep.name}.mimi", ep.codes, 32, meta)
+    if COMPRESS:
+        meta = dict(title=ep.name, source=str(ep.src), id=ep.name, encoder="transformers MimiModel (hub/bulk.py)",
+                    duration_s=ep.p["duration_s"])
+        mimi_file.write(ep.out_dir / f"{ep.name}.mimi", ep.codes, 32, meta)
     cues = [c for seg in ep.asr for c in hub.cues(seg)]
     hub.write_vtt(ep.out_dir / f"{ep.name}.vtt", cues, ep.turns)
     ep.t["written"] = time.perf_counter()
@@ -385,8 +454,11 @@ def write_outputs(models, ep):
     ep.release()
 
 
-def convert(sources, out_dir, prep_workers=None, models=None, log=print):
-    """Convert [sources] into [out_dir]; returns per-episode stats. [models]: a loaded Models (reused)."""
+def convert(sources, out_dir, prep_workers=None, models=None, log=print, names=None, keep_source=False):
+    """Convert [sources] into [out_dir]; returns per-episode stats. [models]: a loaded Models (reused); [names]:
+    {source: output name} (default: the source's file name without its extension); [keep_source]: also the
+    original as <name>.src (without COMPRESS it's downloaded first anyway, and dropped unless kept)."""
+    names = names or {}
     import multiprocessing
     import tempfile
     out_dir = Path(out_dir)
@@ -394,7 +466,7 @@ def convert(sources, out_dir, prep_workers=None, models=None, log=print):
     spool = tempfile.mkdtemp(prefix="mimi-bulk-spool-", dir=os.environ.get("MIMI_BULK_SPOOL"))
     models = models or Models()
     pieces, segments = queue.Queue(), queue.Queue()
-    for k in range(MIMI_WORKERS):
+    for k in range(MIMI_WORKERS if COMPRESS else 0):
         threading.Thread(target=mimi_worker, args=(models, pieces, f"mimi{k}", k), daemon=True,
                          name=f"bulk-mimi{k}").start()
     for k in range(ASR_WORKERS):
@@ -410,7 +482,9 @@ def convert(sources, out_dir, prep_workers=None, models=None, log=print):
                              mp_context=multiprocessing.get_context("spawn"), initializer=_prep_init) as pool:
         def submit(src):
             slots.acquire()  # bounds the episodes held in memory
-            return pool.submit(_prep, src, spool)
+            name = names.get(src) or Path(str(src)).stem
+            keep = (out_dir / f"{name}.src") if keep_source else (Path(spool) / f"{name}.src") if not COMPRESS else None
+            return pool.submit(_prep, src, spool, keep)
 
         futures = {}
         feeder = threading.Thread(target=lambda: [futures.setdefault(s, submit(s)) for s in sources], daemon=True)
@@ -420,11 +494,11 @@ def convert(sources, out_dir, prep_workers=None, models=None, log=print):
             while src not in futures:
                 time.sleep(0.01)
             try:
-                ep = Episode(src, out_dir, futures[src].result())
+                ep = Episode(src, out_dir, futures[src].result(), names.get(src))
             except Exception as e:  # noqa: BLE001 - e.g. a file ffmpeg can't read: skip it
                 slots.release()
                 log(f"{src}: {type(e).__name__}: {e}")
-                stats.append({"name": Path(str(src)).stem, "error": f"{type(e).__name__}: {e}"})
+                stats.append({"name": names.get(src) or Path(str(src)).stem, "error": f"{type(e).__name__}: {e}"[:500]})
                 continue
             for k in range(ep.n_pieces):
                 pieces.put((ep, k))
@@ -443,7 +517,11 @@ def convert(sources, out_dir, prep_workers=None, models=None, log=print):
             if w.exception():
                 stats.append({"name": ep.name, "error": "; ".join(ep.errors) or repr(w.exception())})
                 continue
+            if not keep_source and ep.p.get("source_path"):  # (downloaded for its size only)
+                Path(ep.p["source_path"]).unlink(missing_ok=True)
             stats.append({"name": ep.name, "duration_s": round(ep.p["duration_s"], 1), "errors": ep.errors,
+                          "compressed": COMPRESS, "source_kept": bool(keep_source and ep.p.get("source_path")),
+                          **{k: ep.p[k] for k in ("source_url", "source_type", "source_bytes") if k in ep.p},
                           "prep_s": round(ep.p["prep_s"], 2), "cues": ep.cues,
                           "speakers": len({t[2] for t in ep.turns}), "turns": ep.turns,
                           **{k: round(v - ep.t["start"], 2) for k, v in ep.t.items() if k != "start"}})
@@ -483,10 +561,20 @@ def convert(sources, out_dir, prep_workers=None, models=None, log=print):
 def main():
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     ap.add_argument("out_dir")
-    ap.add_argument("sources", nargs="+")
+    ap.add_argument("sources", nargs="*")
     ap.add_argument("--prep", type=int, default=None, help="CPU worker processes (default: half the cores)")
+    ap.add_argument("--manifest", default=None, help='JSON list of {"id", "url"}: outputs named <id>')
+    ap.add_argument("--no-compress", action="store_true", help="no .mimi: transcripts only (no Mimi loaded)")
+    ap.add_argument("--keep-source", action="store_true", help="also the original audio as <id>.src")
     a = ap.parse_args()
-    summary, stats = convert(a.sources, a.out_dir, a.prep)
+    global COMPRESS
+    COMPRESS = COMPRESS and not a.no_compress
+    sources, names = list(a.sources), {}
+    if a.manifest:
+        for e in json.loads(Path(a.manifest).read_text()):
+            sources.append(e["url"])
+            names[e["url"]] = e["id"]
+    summary, stats = convert(sources, a.out_dir, a.prep, names=names, keep_source=a.keep_source)
     for s in stats:
         print("EPISODE " + json.dumps({k: v for k, v in s.items() if k != "turns"}), flush=True)
     print("BULK " + json.dumps(summary), flush=True)
