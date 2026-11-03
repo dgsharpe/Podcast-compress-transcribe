@@ -58,12 +58,17 @@ billed) while it works, with ad detection through an OpenRouter key.
 ```sh
 pip install modal && modal setup
 modal secret create mimi-hub MIMI_HUB_TOKEN=$(python3 -c 'import secrets; print(secrets.token_urlsafe(32))') \
-  OPENROUTER_API_KEY=<your key> [HF_TOKEN=<token>]   # HF_TOKEN: pyannote's speaker labels (below)
+  [OPENROUTER_API_KEY=<your key>] [HF_TOKEN=<token>]   # both optional: below
 modal deploy hub/modal_app.py       # prints https://<workspace>--mimi-hub-serve.<region>.modal.run
 ```
 
 In the app, Settings > Advanced > Mimi server: `https://<workspace>--mimi-hub-serve.<region>.modal.run/t/<token>`
 (`modal secret` doesn't show the token again: keep it). The app wakes the server when it comes to the foreground.
+
+- **Ad detection:** either the server's own `OPENROUTER_API_KEY` (in the secret), or none there and the app's
+  Settings > Advanced > Mimi server > OpenRouter key, sent with each conversion (`X-OpenRouter-Key`) and held only
+  in the server's memory until that episode's ads are found. Episodes whose detection failed for want of a key are
+  redone when one arrives.
 
 - **First start:** converts the models and compiles their kernels, ~5-10 min, kept on the `mimi-hub-models` Volume.
 - **Cold start after that** (L40S, the default): the server answers in ~8 s and has its models loaded at ~45 s. A

@@ -1,13 +1,14 @@
 """mimi-hub as your own server on Modal: a GPU only while it works (it scales to zero), ad detection through an
 OpenRouter key; no machine or subscription of your own.
 
-    modal secret create mimi-hub MIMI_HUB_TOKEN=<a long random string> OPENROUTER_API_KEY=<key> [HF_TOKEN=<token>]
+    modal secret create mimi-hub MIMI_HUB_TOKEN=<a long random string> [OPENROUTER_API_KEY=<key>] [HF_TOKEN=<token>]
     modal deploy hub/modal_app.py              -> https://<workspace>--mimi-hub-serve.<region>.modal.run
 
 then in the app, Settings > Advanced > Mimi server: that URL followed by /t/<the token> (the app sends no header;
 hub/mimi_hub.py takes the token from the path). The server refuses to start without one: its URL is public. The first start converts the models and compiles their kernels (several minutes, kept on
 the mimi-hub-models Volume); a cold start after that loads them, and the client's POST /v1/warm when it opens hides
-most of it. Episodes, transcripts and .mimi files live on the mimi-hub-data Volume.
+most of it. Episodes, transcripts and .mimi files live on the mimi-hub-data Volume. Without OPENROUTER_API_KEY in
+the secret, ad detection uses the key the app sends with each conversion (X-OpenRouter-Key; held in memory only).
 
 Diarization (speaker labels): pyannote's community-1 on the GPU if it's available: it's gated, so accept its
 conditions on huggingface.co and put HF_TOKEN in the secret (downloaded once to the models Volume), or keep a copy

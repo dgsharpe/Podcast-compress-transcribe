@@ -5,6 +5,7 @@ POST /v1/warm until the models are ready, then a conversion as a client about to
 
 Prints the warm-up time, then for the episode: time to the first audio bytes, to "ready" and to its ad segments,
 and the record's stage timings. --no-warm: request the episode straight away (a cold start without warm-up).
+With OPENROUTER_API_KEY in the environment, it's sent with the request (X-OpenRouter-Key) for the ad detection.
 """
 import json
 import os
@@ -21,8 +22,11 @@ URL = ("https://www.podtrac.com/pts/redirect.mp3/pdst.fm/e/pscrb.fm/rss/p/mgln.a
 
 
 def call(base, path, body=None, timeout=600):
+    headers = {"Content-Type": "application/json"}
+    if body is not None and os.environ.get("OPENROUTER_API_KEY"):
+        headers["X-OpenRouter-Key"] = os.environ["OPENROUTER_API_KEY"]
     req = urllib.request.Request(base + path, data=None if body is None else json.dumps(body).encode(),
-                                 headers={"Content-Type": "application/json"},
+                                 headers=headers,
                                  method="GET" if body is None else "POST")
     with urllib.request.urlopen(req, timeout=timeout) as r:
         return json.load(r)

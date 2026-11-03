@@ -6,6 +6,9 @@ Optional auth: set MIMI_HUB_TOKEN; clients then send `Authorization: Bearer <tok
 /t/<token>/v1/... is /v1/... with the token sent (for a client that's only given a server URL, as the app is).
 
 API (JSON unless noted):
+  Any request that queues work may carry the client's own OpenRouter key, `X-OpenRouter-Key: <key>`: used for that
+  episode's ad detection instead of the server's OPENROUTER_API_KEY, held in memory only (not in the record or on
+  disk), dropped once the detection has run. Sent for an episode whose detection failed (no key), it re-runs it.
   POST /v1/convert {"url": ...[, "id", "title", "priority"]}  enqueue (priority 0 = about to be streamed,
                                                 jumps the queue). The URL may be a direct audio URL or a Pocket
                                                 Casts share link (pca.st / pocketcasts.com), which is resolved to
@@ -1247,9 +1250,18 @@ def run(i):
 seg_jobs: "queue.Queue" = queue.Queue()
 
 
+_client_keys = {}  # episode id -> the OpenRouter key its client sent (X-OpenRouter-Key), until its ads are found
+
+
+def _take_key(i, key):
+    if key and key.strip():
+        _client_keys[i] = key.strip()
+
+
 def queue_segments(i, cues=None):
     """Detect [i]'s ads / self-promotion from [cues] ([(start_s, end_s, speaker or None, text)]), else its VTT."""
     if segments.SEGMENTER.strip().lower() in ("", "off"):
+        _client_keys.pop(i, None)
         update(i, segments_state="off")
         return
     update(i, segments_state="pending")
@@ -1290,7 +1302,9 @@ def _segment(i, cues):
     try:
         if cues is None:
             cues = segments.read_cues((DATA / f"{i}.vtt").read_text())
-        res = segments.detect(cues, log=lambda m: print(f"[{i}] {m}", flush=True))
+        key = _client_keys.pop(i, None)
+        res = segments.detect(cues, log=lambda m: print(f"[{i}] {m}", flush=True),
+                              keys={"OPENROUTER_API_KEY": key} if key else None)
         tmp = DATA / f"{i}.segments.json.tmp"
         tmp.write_text(json.dumps(res, indent=1))
         tmp.replace(DATA / f"{i}.segments.json")
@@ -1531,7 +1545,8 @@ class ConvertRequest(BaseModel):
 
 
 @app.post("/v1/convert", status_code=202)
-def convert(req: ConvertRequest, authorization: str | None = Header(None)):
+def convert(req: ConvertRequest, authorization: str | None = Header(None),
+            x_openrouter_key: str | None = Header(None)):
     auth(authorization)
     try:
         i, audio, title = resolve(req.url.strip())
@@ -1540,12 +1555,26 @@ def convert(req: ConvertRequest, authorization: str | None = Header(None)):
     if req.id:
         check_id(req.id)
         i = req.id
-    return enqueue(i, priority=min(1, max(0, req.priority)), keep_source=req.keep_source, url=req.url,
-                   audio_url=audio, title=req.title or title)
+    _take_key(i, x_openrouter_key)
+    r = enqueue(i, priority=min(1, max(0, req.priority)), keep_source=req.keep_source, url=req.url,
+                audio_url=audio, title=req.title or title)
+    return _retry_segments(r, x_openrouter_key)
+
+
+def _retry_segments(r, key):
+    """An episode whose ad detection failed, now with a key: run it again."""
+    if key and r and r.get("state") == "ready" and r.get("segments_state") == "failed":
+        _take_key(r["id"], key)
+        queue_segments(r["id"])
+        return load(r["id"])
+    if r and (r.get("state") == "ready" and r.get("segments_state") != "pending"):
+        _client_keys.pop(r["id"], None)  # nothing will use it
+    return r
 
 
 @app.post("/v1/upload", status_code=202)
-def upload(file: UploadFile = File(...), title: str = "", authorization: str | None = Header(None)):
+def upload(file: UploadFile = File(...), title: str = "", authorization: str | None = Header(None),
+           x_openrouter_key: str | None = Header(None)):
     auth(authorization)
     h = hashlib.sha1()
     fd, tmp = tempfile.mkstemp(prefix="mimi-upload-", dir=DATA)
@@ -1554,10 +1583,11 @@ def upload(file: UploadFile = File(...), title: str = "", authorization: str | N
             h.update(chunk)
             f.write(chunk)
     i = "u" + h.hexdigest()[:15]
+    _take_key(i, x_openrouter_key)
     r = enqueue(i, url="upload:" + (file.filename or ""), upload=tmp, title=title or file.filename or i)
     if r.get("upload") != tmp:
         os.unlink(tmp)  # duplicate of an existing job
-    return r
+    return _retry_segments(r, x_openrouter_key)
 
 
 @app.post("/v1/warm", status_code=202)
@@ -1581,12 +1611,13 @@ async def hold(s: float = 60, authorization: str | None = Header(None)):
 
 
 @app.post("/v1/episodes/{i}/segments", status_code=202)
-def redo_segments(i: str, authorization: str | None = Header(None)):
+def redo_segments(i: str, authorization: str | None = Header(None), x_openrouter_key: str | None = Header(None)):
     auth(authorization)
     check_id(i)
     r = load(i)
     if not r or r["state"] != "ready":
         raise HTTPException(409, "episode not ready")
+    _take_key(i, x_openrouter_key)
     queue_segments(i)
     return load(i)
 

@@ -15,6 +15,8 @@ per episode.
         openrouter:<model id>[+<effort>] (OpenRouter's API, key in OPENROUTER_API_KEY; effort low .. xhigh as
             its reasoning.effort); e.g. openrouter:anthropic/claude-haiku-5.5, openrouter:inception/mercury-3
         inception:<model id> (Inception Labs' API, key in INCEPTION_API_KEY); e.g. inception:mercury-3
+        An API key can also come with the call (detect(..., keys={"OPENROUTER_API_KEY": ...}): a client's own,
+        which the hub holds in memory only); it takes precedence over the environment's.
 
 Against judged ground truths (2026-11-02; scripts/ads_truth.py): 13 episodes the v2 prompt was written from (50
 breaks) and 11 fresh shows (48), with the v2 prompt: Haiku 5.5 through OpenRouter all 98, nothing extra, edges a
@@ -35,6 +37,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 
 SEGMENTER = os.environ.get("MIMI_HUB_SEGMENTER",
@@ -210,13 +213,20 @@ _OPENAI_COMPAT = {"openrouter": ("https://openrouter.ai/api/v1/chat/completions"
                   "inception": ("https://api.inceptionlabs.ai/v1/chat/completions", "INCEPTION_API_KEY")}
 
 
+_keys = threading.local()  # this thread's detect() call's own API keys (keys=)
+
+
+def _key(var):
+    return (getattr(_keys, "value", None) or {}).get(var) or os.environ.get(var)
+
+
 def _chat(backend, model, flags, prompt):
     import urllib.request
     # uv's Python doesn't know NixOS's CA bundle (as hub/mimi_hub.py; this may run on its own)
     if not os.environ.get("SSL_CERT_FILE") and os.path.exists("/etc/ssl/certs/ca-certificates.crt"):
         os.environ["SSL_CERT_FILE"] = "/etc/ssl/certs/ca-certificates.crt"
     url, var = _OPENAI_COMPAT[backend]
-    key = os.environ.get(var)
+    key = _key(var)
     if not key:
         raise RuntimeError(f"{var} not set")
     body = {"model": model, "messages": [{"role": "user", "content": prompt}]}
@@ -281,7 +291,7 @@ def _choices(segmenter):
     """The [segmenter] list's entries, without API backends whose key isn't set (unless that leaves none)."""
     every = [c.strip() for c in segmenter.split(",") if c.strip()]
     keyed = [c for c in every if c.partition(":")[0] not in _OPENAI_COMPAT
-             or os.environ.get(_OPENAI_COMPAT[c.partition(":")[0]][1])]
+             or _key(_OPENAI_COMPAT[c.partition(":")[0]][1])]
     return keyed or every
 
 
@@ -313,11 +323,16 @@ def _finish(found, cues):
     return segs
 
 
-def detect(cues, segmenter=SEGMENTER, log=print, prompt=None):
-    """Skip ranges for [cues]: {"model", "segments": [{"start", "end", "kind", "label", "first", "last"}]}."""
+def detect(cues, segmenter=SEGMENTER, log=print, prompt=None, keys=None):
+    """Skip ranges for [cues]: {"model", "segments": [{"start", "end", "kind", "label", "first", "last"}]}.
+    [keys]: API keys for this call ({"OPENROUTER_API_KEY": ...}), before the environment's."""
     lines = [_line(i, c) for i, c in enumerate(cues)]
     t0 = time.time()
-    used, found = _ask(segmenter, lines, log, prompt)
+    _keys.value = keys
+    try:
+        used, found = _ask(segmenter, lines, log, prompt)
+    finally:
+        _keys.value = None
     segs = _finish(found, cues)
     log(f"segments: {len(segs)} via {used} in {time.time() - t0:.0f} s")
     return {"model": used, "segments": segs}
