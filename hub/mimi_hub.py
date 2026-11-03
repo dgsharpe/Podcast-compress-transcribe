@@ -2,9 +2,13 @@
 
 Serve on the Tailscale address only, e.g.
     uv run uvicorn hub.mimi_hub:app --host <tailscale-ip> --port 8765
-Optional auth: set MIMI_HUB_TOKEN; clients then send `Authorization: Bearer <token>`.
+Optional auth: set MIMI_HUB_TOKEN; clients then send `Authorization: Bearer <token>`, or put it in the URL:
+/t/<token>/v1/... is /v1/... with the token sent (for a client that's only given a server URL, as the app is).
 
 API (JSON unless noted):
+  Any request that queues work may carry the client's own OpenRouter key, `X-OpenRouter-Key: <key>`: used for that
+  episode's ad detection instead of the server's OPENROUTER_API_KEY, held in memory only (not in the record or on
+  disk), dropped once the detection has run. Sent for an episode whose detection failed (no key), it re-runs it.
   POST /v1/convert {"url": ...[, "id", "title", "priority"]}  enqueue (priority 0 = about to be streamed,
                                                 jumps the queue). The URL may be a direct audio URL or a Pocket
                                                 Casts share link (pca.st / pocketcasts.com), which is resolved to
@@ -30,15 +34,40 @@ then keeps its source); records say "compressed": false.
                                                 "label"}]}, seconds); the record's "segments_state" says
                                                 pending | ready | failed | off. See hub/segments.py.
   POST /v1/episodes/{id}/segments               re-run that detection
+  GET  /v1/episodes/{id}.summary.json           an executive summary (MIMI_HUB_SUMMARIZER; off by default), made after
+                                                the ad detection by a request of its own (Haiku 5.5): {"model",
+                                                "summary": HTML of <h4> <p> <ul> <ol> <li> <strong> <em> only}; the
+                                                record's "summary_state" says pending | ready | failed (absent: none
+                                                asked for). .summary.html: the HTML (no scripts: CSP); .summary.txt:
+                                                its text.
+  POST /v1/episodes/{id}/summary                make (or remake) it, e.g. for an episode from before summaries
+  GET  /v1/features                             what this hub does: {"compress", "segments", "summaries", "remote"}
   GET  /v1/episodes                             all jobs, newest first
+  POST /v1/warm                                 load the models now (in the background) and run each once, so the
+                                                next episode starts at full speed: {"models": cold | loading | ready
+                                                | failed}. A client calls it when it opens; MIMI_HUB_PRELOAD=1 does
+                                                it at startup (hub/modal_app.py, a server that scales to zero),
+                                                which then stays up MIMI_HUB_WARM_LINGER_S (30) for the client.
+  GET  /v1/hold?s=60                            returns once nothing is converting or waiting (or after s seconds):
+                                                a request in flight keeps a serverless container (Modal) alive
+                                                while the work it started in the background runs.
 Files live in $MIMI_HUB_DATA (default neural_audio/hub_data/): <id>.mimi, <id>.vtt, <id>.segments.json, <id>.json.
+
+A remote GPU (MIMI_HUB_REMOTE: another hub's URL, e.g. hub/modal_app.py's, with /t/<token> or its token in
+MIMI_HUB_REMOTE_TOKEN_FILE): jobs this hub can't start
+right away (MIMI_HUB_REMOTE_WHEN=busy, the default: every local worker busy; priority: also every priority-0 job;
+always) are converted there and copied back; this hub keeps the library, the clients and the ad detection (its own
+LLM logins), and relays the remote's .mimi while it's being made. A job the remote fails is redone here.
 
 GPU: run in .venv-rocm (hub/setup_rocm.sh; hub/serve.sh picks it) and the Mimi encoder and Parakeet's encoder run on
 the Radeon 8060S (MIMI_HUB_DEVICE=auto | cuda | cpu). Diarization and Parakeet's decoding loop stay on the CPU.
 """
 
+import atexit
+import contextlib
 import gzip
 import hashlib
+import hmac
 import itertools
 import json
 import os
@@ -62,6 +91,16 @@ from pydantic import BaseModel
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "scripts"))
+
+# Settings from a file too (KEY=value a line, # comments; the environment wins): MIMI_HUB_ENV_FILE, default
+# ~/.config/mimi-hub/hub.env. For a service whose unit is generated (home-manager) or settings kept out of it.
+_env_file = Path(os.environ.get("MIMI_HUB_ENV_FILE", Path.home() / ".config/mimi-hub/hub.env"))
+if _env_file.is_file():
+    for _ln in _env_file.read_text().splitlines():
+        _k, _eq, _v = _ln.strip().partition("=")
+        if _eq and _k and not _k.startswith("#"):
+            os.environ.setdefault(_k.strip(), _v.strip())
+
 import mimi_file  # noqa: E402
 
 from hub import segments  # noqa: E402
@@ -72,6 +111,10 @@ if not os.environ.get("SSL_CERT_FILE") and os.path.exists("/etc/ssl/certs/ca-cer
 
 # MIOpen (ROCm's conv library) otherwise tunes every new input shape exhaustively; Parakeet's batches all differ
 os.environ.setdefault("MIOPEN_FIND_MODE", "FAST")
+# torch.compile's kernels (MIMI_HUB_COMPILE) kept across restarts: the first start compiles (Parakeet's encoder took
+# 4.5 min on the server's CPU), later ones load from here
+os.environ.setdefault("TORCHINDUCTOR_CACHE_DIR", str(Path(os.environ.get("MIMI_HUB_MODELS", ROOT / "hub_models"))
+                                                     / "inductor-cache"))
 
 DATA = Path(os.environ.get("MIMI_HUB_DATA", ROOT / "hub_data"))
 DEVICE = os.environ.get("MIMI_HUB_DEVICE", "auto")
@@ -140,6 +183,13 @@ def update(i, **kw):
 
 
 def enqueue(i, priority=1, keep_source=False, **fields):
+    r = _enqueue(i, priority, keep_source, **fields)
+    if priority == 0 and r.get("state") == "queued":
+        queue_source(i)
+    return r
+
+
+def _enqueue(i, priority=1, keep_source=False, **fields):
     """Queue job i (priority 0 = someone is streaming it, 1 = download / background). [keep_source]: keep the
     original audio as processed and serve it (.src)."""
     keep_source = keep_source or not COMPRESS  # without a .mimi, clients play the original
@@ -165,13 +215,71 @@ def enqueue(i, priority=1, keep_source=False, **fields):
 
 def fetch_source(url, i):
     """Download [url] to <id>.src; its MIME type."""
-    path, tmp = DATA / f"{i}.src", DATA / f"{i}.src.tmp"
+    # a temporary file of its own: two fetches of one episode (processing, and an early fetch) never share one
+    path, tmp = DATA / f"{i}.src", DATA / f"{i}.src.{os.getpid()}-{threading.get_ident()}.tmp"
     req = urllib.request.Request(url, headers=UA)
-    with urllib.request.urlopen(req, timeout=60) as resp, open(tmp, "wb") as f:
-        ctype = resp.headers.get_content_type()
-        shutil.copyfileobj(resp, f, 1 << 20)
-    tmp.replace(path)
+    try:
+        with urllib.request.urlopen(req, timeout=60) as resp, open(tmp, "wb") as f:
+            ctype = resp.headers.get_content_type()
+            shutil.copyfileobj(resp, f, 1 << 20)
+        tmp.replace(path)
+    finally:
+        tmp.unlink(missing_ok=True)
     return ctype if ctype.startswith("audio/") else "audio/mpeg"
+
+
+def get_source(i, r):
+    """Download job i's audio (the first readable of its candidate URLs) to <id>.src and mark it source_ready."""
+    err = None
+    for u in candidates(r["audio_url"]):  # skip tracking hops that are unreachable
+        try:
+            probe(u)
+            break
+        except Exception as e:
+            err = e
+    else:
+        raise RuntimeError(f"cannot read source: {err}")
+    ctype = fetch_source(u, i)
+    path = DATA / f"{i}.src"
+    update(i, source_ready=True, source_type=ctype, source_bytes=path.stat().st_size, source_url=u)
+    return str(path)
+
+
+# A client about to download an episode (priority 0) waits a few minutes for its source, and processing may be hours
+# away behind a backlog. So the source is fetched as soon as the episode is queued; processing later uses that copy,
+# and the client's download lines up with the transcript and ad segments whenever they arrive.
+src_jobs: "queue.Queue" = queue.Queue()
+
+
+def queue_source(i):
+    src_jobs.put(i)
+
+
+def source_worker():
+    while True:
+        i = src_jobs.get()
+        with lock:
+            r = load(i)
+            if (not r or r["state"] != "queued" or not r.get("keep_source") or not r.get("audio_url")
+                    or r.get("source_ready") or r.get("source_fetching")):
+                continue
+            save(dict(r, source_fetching=time.time()))
+        t0 = time.time()
+        try:
+            get_source(i, r)
+            print(f"source: fetched {i} ahead of processing in {time.time() - t0:.0f} s", flush=True)
+        except Exception as e:
+            print(f"source: fetching {i} ahead of processing failed ({e}); processing will try again", flush=True)
+        finally:
+            update(i, source_fetching=None)
+
+
+def await_source_fetch(i):
+    """Wait for an in-flight early fetch of job i's source (so processing doesn't fetch a second, different copy:
+    dynamically inserted ads differ between downloads). As long as it runs: its reads time out after 60 s, it clears
+    source_fetching when it ends, and start() clears it after a restart."""
+    while (r := load(i)) and r.get("source_fetching"):
+        time.sleep(1)
 
 
 # ---------- URL resolution ----------
@@ -219,19 +327,69 @@ _models = {}
 _models_lock = threading.Lock()
 
 
-def models():
+def models(vad_workers=True):
+    """The loaded models; [vad_workers]: also start MIMI_HUB_VAD_SHARDS' processes (not before a memory snapshot,
+    hub/modal_app.py: started after its restore)."""
     with _models_lock:  # jobs starting together on a fresh hub must not see half-loaded models
         if not _models:
             _models.update(_load_models())
+        if vad_workers and _vad_pool is None:
+            t = time.time()
+            _vad_workers()  # (MIMI_HUB_VAD_SHARDS) started with the models, not by the first episode
+            _stage("VAD worker processes", t)
     return _models
+
+
+def _stage(what, t0):
+    """A startup stage's time, logged (where a cold start goes)."""
+    print(f"startup: {what} {time.time() - t0:.1f} s", flush=True)
+    return time.time()
+
+
+_warm = {"models": "cold"}  # cold | loading | ready | failed (POST /v1/warm)
+_warm_lock = threading.Lock()
+PRELOAD = os.environ.get("MIMI_HUB_PRELOAD", "0") == "1"
+# after POST /v1/warm, busy() for this long: a server that scales to zero (hub/modal_app.py) stays up while the client
+# that woke it picks an episode, though it otherwise scales down seconds after its last job
+WARM_LINGER_S = float(os.environ.get("MIMI_HUB_WARM_LINGER_S", "30"))
+_linger_until = [0.0]
+
+
+def warm(vad_workers=True):
+    """Load the models and run the lazily loaded and first-call-slow parts once (pyannote, ASR) on noise."""
+    with _warm_lock:
+        if _warm["models"] in ("loading", "ready"):
+            return
+        _warm["models"] = "loading"
+    t0 = time.time()
+    try:
+        import numpy as np
+        m = models(vad_workers)
+        t = _stage("models", t0)
+        noise = (0.05 * np.random.default_rng(0).standard_normal(16000 * 30)).astype(np.float32)
+        diarize(noise)
+        t = _stage("diarizer loaded and run", t)
+        list(m["asr"].recognize(noise, sample_rate=16000))
+        _stage("ASR run", t)
+        _warm["models"] = "ready"
+        print(f"warm: models ready in {time.time() - t0:.1f} s", flush=True)
+    except Exception:
+        traceback.print_exc()
+        _warm["models"] = "failed"
 
 
 def _load_models():
     m = {}
+    t = time.time()
     import onnx_asr
     import onnxruntime as ort
+    import threadpoolctl
     import torch
     torch.set_num_threads(THREADS)
+    # onnx_asr computes Parakeet's features with NumPy on the CPU, and OpenBLAS's default (a spin-waiting thread
+    # per core) turned their small matrix products into most of the hub's CPU use: ASR 47 -> 19 CPU-ms per audio
+    # second on the server with one BLAS thread, at the same speed
+    threadpoolctl.threadpool_limits(int(os.environ.get("MIMI_HUB_BLAS_THREADS", "1")), user_api="blas")
     if DEVICE != "auto":
         dev = DEVICE
     elif torch.cuda.is_available():
@@ -239,13 +397,20 @@ def _load_models():
     else:  # Apple silicon: the GPU through Metal
         dev = "mps" if torch.backends.mps.is_available() else "cpu"
     m["device"] = dev
-    m["mimi"] = mimi_file.load_model(dev)
+    t = _stage("imports", t)
+    if COMPRESS:  # (MIMI_HUB_COMPRESS=0: transcripts and ad marks only, no .mimi: no Mimi either)
+        m["mimi"] = mimi_file.load_model(dev)
+    if "mimi" in m and MIMI_FP16 and dev != "cpu":  # the encoder's conv / linear weights as autocast uses them: the same codes
+        from hub.autocast_weights import half_weights
+        half_weights(m["mimi"].encoder)
+    t = _stage("Mimi", t)
     # onnxruntime's default spin-waiting threads starve torch's: on a 15 min clip (scripts/bench_overlap.py)
     # ASR alone went 50 -> 31 s with spinning off, and encode || ASR 87 -> 39 s
     so = ort.SessionOptions()
     so.intra_op_num_threads = THREADS
     so.add_session_config_entry("session.intra_op.allow_spinning", "0")
     asr = onnx_asr.load_model(ASR_MODEL, sess_options=so)
+    t = _stage("onnx_asr Parakeet (ONNX sessions)", t)
     if dev != "cpu":
         try:
             # hub/parakeet_native.py. Checked against NVIDIA's NeMo encoder on real batches: native matches to
@@ -254,7 +419,14 @@ def _load_models():
             if os.environ.get("MIMI_HUB_ASR_ENCODER", "native") == "native":
                 from hub import parakeet_native
                 model_dir = parakeet_native.convert(ASR_MODEL, MODELS_DIR / f"{ASR_MODEL}-hf")
-                asr.asr._encoder = parakeet_native.NativeEncoder(parakeet_native.load(model_dir, dev))
+                # its linear / conv weights in fp16, as autocast uses them: identical output, 1.2 GB less GPU memory
+                encoder = parakeet_native.load(model_dir, dev, half=True)
+                t = _stage("Parakeet encoder (native, to the GPU)", t)
+                # compiled ahead of time (hub/aoti.py, fixed-length buckets): 1.7x on an H100; with the ResNet's
+                # (hub/pyannote_gpu.py) torch.compile took the server's pipeline 86 -> 99x. MIMI_HUB_COMPILE.
+                from hub import aoti
+                asr.asr._encoder = parakeet_native.NativeEncoder(encoder, compile=aoti.mode(dev))
+                t = _stage("Parakeet encoder AOT packages", t)
                 # identical tokens and timestamps to onnx_asr's loop (548/548 segments of a 43.8 min episode;
                 # scripts/parakeet_decoder_check.py). It frees the CPU: on Modal's L40S (CPU-bound) pipeline
                 # throughput went 214 -> 268x, on an M5 Mac 43 -> 47x; the server (ROCm) is GPU-bound and ~3%
@@ -264,6 +436,7 @@ def _load_models():
                     asr.asr._decoding = parakeet_native.NativeTdtDecoder(
                         path, dev, asr.asr._blank_idx, asr.asr._vocab_size,
                         max_symbols=asr.asr._max_tokens_per_step)
+                    t = _stage("Parakeet decoder", t)
             elif dev == "cuda":
                 asr.asr._encoder = TorchEncoder(parakeet_encoder())
         except Exception:
@@ -286,6 +459,7 @@ def _load_models():
     if ASR_BUCKET > 1:
         vad.recognize_batch = types.MethodType(_bucketed_recognize_batch, vad)
     m["asr"] = asr.with_vad(vad).with_timestamps()
+    _stage("VAD", t)
     return m
 
 
@@ -462,8 +636,9 @@ _diar_lock = threading.Lock()
 def _pyannote_turns(wav16):
     import torch
     from hub import pyannote_gpu
-    if "diar_pyannote" not in _models:  # from the HF cache; no token at runtime
+    if "diar_pyannote" not in _models:  # from the HF cache (or MIMI_HUB_PYANNOTE_PATH, a copy); no token at runtime
         _models["diar_pyannote"] = pyannote_gpu.load(_models.get("device", "cpu"),
+                                                     path=os.environ.get("MIMI_HUB_PYANNOTE_PATH") or None,
                                                      segmentation_device=os.environ.get("MIMI_HUB_SEG_DEVICE") or None)
     out = _models["diar_pyannote"]({"waveform": torch.from_numpy(wav16)[None], "sample_rate": 16000})
     ann = getattr(out, "speaker_diarization", out)
@@ -506,12 +681,18 @@ def diarize(wav16):
                 traceback.print_exc()  # e.g. pyannote missing or its model not cached: use sherpa
         if segs is None:
             segs, name = _sherpa_turns(wav16), SHERPA_NAME
+    return number_turns(segs), name
+
+
+def number_turns(segs):
+    """A diarizer's [(start_s, end_s, label)] as the hub keeps them: speakers with under DIAR_MIN_TALK_S in all
+    merged into the nearest kept turn's, then numbered 1.. by first appearance."""
     total = {}
     for a, b, k in segs:
         total[k] = total.get(k, 0.0) + b - a
     keep = [(a, b, k) for a, b, k in segs if total[k] >= DIAR_MIN_TALK_S]
     if not keep:
-        return [], name
+        return []
     out = []
     for a, b, k in segs:
         if total[k] < DIAR_MIN_TALK_S:  # fragment: take the speaker of the nearest kept turn
@@ -520,7 +701,19 @@ def diarize(wav16):
     number = {}
     for _, _, k in out:
         number.setdefault(k, len(number) + 1)
-    return [(a, b, number[k]) for a, b, k in out], name
+    return [(a, b, number[k]) for a, b, k in out]
+
+
+def write_vtt(path, all_cues, turns):
+    """[all_cues] ([(start_s, end_s, text)]) as a WebVTT file, each cue voiced by its speaker in [turns]."""
+    tmp = Path(path).with_suffix(".vtt.tmp")
+    with open(tmp, "w") as f:
+        f.write("WEBVTT\n\n")
+        for a, b, text in all_cues:
+            text = text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+            who = speaker_for(a, b, turns)
+            f.write(f"{vtt_time(a)} --> {vtt_time(b)}\n{f'<v Speaker {who}>' if who else ''}{text}\n\n")
+    tmp.replace(path)
 
 
 def speaker_for(a, b, turns):
@@ -756,9 +949,33 @@ _vad_pre = threading.local()  # (n_samples, probabilities) for the VAD call of t
 STREAM_ASR = os.environ.get("MIMI_HUB_STREAM_ASR", "0") == "1"
 STREAM_WINDOW = int(os.environ.get("MIMI_HUB_STREAM_WINDOW", "64"))
 
+# For one episode on a GPU with room to spare (a cloud H100: the hub's order left it waiting on one CPU thread for
+# ~10 of a 43 min episode's 15 s): diarization starts as soon as the audio is resampled (~1 s), on its own CUDA
+# stream, alongside the VAD and ASR (streamed, as STREAM_ASR), instead of after them. Same speakers; streamed ASR
+# batches segments differently, which moved a few close calls (2 43 min episodes: 3 / 5 of ~900 cues, 99.97% of words
+# the same). On the server (GPU-bound) a 43 min upload was ready 26.5 -> 24.5 s.
+LATENCY = os.environ.get("MIMI_HUB_LATENCY", "0") == "1"
+# Silero VAD in this many worker processes (hub/vad_shard.py; 0: one thread, frame by frame, identical to onnx_asr):
+# 4.6 s -> ~0.4 s for a 43 min episode on the server; the transcript of the reference was word for word the same.
+# Latency mode's default 16.
+VAD_SHARDS = int(os.environ.get("MIMI_HUB_VAD_SHARDS", "16" if LATENCY else "0"))
+_vad_pool = None
+
+
+def _vad_workers():
+    global _vad_pool
+    if _vad_pool is None and VAD_SHARDS > 1:
+        from hub import vad_shard
+        _vad_pool = vad_shard.pool(VAD_SHARDS)
+        atexit.register(_vad_pool.shutdown, wait=False, cancel_futures=True)
+        list(_vad_pool.map(abs, range(VAD_SHARDS)))  # started (and their sessions loaded) now, not by an episode
+    return _vad_pool
+
 
 class _StreamPrep:
-    """[pcm] at 16 kHz, and SileroVad._encode's per-frame probabilities of it, as ffmpeg decodes it (a thread)."""
+    """[pcm] at 16 kHz, and SileroVad._encode's per-frame probabilities of it, as ffmpeg decodes it: one thread
+    resamples, another runs the VAD behind it (wav16() is ready as soon as the resampling is, ~1 s for a 43 min
+    episode; the VAD, one ONNX call per 32 ms, takes ~5 s more)."""
 
     END = object()
 
@@ -767,21 +984,58 @@ class _StreamPrep:
         self.pcm, self.cond, self.vad, self.sr, self.hop, self.ctx = pcm, cond, vad, sr, hop, ctx
         self.w = np.empty(int(len(pcm.buf) * sr / mimi_file.SR) + 1024, np.float32)
         self.n = 0  # samples written
-        self.length = None  # the final number of samples, once decoded
+        self.length = None  # the final number of samples, once resampled
         self.probs = []
         self.q = queue.Queue()
-        self.finished = threading.Event()
-        threading.Thread(target=self._run, daemon=True, name="mimi-prep").start()
+        self.grown = threading.Condition()  # w / n / length changed
+        self.resampled, self.finished = threading.Event(), threading.Event()
+        self.failed = False
+        threading.Thread(target=self._resample, daemon=True, name="mimi-resample").start()
+        threading.Thread(target=self._vad, daemon=True, name="mimi-vad").start()
 
-    def _run(self):
+    def _resample(self):
         import numpy as np
         import soxr
         try:
-            pcm, cond, hop, ctx = self.pcm, self.cond, self.hop, self.ctx
+            pcm, cond = self.pcm, self.cond
             rs = soxr.ResampleStream(mimi_file.SR, self.sr, 1, dtype="float32", quality="HQ")
+            pos = 0
+            while True:
+                with cond:
+                    while pcm.avail - pos < mimi_file.SR and not pcm.done:
+                        cond.wait(1.0)
+                    done, avail = pcm.done, pcm.avail
+                if done and pcm.error:
+                    self.failed = True
+                    return
+                y = rs.resample_chunk(pcm.buf[pos:avail], last=done)
+                pos = avail
+                with self.grown:
+                    if self.n + len(y) > len(self.w):
+                        self.w = np.concatenate([self.w, np.empty(self.n + len(y) - len(self.w) + self.sr,
+                                                                  np.float32)])
+                    self.w[self.n:self.n + len(y)] = y
+                    self.n += len(y)
+                    if done:
+                        self.length = self.n
+                    self.grown.notify_all()
+                if done:
+                    return
+        finally:
+            with self.grown:
+                self.failed = self.failed or self.length is None
+                self.grown.notify_all()
+            self.resampled.set()
+
+    def _vad(self):
+        if _vad_workers() is not None:
+            return self._vad_sharded()
+        import numpy as np
+        try:
+            hop, ctx = self.hop, self.ctx
             state = np.zeros((2, 1, 128), dtype=np.float32)
             srs = np.array([self.sr], dtype=np.int64)
-            pos, next_frame = 0, -1  # -1: the first (left-padded) frame; k >= 0: w[448 + 512 k:][:576]
+            next_frame = -1  # -1: the first (left-padded) frame; k >= 0: w[448 + 512 k:][:576]
 
             def vad_run(frame):
                 nonlocal state
@@ -790,39 +1044,80 @@ class _StreamPrep:
                 self.q.put(o[0, 0])
 
             while True:
-                with cond:
-                    while pcm.avail - pos < mimi_file.SR and not pcm.done:
-                        cond.wait(1.0)
-                    done, avail = pcm.done, pcm.avail
-                if done and pcm.error:
-                    return
-                y = rs.resample_chunk(pcm.buf[pos:avail], last=done)
-                pos = avail
-                if self.n + len(y) > len(self.w):
-                    self.w = np.concatenate([self.w, np.empty(self.n + len(y) - len(self.w) + self.sr, np.float32)])
-                self.w[self.n:self.n + len(y)] = y
-                self.n += len(y)
-                if next_frame == -1 and self.n >= hop:
-                    vad_run(np.pad(self.w[:hop], (ctx, 0)))
+                with self.grown:
+                    # frame -1 needs the first hop samples, frame k >= 0 hop x (k + 2)
+                    while not self.failed and self.length is None and self.n < hop * (next_frame + 2):
+                        self.grown.wait(1.0)
+                    if self.failed:
+                        return
+                    w, n, length = self.w, self.n, self.length
+                if next_frame == -1 and n >= hop:
+                    vad_run(np.pad(w[:hop], (ctx, 0)))
                     next_frame = 0
-                while next_frame >= 0 and hop - ctx + hop * next_frame + ctx + hop <= self.n:
+                while next_frame >= 0 and hop - ctx + hop * next_frame + ctx + hop <= n:
                     a = hop - ctx + hop * next_frame
-                    vad_run(self.w[a:a + ctx + hop])
+                    vad_run(w[a:a + ctx + hop])
                     next_frame += 1
-                if done:
+                if length is not None and n == length:
                     break
-            if next_frame >= 0 and (last := self.n % hop):
-                vad_run(np.pad(self.w[self.n - last - ctx:self.n], (0, hop - last)))
+            if next_frame >= 0 and (last := n % hop):
+                vad_run(np.pad(w[n - last - ctx:n], (0, hop - last)))
             # as SileroVad._encode's output; under one frame: let the VAD do it all
             self.probs = np.array(self.probs, dtype=np.float32) if next_frame >= 0 else None
-            self.length = self.n
         finally:
             self.q.put(self.END)
             self.finished.set()
 
+    def _vad_sharded(self):
+        """As _vad, in hub/vad_shard.py's shards, each sent to a worker as soon as its audio is here."""
+        import numpy as np
+        from hub import vad_shard as vs
+        pending = queue.Queue()  # the shards' futures, in order
+
+        def collect():
+            try:
+                parts = []
+                while (f := pending.get()) is not None:
+                    probs = f.result()
+                    parts.append(probs)
+                    for p in probs:
+                        self.q.put(p)
+                self.probs = np.concatenate(parts) if parts else None
+            except Exception:
+                traceback.print_exc()
+                self.probs = None
+            finally:
+                self.q.put(self.END)
+                self.finished.set()
+        threading.Thread(target=collect, daemon=True, name="mimi-vad-collect").start()
+        try:
+            i0 = 0
+            while True:
+                i1 = i0 + vs.SHARD_FRAMES
+                with self.grown:  # until this shard's audio is here, or all of it is
+                    while not self.failed and self.length is None and self.n < vs.samples_for(i1):
+                        self.grown.wait(1.0)
+                    if self.failed:
+                        return
+                    w, n, length = self.w, self.n, self.length
+                if length is not None:
+                    i1 = min(i1, vs.n_frames(length))
+                if i0 >= i1:
+                    return
+                a = max(0, i0 - vs.WARM_FRAMES)
+                pending.put(_vad_pool.submit(vs._run, vs.frames(w, n, a, i1), i0 - a))
+                i0 = i1
+        finally:
+            pending.put(None)
+
     def wav16(self):
-        self.finished.wait()
+        """The resampled audio, once all of it is (the VAD may still be running)."""
+        self.resampled.wait()
         return self.w[:self.n]
+
+    def vad_probs(self):
+        self.finished.wait()
+        return self.probs
 
     def stream(self):
         """The probabilities as they come."""
@@ -891,10 +1186,34 @@ def transcribe(m, pcm, cond, out, on_cues=None):
         mark = out.get("mark", lambda k: None)
         prep = _StreamPrep(pcm, cond, m["asr"].vad) if STREAM_VAD else None
         streamed = None
+        diar_on_gpu = m.get("device", "cpu") != "cpu" and DIARIZER in ("auto", "pyannote")
+        if prep is not None and LATENCY:
+            wav16 = prep.wav16()
+            if pcm.error or prep.failed:
+                return  # the encoder reports it
+            mark("decoded")  # resampled (the VAD still running)
+
+            def speakers_early():
+                import torch
+                try:
+                    with torch.cuda.stream(torch.cuda.Stream()) if diar_on_gpu else contextlib.nullcontext():
+                        out["turns"], out["diarization"] = diarize(wav16)
+                except Exception:
+                    traceback.print_exc()
+                    out["turns"], out["diarization"] = [], None
+            d = threading.Thread(target=speakers_early, daemon=True, name="mimi-diarize")
+            d.start()
+            out["cues"] = [c for s in _stream_recognize(m["asr"], prep) for c in cues(s)]
+            mark("asr")
+            if on_cues:
+                on_cues(out["cues"])
+            d.join()
+            mark("diar")
+            return
         if prep is not None and STREAM_ASR:
             streamed = _stream_recognize(m["asr"], prep)  # done shortly after the download
         if prep is not None:
-            wav16, probs = prep.wav16(), prep.probs
+            wav16, probs = prep.wav16(), prep.vad_probs()
         else:
             with cond:
                 while not pcm.done:
@@ -916,7 +1235,6 @@ def transcribe(m, pcm, cond, out, on_cues=None):
         # this way the cues, and so ad detection, are ready sooner. Even for one episode alone: run alongside ASR,
         # a 43 min episode was ready 3 s sooner but its ad marks 14 s later and its .mimi 19 s later
         # (scripts/episode_timeline.py). sherpa (CPU) runs alongside.
-        diar_on_gpu = m.get("device", "cpu") != "cpu" and DIARIZER in ("auto", "pyannote")
         d = threading.Thread(target=speakers, daemon=True, name="mimi-diarize")
         if not diar_on_gpu:
             d.start()
@@ -957,6 +1275,12 @@ def run(i):
         update(i, state="downloading", progress=0.0)
         if upload:
             src, dur = upload, probe(upload)
+        elif r.get("keep_source"):  # process exactly the bytes the client will get
+            await_source_fetch(i)
+            r = load(i)
+            kept = DATA / f"{i}.src"
+            src = str(kept) if r.get("source_ready") and kept.exists() else get_source(i, r)
+            dur = probe(src)
         else:
             src, dur, err = None, None, None
             for u in candidates(r["audio_url"]):  # skip tracking hops that are unreachable
@@ -967,14 +1291,11 @@ def run(i):
                     err = e
             if src is None or dur is None:
                 raise RuntimeError(f"cannot read source: {err}")
-            if r.get("keep_source"):  # process exactly the bytes the client will get
-                ctype = fetch_source(src, i)
-                url, src = src, str(DATA / f"{i}.src")
-                dur = probe(src)
-                update(i, source_ready=True, source_type=ctype, source_bytes=os.path.getsize(src), source_url=url)
         mark("probed")
         n_frames = int(dur * FPS) + 13  # + ~1 s: ffprobe estimates can run short; the tail is padded
-        compress = r.get("compressed", COMPRESS)
+        # (a job queued while the hub compressed, resumed after a restart with MIMI_HUB_COMPRESS=0: not compressed now,
+        # as there's no Mimi loaded)
+        compress = COMPRESS and r.get("compressed", True)
         # transcription and diarization start once the whole episode is decoded (ffmpeg is far ahead of the
         # encoder) and run alongside the encode
         tx = {"mark": mark}
@@ -1016,13 +1337,7 @@ def run(i):
         if "cues" not in tx:
             raise pcm.error or RuntimeError("transcription did not run")
         all_cues, turns = tx["cues"], tx["turns"]
-        with open(DATA / f"{i}.vtt.tmp", "w") as f:
-            f.write("WEBVTT\n\n")
-            for a, b, text in all_cues:
-                text = text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
-                who = speaker_for(a, b, turns)
-                f.write(f"{vtt_time(a)} --> {vtt_time(b)}\n{f'<v Speaker {who}>' if who else ''}{text}\n\n")
-        (DATA / f"{i}.vtt.tmp").replace(DATA / f"{i}.vtt")
+        write_vtt(DATA / f"{i}.vtt", all_cues, turns)
         mark("ready")
         with lock:  # merged: ad detection may have added its time already
             rec = load(i)
@@ -1055,10 +1370,21 @@ def run(i):
 seg_jobs: "queue.Queue" = queue.Queue()
 
 
+_client_keys = {}  # episode id -> the OpenRouter key its client sent (X-OpenRouter-Key), until its ads are found
+
+
+def _take_key(i, key):
+    if key and key.strip():
+        _client_keys[i] = key.strip()
+
+
 def queue_segments(i, cues=None):
     """Detect [i]'s ads / self-promotion from [cues] ([(start_s, end_s, speaker or None, text)]), else its VTT."""
-    if segments.SEGMENTER.strip().lower() in ("", "off"):
+    if segments.SEGMENTER.strip().lower() in ("", "off") or (load(i) or {}).get("no_segments"):
+        key = _client_keys.pop(i, None)
         update(i, segments_state="off")
+        if not (load(i) or {}).get("no_segments"):  # (no ad detection here: a summary of the whole transcript)
+            queue_summary(i, key, [], cues)
         return
     update(i, segments_state="pending")
     if _events is not None:  # in a worker process: the main process runs the (one) segment worker
@@ -1067,39 +1393,90 @@ def queue_segments(i, cues=None):
     seg_jobs.put((i, cues))
 
 
+_active = [0]  # conversions and ad detections in progress (busy())
+_active_lock = threading.Lock()
+
+
+@contextlib.contextmanager
+def _working():
+    with _active_lock:
+        _active[0] += 1
+    try:
+        yield
+    finally:
+        with _active_lock:
+            _active[0] -= 1
+
+
+# ---------- executive summaries (MIMI_HUB_SUMMARIZER: a request of their own after the ads, at low priority) ----------
+
+sum_jobs: "queue.Queue" = queue.Queue()
+
+
+def queue_summary(i, key=None, found=None, cues=None):
+    """[i]'s summary, after its ads ([found]; else its .segments.json) are known. [key]: the client's OpenRouter key,
+    kept in memory until it's made (for the fallback after the claude login)."""
+    if not segments.SUMMARIES:
+        return
+    update(i, summary_state="pending", summary_error=None)
+    sum_jobs.put((i, key, found, cues))
+
+
+def summary_worker():
+    while True:
+        i, key, found, cues = sum_jobs.get()
+        with _working():
+            try:
+                cues = cues or segments.read_cues((DATA / f"{i}.vtt").read_text())
+                if found is None and (DATA / f"{i}.segments.json").exists():
+                    found = json.loads((DATA / f"{i}.segments.json").read_text())["segments"]
+                res = segments.summarize(cues, found, log=lambda m: print(f"[{i}] {m}", flush=True),
+                                         keys={"OPENROUTER_API_KEY": key} if key else None)
+                tmp = DATA / f"{i}.summary.json.tmp"
+                tmp.write_text(json.dumps(res, indent=1))
+                tmp.replace(DATA / f"{i}.summary.json")
+                update(i, summary_state="ready", summary_model=res["model"], summary_error=None)
+            except Exception as e:
+                traceback.print_exc()
+                update(i, summary_state="failed", summary_error=f"{type(e).__name__}: {e}"[:500])
+
+
+def busy():
+    """Anything converting, detecting ads, warming up or waiting to, or a client that has just woken the server
+    (GET /v1/hold)."""
+    return (_active[0] > 0 or not jobs.empty() or not seg_jobs.empty() or not sum_jobs.empty()
+            or _warm["models"] == "loading"
+            or time.time() < _linger_until[0])
+
+
 def segment_worker():
     while True:
         i, cues = seg_jobs.get()
-        try:
-            if cues is None:
-                cues = segments.read_cues((DATA / f"{i}.vtt").read_text())
-            res = segments.detect(cues, log=lambda m: print(f"[{i}] {m}", flush=True))
-            tmp = DATA / f"{i}.segments.json.tmp"
-            tmp.write_text(json.dumps(res, indent=1))
-            tmp.replace(DATA / f"{i}.segments.json")
-            with lock:
-                r = load(i)
-                timing = dict(r.get("timing") or {})
-                if r.get("timing_start"):
-                    timing["segments"] = round(time.time() - r["timing_start"], 2)
-                save(dict(r, segments_state="ready", segments=len(res["segments"]), segments_model=res["model"],
-                          skippable_s=round(sum(s["end"] - s["start"] for s in res["segments"]), 1), timing=timing))
+        with _working():
+            _segment(i, cues)
 
-            if segments.SUMMARIZER.strip().lower() not in ("", "off", "0", "false"):
-                try:
-                    update(i, summary_state="pending")
-                    sum_res = segments.summarize(cues, res.get("segments"), log=lambda m: print(f"[{i}] {m}", flush=True))
-                    stmp = DATA / f"{i}.summary.json.tmp"
-                    stmp.write_text(json.dumps(sum_res, indent=1))
-                    stmp.replace(DATA / f"{i}.summary.json")
-                    (DATA / f"{i}.summary.html").write_text(sum_res["summary"])
-                    update(i, summary_state="ready", summary_model=sum_res["model"])
-                except Exception as se:
-                    traceback.print_exc()
-                    update(i, summary_state="failed", summary_error=f"{type(se).__name__}: {se}"[:500])
-        except Exception as e:
-            traceback.print_exc()
-            update(i, segments_state="failed", segments_error=f"{type(e).__name__}: {e}"[:500])
+
+def _segment(i, cues):
+    try:
+        if cues is None:
+            cues = segments.read_cues((DATA / f"{i}.vtt").read_text())
+        key = _client_keys.pop(i, None)
+        res = segments.detect(cues, log=lambda m: print(f"[{i}] {m}", flush=True),
+                              keys={"OPENROUTER_API_KEY": key} if key else None)
+        queue_summary(i, key, res["segments"], cues)
+        tmp = DATA / f"{i}.segments.json.tmp"
+        tmp.write_text(json.dumps(res, indent=1))
+        tmp.replace(DATA / f"{i}.segments.json")
+        with lock:
+            r = load(i)
+            timing = dict(r.get("timing") or {})
+            if r.get("timing_start"):
+                timing["segments"] = round(time.time() - r["timing_start"], 2)
+            save(dict(r, segments_state="ready", segments=len(res["segments"]), segments_model=res["model"],
+                      skippable_s=round(sum(s["end"] - s["start"] for s in res["segments"]), 1), timing=timing))
+    except Exception as e:
+        traceback.print_exc()
+        update(i, segments_state="failed", segments_error=f"{type(e).__name__}: {e}"[:500])
 
 
 _seq = itertools.count()
@@ -1115,18 +1492,180 @@ def _requeue(i):
 def _take_job():
     """The next queued job's id (highest priority first), marked starting."""
     while True:
-        _, _, i = jobs.get()
+        prio, _, i = jobs.get()
         with lock:
             r = load(i)
             if not r or r["state"] != "queued":
                 continue  # duplicate entry (re-queued at a higher priority) or already handled
-            save(dict(r, state="starting"))
+            if _for_remote(prio, r):  # the remote GPU's (MIMI_HUB_REMOTE_WHEN always / priority)
+                jobs.put((prio, next(_seq), i))
+                claimed = True
+            else:
+                save(dict(r, state="starting"))
+                claimed = False
+        if claimed:
+            time.sleep(0.5)
+            continue
         return i
+
+
+def _for_remote(prio, r):
+    return (bool(REMOTE) and (REMOTE_WHEN == "always" or (REMOTE_WHEN == "priority" and prio == 0))
+            and bool(_remote_ok(r)))
+
+
+_local_jobs = [0]  # local workers running a job (the remote takes jobs when they're all busy)
 
 
 def worker():
     while True:
-        run(_take_job())
+        i = _take_job()
+        with _active_lock:
+            _local_jobs[0] += 1
+        try:
+            with _working():
+                run(i)
+        finally:
+            with _active_lock:
+                _local_jobs[0] -= 1
+
+
+# ---------- a remote GPU (MIMI_HUB_REMOTE: another hub, e.g. hub/modal_app.py on Modal) ----------
+
+REMOTE = os.environ.get("MIMI_HUB_REMOTE", "").strip().rstrip("/")  # with /t/<token> if it has one, or:
+if REMOTE and os.environ.get("MIMI_HUB_REMOTE_TOKEN_FILE"):  # its token from a file (not in the settings)
+    REMOTE += "/t/" + Path(os.environ["MIMI_HUB_REMOTE_TOKEN_FILE"]).expanduser().read_text().strip()
+REMOTE_WHEN = os.environ.get("MIMI_HUB_REMOTE_WHEN", "busy")  # busy | priority | always | off
+REMOTE_JOBS = int(os.environ.get("MIMI_HUB_REMOTE_JOBS", "2"))  # at once (Modal's hub: one container, 2 workers)
+# POST /v1/warm passed on to the remote: by default only when it takes jobs a client may be waiting for
+REMOTE_WARM = os.environ.get("MIMI_HUB_REMOTE_WARM", "1" if REMOTE_WHEN in ("priority", "always") else "0") != "0"
+_remote_jobs = [0]
+
+
+def _remote_ok(r):
+    """Jobs the remote can do: an episode by URL, compressed (uploads and kept sources stay here)."""
+    return (r and not r.get("upload") and not r.get("keep_source") and COMPRESS and r.get("compressed", True)
+            and not r.get("remote_failed"))
+
+
+def _remote_wants():
+    if not REMOTE or REMOTE_WHEN == "off" or _remote_jobs[0] >= REMOTE_JOBS:
+        return False
+    with jobs.mutex:
+        head = jobs.queue[0] if jobs.queue else None
+    if head is None:
+        return False
+    return (REMOTE_WHEN == "always" or (REMOTE_WHEN == "priority" and head[0] == 0)
+            or _local_jobs[0] >= WORKERS)
+
+
+def _remote_open(path, body=None, headers=None, timeout=60):
+    """urllib (not httpx: its versions' APIs differ between the hub's environments)."""
+    data = None if body is None else json.dumps(body).encode()
+    h = {"Content-Type": "application/json", **UA, **(headers or {})}
+    return urllib.request.urlopen(urllib.request.Request(REMOTE + path, data=data, headers=h), timeout=timeout)
+
+
+def _remote(method, path, body=None, timeout=60):
+    try:
+        with _remote_open(path, {} if method == "POST" and body is None else body, timeout=timeout) as r:
+            return json.load(r)
+    except urllib.error.HTTPError as e:
+        if e.code == 404:
+            return None
+        raise
+
+
+def remote_worker():
+    while True:
+        if not _remote_wants():
+            time.sleep(0.5)
+            continue
+        try:
+            prio, _, i = jobs.get(timeout=1)
+        except queue.Empty:
+            continue
+        with lock:
+            r = load(i)
+            if not r or r["state"] != "queued":
+                continue
+            if not _remote_ok(r):  # back for a local worker
+                jobs.put((prio, next(_seq), i))
+                time.sleep(1)
+                continue
+            save(dict(r, state="starting", remote=REMOTE.split("/t/")[0]))
+        with _active_lock:
+            _remote_jobs[0] += 1
+        try:
+            with _working():
+                run_remote(i)
+        finally:
+            with _active_lock:
+                _remote_jobs[0] -= 1
+
+
+def run_remote(i):
+    """Job [i] converted by the remote and copied here, then its ads found here; redone locally if that fails."""
+    r = load(i)
+    t0 = time.time()
+    update(i, timing_start=t0, timing={})
+    try:
+        _remote("POST", "/v1/convert", {"url": r.get("audio_url") or r["url"], "id": i, "title": r.get("title"),
+                                        "priority": r.get("priority", 1), "segments": False})
+        last = None
+        while True:
+            s = _remote("GET", f"/v1/episodes/{i}")
+            if s is None:
+                raise RuntimeError("the remote lost the job")
+            if s["state"] == "failed":
+                raise RuntimeError(f"remote: {s.get('error')}")
+            if s["state"] == "ready":
+                break
+            mirror = (s["state"], s.get("progress"))
+            if mirror != last:  # its progress, for clients polling this hub
+                fields = {k: s[k] for k in ("duration_s", "mimi_bytes") if s.get(k)}
+                update(i, state=s["state"] if s["state"] != "queued" else "starting", progress=s.get("progress", 0.0),
+                       remote_state=s["state"], **fields)
+                last = mirror
+            time.sleep(1)
+        for ext in ("vtt", "mimi"):  # the .mimi last: once it's a plain file here, it's served from here
+            tmp = DATA / f"{i}.{ext}.remote"
+            with _remote_open(f"/v1/episodes/{i}.{ext}", timeout=300) as resp, open(tmp, "wb") as f:
+                shutil.copyfileobj(resp, f, 1 << 20)
+            tmp.replace(DATA / f"{i}.{ext}")
+        with lock:
+            rec = load(i)
+            save(dict(rec, state="ready", progress=1.0, remote_state="ready", asr=s.get("asr"),
+                      device=f"remote: {s.get('device')}", duration_s=s.get("duration_s"),
+                      mimi_bytes=(DATA / f"{i}.mimi").stat().st_size, speakers=s.get("speakers"),
+                      diarization=s.get("diarization"), compressed=True,
+                      timing={**(s.get("timing") or {}), "copied": round(time.time() - t0, 2)}))
+        queue_segments(i)
+    except Exception as e:
+        traceback.print_exc()
+        for ext in ("vtt", "mimi"):
+            (DATA / f"{i}.{ext}.remote").unlink(missing_ok=True)
+        print(f"[{i}] remote failed ({type(e).__name__}: {e}); converting here", flush=True)
+        with lock:
+            rec = load(i)
+            save(dict(rec, state="queued", progress=0.0, remote_failed=True, remote_error=f"{type(e).__name__}: {e}"[:300]))
+        jobs.put((rec.get("priority", 1), next(_seq), i))
+
+
+def proxy_remote(i, rng):
+    """The remote's .mimi for job [i] while it's being made there, passed through (Range and all)."""
+    try:
+        resp = _remote_open(f"/v1/episodes/{i}.mimi", headers={"Range": rng} if rng else None, timeout=120)
+    except urllib.error.HTTPError as e:
+        raise HTTPException(e.code, "remote: not ready") from None
+    keep = ("content-range", "content-length", "accept-ranges", "content-type")
+    headers = {k: v for k, v in resp.headers.items() if k.lower() in keep}
+
+    def body():
+        with resp:
+            while chunk := resp.read1(1 << 16):
+                yield chunk
+    return StreamingResponse(body(), status_code=resp.status, headers=headers)
 
 
 # ---------- worker processes (MIMI_HUB_PROCS > 1) ----------
@@ -1257,12 +1796,16 @@ _procs = None
 def start():
     for p in sorted(record_paths(), key=lambda p: p.stat().st_mtime):
         r = json.loads(p.read_text())
-        if r.get("state") not in ("ready", "failed"):  # resume interrupted jobs from scratch
+        if r["state"] not in ("ready", "failed"):  # resume interrupted jobs from scratch
             (DATA / f"{r['id']}.mimi").unlink(missing_ok=True)  # partial, preallocated: never serve it
-            save(dict(r, state="queued", progress=0.0))
+            save(dict(r, state="queued", progress=0.0, source_fetching=None))
             jobs.put((r.get("priority", 1), next(_seq), r["id"]))
+            if r.get("priority", 1) == 0:
+                queue_source(r["id"])
         elif r["state"] == "ready" and r.get("segments_state") not in ("ready", "failed", "off"):
             queue_segments(r["id"])  # converted before segment detection existed, or interrupted
+        elif r["state"] == "ready" and r.get("summary_state") == "pending":
+            queue_summary(r["id"])  # interrupted (episodes from before summaries: POST /v1/episodes/{id}/summary)
     global _procs
     if PROCS > 1:
         _procs = _Procs(PROCS)
@@ -1273,7 +1816,15 @@ def start():
     else:
         for k in range(WORKERS):
             threading.Thread(target=worker, daemon=True, name=f"mimi-worker-{k}").start()
+    if REMOTE and REMOTE_WHEN != "off":
+        for k in range(REMOTE_JOBS):
+            threading.Thread(target=remote_worker, daemon=True, name=f"mimi-remote-{k}").start()
     threading.Thread(target=segment_worker, daemon=True, name="mimi-segments").start()
+    threading.Thread(target=summary_worker, daemon=True, name="mimi-summaries").start()
+    for k in range(2):
+        threading.Thread(target=source_worker, daemon=True, name=f"mimi-source-{k}").start()
+    if PRELOAD:
+        threading.Thread(target=warm, daemon=True, name="mimi-warm").start()
 
 
 @app.on_event("shutdown")
@@ -1283,6 +1834,26 @@ def stop():
 
 
 # ---------- HTTP ----------
+
+class _TokenPath:
+    """/t/<MIMI_HUB_TOKEN>/... served as /... with the token's Authorization header."""
+
+    def __init__(self, inner):
+        self.inner = inner
+
+    async def __call__(self, scope, receive, send):
+        if TOKEN and scope["type"] == "http" and scope["path"].startswith("/t/"):
+            given, _, rest = scope["path"][3:].partition("/")
+            if hmac.compare_digest(given, TOKEN):
+                path = "/" + rest
+                headers = [h for h in scope["headers"] if h[0] != b"authorization"]
+                scope = dict(scope, path=path, raw_path=path.encode(),
+                             headers=[*headers, (b"authorization", f"Bearer {TOKEN}".encode())])
+        await self.inner(scope, receive, send)
+
+
+app.add_middleware(_TokenPath)
+
 
 def auth(authorization):
     if TOKEN and authorization != f"Bearer {TOKEN}":
@@ -1300,10 +1871,12 @@ class ConvertRequest(BaseModel):
     title: str | None = None
     priority: int = 1  # 0: a client is about to stream it
     keep_source: bool = False  # also keep and serve the original audio (GET .src)
+    segments: bool = True  # False: no ad detection here (a hub using this one as its remote GPU does its own)
 
 
 @app.post("/v1/convert", status_code=202)
-def convert(req: ConvertRequest, authorization: str | None = Header(None)):
+def convert(req: ConvertRequest, authorization: str | None = Header(None),
+            x_openrouter_key: str | None = Header(None)):
     auth(authorization)
     try:
         i, audio, title = resolve(req.url.strip())
@@ -1312,12 +1885,27 @@ def convert(req: ConvertRequest, authorization: str | None = Header(None)):
     if req.id:
         check_id(req.id)
         i = req.id
-    return enqueue(i, priority=min(1, max(0, req.priority)), keep_source=req.keep_source, url=req.url,
-                   audio_url=audio, title=req.title or title)
+    _take_key(i, x_openrouter_key)
+    extra = {} if req.segments else {"no_segments": True}
+    r = enqueue(i, priority=min(1, max(0, req.priority)), keep_source=req.keep_source, url=req.url,
+                audio_url=audio, title=req.title or title, **extra)
+    return _retry_segments(r, x_openrouter_key)
+
+
+def _retry_segments(r, key):
+    """An episode whose ad detection failed, now with a key: run it again."""
+    if key and r and r.get("state") == "ready" and r.get("segments_state") == "failed":
+        _take_key(r["id"], key)
+        queue_segments(r["id"])
+        return load(r["id"])
+    if r and (r.get("state") == "ready" and r.get("segments_state") != "pending"):
+        _client_keys.pop(r["id"], None)  # nothing will use it
+    return r
 
 
 @app.post("/v1/upload", status_code=202)
-def upload(file: UploadFile = File(...), title: str = "", authorization: str | None = Header(None)):
+def upload(file: UploadFile = File(...), title: str = "", authorization: str | None = Header(None),
+           x_openrouter_key: str | None = Header(None)):
     auth(authorization)
     h = hashlib.sha1()
     fd, tmp = tempfile.mkstemp(prefix="mimi-upload-", dir=DATA)
@@ -1326,19 +1914,64 @@ def upload(file: UploadFile = File(...), title: str = "", authorization: str | N
             h.update(chunk)
             f.write(chunk)
     i = "u" + h.hexdigest()[:15]
+    _take_key(i, x_openrouter_key)
     r = enqueue(i, url="upload:" + (file.filename or ""), upload=tmp, title=title or file.filename or i)
     if r.get("upload") != tmp:
         os.unlink(tmp)  # duplicate of an existing job
-    return r
+    return _retry_segments(r, x_openrouter_key)
+
+
+@app.post("/v1/warm", status_code=202)
+def warm_up(authorization: str | None = Header(None)):
+    auth(authorization)
+    _linger_until[0] = max(_linger_until[0], time.time() + WARM_LINGER_S)
+    if _warm["models"] in ("cold", "failed"):
+        threading.Thread(target=warm, daemon=True, name="mimi-warm").start()
+    if REMOTE and REMOTE_WARM:  # (fire and forget: it may be cold-starting)
+        threading.Thread(target=lambda: _remote("POST", "/v1/warm", {}, timeout=90), daemon=True).start()
+    return {"models": "loading" if _warm["models"] == "cold" else _warm["models"]}
+
+
+@app.get("/v1/hold")
+async def hold(s: float = 60, authorization: str | None = Header(None)):
+    # async, so it can be cancelled: Modal cancels a request whose client is gone and kills the container if the
+    # handler doesn't stop within 30 s (a thread sleeping in a sync handler doesn't)
+    import asyncio
+    auth(authorization)
+    end = time.time() + min(max(s, 0), 3600)
+    while busy() and time.time() < end:
+        await asyncio.sleep(1)
+    return {"busy": busy()}
+
+
+@app.post("/v1/episodes/{i}/summary", status_code=202)
+def make_summary(i: str, authorization: str | None = Header(None), x_openrouter_key: str | None = Header(None)):
+    auth(authorization)
+    check_id(i)
+    if not segments.SUMMARIES:
+        raise HTTPException(409, "summaries are off on this hub (MIMI_HUB_SUMMARIZER)")
+    r = load(i)
+    if not r or r["state"] != "ready" or r.get("segments_state") == "pending":
+        raise HTTPException(409, "episode not ready")
+    queue_summary(i, (x_openrouter_key or "").strip() or None)
+    return load(i)
+
+
+@app.get("/v1/features")
+def features(authorization: str | None = Header(None)):
+    auth(authorization)
+    return {"compress": COMPRESS, "segments": segments.SEGMENTER.strip().lower() not in ("", "off"),
+            "summaries": segments.SUMMARIES, "remote": bool(REMOTE) and REMOTE_WHEN != "off"}
 
 
 @app.post("/v1/episodes/{i}/segments", status_code=202)
-def redo_segments(i: str, authorization: str | None = Header(None)):
+def redo_segments(i: str, authorization: str | None = Header(None), x_openrouter_key: str | None = Header(None)):
     auth(authorization)
     check_id(i)
     r = load(i)
     if not r or r["state"] != "ready":
         raise HTTPException(409, "episode not ready")
+    _take_key(i, x_openrouter_key)
     queue_segments(i)
     return load(i)
 
@@ -1437,25 +2070,36 @@ def episode(name: str, request: Request, authorization: str | None = Header(None
         if not p.exists():
             raise HTTPException(404, "no segments yet")
         return FileResponse(p, media_type="application/json")
-    if ext == "summary.json":
+    if ext in ("summary.json", "summary.html", "summary.txt"):
         p = DATA / f"{stem}.summary.json"
         if not p.exists():
             raise HTTPException(404, "no summary yet")
-        return FileResponse(p, media_type="application/json")
-    if ext in ("summary.html", "summary.txt"):
-        p = DATA / f"{stem}.summary.html"
-        if not p.exists():
-            raise HTTPException(404, "no summary yet")
-        return FileResponse(p, media_type="text/html" if ext == "summary.html" else "text/plain")
+        if ext == "summary.json":
+            return FileResponse(p, media_type="application/json")
+        html = segments.sanitize_html(json.loads(p.read_text())["summary"])  # (again: whatever wrote the file)
+        if ext == "summary.txt":
+            import html as h
+            text = h.unescape(re.sub(r"<(/(p|h4|li|ul|ol)|br)>", "\n", html))
+            return Response(re.sub(r"<[^>]+>", "", text).strip() + "\n", media_type="text/plain")
+        return Response(html, media_type="text/html", headers={
+            "Content-Security-Policy": "default-src 'none'; style-src 'unsafe-inline'", "X-Content-Type-Options": "nosniff"})
     if ext == "mimi":
-        deadline = time.time() + 30  # a just-requested job writes its header within a few seconds
-        while (L := live.get(stem)) is None and time.time() < deadline:
+        # a just-requested job writes its header within a few seconds; one on the remote GPU after its start (a
+        # cold one on Modal: up to a minute or so)
+        t0 = time.time()
+        while (L := live.get(stem)) is None:
             r = load(stem)
             if not r or r["state"] not in ("queued", "starting", "downloading"):
+                break
+            if time.time() - t0 > (120 if r.get("remote") and not r.get("remote_failed") else 30):
                 break
             time.sleep(0.25)
         if L is not None:
             return stream_live(L, request.headers.get("range"))
+        r = load(stem)
+        if (REMOTE and r and r.get("remote") and not r.get("remote_failed") and r["state"] not in ("ready", "failed")
+                and r.get("remote_state") not in (None, "queued", "starting", "ready")):
+            return proxy_remote(stem, request.headers.get("range"))  # being made on the remote GPU
     if ext == "src":
         r = load(stem)
         p = DATA / f"{stem}.src"

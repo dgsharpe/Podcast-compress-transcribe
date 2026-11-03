@@ -13,6 +13,7 @@ import sys
 import tempfile
 import threading
 import time
+from pathlib import Path
 
 os.environ.setdefault("MIMI_HUB_DATA", tempfile.mkdtemp(prefix="mimi-timeline-"))
 os.environ.setdefault("HF_HUB_OFFLINE", "1")
@@ -34,6 +35,9 @@ def main():
     sf.write(buf, wav, sr, format="WAV")
     with TestClient(mimi_hub.app) as c:
         m = mimi_hub.models()  # warm, as in service: models loaded, kernels picked
+        if os.environ.get("TPUT_PYANNOTE_PATH"):  # a local copy of the gated model (Modal), not the HF cache
+            from hub import pyannote_gpu
+            mimi_hub._models["diar_pyannote"] = pyannote_gpu.load(m["device"], path=os.environ["TPUT_PYANNOTE_PATH"])
         w16 = np.ascontiguousarray(wav[: 60 * sr:3])  # ~16 kHz
         list(m["asr"].recognize(w16, sample_rate=16000))
         mimi_hub.diarize(w16)
@@ -64,6 +68,10 @@ def main():
                    "queue_s": round(r.get("timing_start", t0) - t0, 2), "timing": r.get("timing"),
                    "segments": r.get("segments"), "segments_model": r.get("segments_model"), "error": r.get("error")}
             print("TIMELINE " + json.dumps(res), flush=True)
+            if os.environ.get("TIMELINE_SAVE"):  # the transcript (with speakers), to compare runs
+                import shutil
+                os.makedirs(os.environ["TIMELINE_SAVE"], exist_ok=True)
+                shutil.copy(mimi_hub.DATA / f"{i}.vtt", Path(os.environ["TIMELINE_SAVE"]) / f"{label}.vtt")
 
 
 if __name__ == "__main__":

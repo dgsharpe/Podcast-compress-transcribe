@@ -149,8 +149,9 @@ def load_clips(path, n, clip_min, ks=None):
     wav, sr = sf.read(path, dtype="float32")
     step = int(clip_min * 60 * sr)
     ks = range(n) if ks is None else ks
-    clips = [wav[k * step:(k + 1) * step] for k in ks]
-    assert all(len(c) == step for c in clips), "not enough audio for that many clips"
+    avail = len(wav) // step
+    assert avail > 0, "the audio is shorter than one clip"
+    clips = [wav[k % avail * step:(k % avail + 1) * step] for k in ks]  # a long backlog reuses the audio
     return [(w, librosa.resample(w, orig_sr=sr, target_sr=16000)) for w in clips]
 
 
@@ -198,23 +199,86 @@ def profile_hooks(m):
         wrap(pipe, "get_embeddings", "embeddings")
 
 
-def _proc(a, ks, workers, barrier, results):
+def _proc(a, ks, workers, barrier, results, index=0, loading=None):
     """One of --procs processes: its own models, its share [ks] of the clips."""
     clips = load_clips(a.wav, None, a.clip_min, ks)
-    m = setup(a.tf32)
-    baseline_episode(m, *clips[0])  # warm-up
-    barrier.wait()
+    if loading is not None:  # a few at a time: loading peaks at several GB of RAM per process
+        loading.acquire()
+    try:
+        m = setup(a.tf32)
+        baseline_episode(m, *clips[0])  # warm-up
+    finally:
+        if loading is not None:
+            loading.release()
+    barrier.wait(timeout=900)
     t = time.time()
-    wall, _, out, errors, cpu_s = run_backlog(baseline_episode, m, clips, workers)
-    results.put((t, t + wall, list(out.values()), errors, cpu_s))
+    if a.torch_profile and index == 0:
+        wall, _, out, errors, cpu_s = _profiled(lambda: run_backlog(baseline_episode, m, clips, workers))
+    else:
+        wall, _, out, errors, cpu_s = run_backlog(baseline_episode, m, clips, workers)
+    results.put((t, t + wall, list(out.values()), errors, cpu_s, _gpu_peak_gb()))
 
 
-def summarize(a, workers, wall, busy, outs, errors, cpu_s):
+def _profiled(f):
+    """f() under torch.profiler: prints the GPU kernels taking the most time."""
+    import torch
+    from torch.profiler import ProfilerActivity, profile
+    try:  # the work runs in worker threads
+        cfg = {"experimental_config": torch._C._profiler._ExperimentalConfig(profile_all_threads=True)}
+    except (AttributeError, TypeError):
+        cfg = {}
+    with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA], **cfg) as prof:
+        r = f()
+    ev = prof.key_averages()
+
+    def selfdev(e):
+        return getattr(e, "self_device_time_total", None) or getattr(e, "self_cuda_time_total", 0)
+    kernels = sorted((e for e in ev if selfdev(e) > 0), key=selfdev, reverse=True)
+    total = sum(selfdev(e) for e in kernels)
+    top = [{"kernel": e.key[:90], "ms": round(selfdev(e) / 1000, 1), "calls": e.count,
+            "pct": round(100 * selfdev(e) / max(1, total), 1)} for e in kernels[:25]]
+    print("TORCHPROF " + json.dumps({"wall_s": round(r[0], 1), "kernel_ms_total": round(total / 1000, 1),
+                                     "top": top}), flush=True)
+    return r
+
+
+def _gpu_peak_gb():
+    import torch
+    return round(torch.cuda.max_memory_allocated() / 2**30, 1) if torch.cuda.is_available() else None
+
+
+def summarize(a, workers, wall, busy, outs, errors, cpu_s, gpu_peak_gb=None):
     stages = {k: round(sum(o[2].get(k, 0.0) for o in outs) / max(1, len(outs)), 2) for k in ("mimi", "asr", "diar")}
     return {"label": a.label, "procs": a.procs, "workers": workers, "clips": a.clips, "clip_min": a.clip_min,
             "tf32": a.tf32, "wall_s": round(wall, 1), "x_rt": round(a.clips * a.clip_min * 60 / wall, 1),
             "gpu_busy_pct": busy, "cpu_cores_used": round(cpu_s / wall, 1), "clip_stage_s": stages,
-            "errors": errors, "cues": sum(o[0] for o in outs)}
+            "gpu_peak_gb_per_proc": gpu_peak_gb, "errors": errors, "cues": sum(o[0] for o in outs)}
+
+
+def stage_cpu(a):
+    """Mimi, ASR and diarization each run alone over every clip: where the CPU (and the wall time) goes."""
+    import torch
+    from hub import mimi_hub
+    clips = load_clips(a.wav, a.clips, a.clip_min)
+    m = setup(a.tf32)
+    baseline_episode(m, *clips[0])
+    stages = {"mimi": lambda w24, w16: hub_encode(m["mimi"], w24),
+              "asr": lambda w24, w16: [c for s in m["asr"].recognize(w16, sample_rate=16000)
+                                       for c in mimi_hub.cues(s)],
+              "diar": lambda w24, w16: mimi_hub.diarize(w16)}
+    audio_s = a.clips * a.clip_min * 60
+    res = {"label": a.label, "clips": a.clips, "threads": mimi_hub.THREADS}
+    for name, f in stages.items():
+        torch.cuda.synchronize()
+        r0, t0 = resource.getrusage(resource.RUSAGE_SELF), time.perf_counter()
+        for w24, w16 in clips:
+            f(w24, w16)
+        torch.cuda.synchronize()
+        r1, t1 = resource.getrusage(resource.RUSAGE_SELF), time.perf_counter()
+        cpu = (r1.ru_utime - r0.ru_utime) + (r1.ru_stime - r0.ru_stime)
+        res[name] = {"cpu_ms_per_audio_s": round(1000 * cpu / audio_s, 2), "wall_ms_per_audio_s":
+                     round(1000 * (t1 - t0) / audio_s, 3), "cores": round(cpu / (t1 - t0), 1)}
+    print("STAGECPU " + json.dumps(res), flush=True)
 
 
 def main():
@@ -226,9 +290,15 @@ def main():
     ap.add_argument("--label", default="E0")
     ap.add_argument("--tf32", action="store_true")
     ap.add_argument("--profile", action="store_true", help="component times (one process; per clip)")
+    ap.add_argument("--torch-profile", action="store_true", help="profile process 0's share of the backlog")
+    ap.add_argument("--stage-cpu", action="store_true",
+                    help="each stage alone over all clips: CPU-seconds and wall seconds per audio-second")
     ap.add_argument("--wav", default=str(ROOT / "data/ref/ref_24k.wav"))
     a = ap.parse_args()
 
+    if a.stage_cpu:
+        stage_cpu(a)
+        return
     results = []
     for workers in [int(x) for x in a.workers.split(",")]:
         if a.procs == 1:
@@ -240,24 +310,42 @@ def main():
                     profile_hooks(m)
             PROFILE.clear()
             wall, busy, out, errors, cpu_s = run_backlog(baseline_episode, m, clips, workers)
-            res = summarize(a, workers, wall, busy, list(out.values()), errors, cpu_s)
+            res = summarize(a, workers, wall, busy, list(out.values()), errors, cpu_s, _gpu_peak_gb())
             if a.profile:
                 res["profile_per_clip"] = {k: [round(v[0] / a.clips, 3), round(v[1] / a.clips)]
                                            for k, v in PROFILE.items()}
         else:
             import multiprocessing as mp
             ctx = mp.get_context("spawn")
-            barrier, q = ctx.Barrier(a.procs + 1), ctx.Queue()
+            barrier, q, loading = ctx.Barrier(a.procs + 1), ctx.Queue(), ctx.Semaphore(4)
             shares = [list(range(a.clips))[p::a.procs] for p in range(a.procs)]
-            ps = [ctx.Process(target=_proc, args=(a, ks, workers, barrier, q)) for ks in shares]
+            ps = [ctx.Process(target=_proc, args=(a, ks, workers, barrier, q, k, loading))
+                  for k, ks in enumerate(shares)]
             [p.start() for p in ps]
-            barrier.wait()
-            with GpuBusy() as busy:
-                got = [q.get() for _ in ps]
+            got, dead = [], []
+            try:
+                barrier.wait(timeout=900)  # every process loaded and warmed up
+            except threading.BrokenBarrierError:
+                dead = [f"process {k} died loading (exit {p.exitcode})" for k, p in enumerate(ps) if not p.is_alive()]
+            if not dead:
+                with GpuBusy() as busy:
+                    while len(got) < len(ps):  # a process that dies (e.g. out of GPU memory) never reports
+                        try:
+                            got.append(q.get(timeout=5))
+                        except queue.Empty:
+                            if all(not p.is_alive() for p in ps) and q.empty():
+                                break
+                dead = [f"process {k} exited {p.exitcode}" for k, p in enumerate(ps) if p.exitcode not in (0, None)]
+            [p.kill() for p in ps if p.is_alive()]
             [p.join() for p in ps]
+            if dead or not got:
+                res = {"label": a.label, "procs": a.procs, "workers": workers, "clips": a.clips, "error": dead}
+                print("RESULT " + json.dumps(res), flush=True)
+                continue
             wall = max(g[1] for g in got) - min(g[0] for g in got)
             res = summarize(a, workers, wall, busy.mean, [o for g in got for o in g[2]],
-                            [e for g in got for e in g[3]], sum(g[4] for g in got))
+                            [e for g in got for e in g[3]], sum(g[4] for g in got),
+                            max((g[5] for g in got if g[5] is not None), default=None))
         results.append(res)
         print("RESULT " + json.dumps(res), flush=True)
         (ROOT / "outputs").mkdir(exist_ok=True)
