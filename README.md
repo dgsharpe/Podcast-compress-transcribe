@@ -1,5 +1,8 @@
 # neural_audio: podcasts as Mimi, with transcripts and ad skipping
 
+`AGENTS.md` is a short guide to the repository and to setting up a server (at home, on Modal, or both), for AI
+coding agents and people.
+
 A podcast pipeline. A server (**mimi-hub**) re-encodes episodes with Kyutai's
 [Mimi](https://huggingface.co/kyutai/mimi) neural codec (32 codebooks, 4.4 kb/s, about 2 MB per hour), transcribes
 them with speaker labels (Parakeet TDT 0.6B v2 + pyannote) and marks ads and self-promotion with an LLM. A patched

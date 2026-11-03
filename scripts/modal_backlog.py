@@ -32,8 +32,9 @@ NA, MODELS, FT_PYTHON = "/root/na", "/models/hub", "/ft/bin/python"  # as in scr
 FT_ENV = {"PYTHON_GIL": "0", "PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION": "python"}
 
 app = modal.App("mimi-backlog", image=image)
-DATA = modal.Volume.from_name(os.environ.get("MIMI_MODAL_APP", "mimi-hub") + "-data", version=2)
-CACHE = modal.Volume.from_name("mimi-hub-inductor-cache")
+DATA = modal.Volume.from_name(os.environ.get("MIMI_MODAL_APP", "mimi-hub") + "-data", create_if_missing=True,
+                              version=2)
+CACHE = modal.Volume.from_name("mimi-hub-inductor-cache", create_if_missing=True)  # (the bulk kernels, kept)
 CHUNK_TIMEOUT_S = 2 * 3600
 ASR_MODEL = "nemo-parakeet-tdt-0.6b-v2"
 

@@ -6,7 +6,7 @@ a backlog of 8 x 5 min clips, then variants of how it's run.
 
 Each plan entry is one throughput_server.py run (fresh process, so env settings apply) in the same container.
 Needs locally: data/ref/ref_24k.wav, data/modal_pyannote/ (the gated community-1 snapshot, cp -rL out of the HF
-cache). Results: outputs/modal_hub_bench.jsonl (one line per run).
+cache); both optional for scripts/modal_backlog.py, which uses this image. Results: outputs/modal_hub_bench.jsonl.
 """
 
 import json
@@ -87,8 +87,6 @@ image = (
     # TensorRT and the ONNX exporter (the standard Python only), for scripts/trt_mimi_check.py
     .pip_install("tensorrt-cu13", "onnx", "onnxscript")
     .env({**ENV, "CUDA_HOME": "/usr/local/cuda-13.0"})
-    .add_local_dir(ROOT / "data/modal_pyannote", "/models/pyannote")
-    .add_local_file(ROOT / "data/ref/ref_24k.wav", f"{NA}/data/ref/ref_24k.wav")
     .add_local_dir(ROOT / "hub", f"{NA}/hub", ignore=["__pycache__", "*.pyc"])
     .add_local_file(ROOT / "scripts/mimi_file.py", f"{NA}/scripts/mimi_file.py")
     .add_local_file(ROOT / "scripts/throughput_server.py", f"{NA}/scripts/throughput_server.py")
@@ -106,6 +104,12 @@ image = (
     .add_local_file(ROOT / "scripts/trt_mimi_check.py", f"{NA}/scripts/trt_mimi_check.py")
     .add_local_file(ROOT / "scripts/episode_timeline.py", f"{NA}/scripts/episode_timeline.py")
 )
+# local files that aren't in git, if there: the gated pyannote snapshot (without it, no speaker labels) and the
+# benchmarks' reference clip (scripts/modal_backlog.py needs neither)
+if (ROOT / "data/modal_pyannote").exists():
+    image = image.add_local_dir(ROOT / "data/modal_pyannote", "/models/pyannote")
+if (ROOT / "data/ref/ref_24k.wav").exists():
+    image = image.add_local_file(ROOT / "data/ref/ref_24k.wav", f"{NA}/data/ref/ref_24k.wav")
 app = modal.App("mimi-hub-bench", image=image)
 
 FT_PYTHON = "/ft/bin/python"
