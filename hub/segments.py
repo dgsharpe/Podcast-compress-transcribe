@@ -7,9 +7,10 @@ agent CLI on the server (claude / codex / agy) in print mode, from an empty temp
 per episode.
 
     MIMI_HUB_SEGMENTER = "<backend>:<model>[+<flag>...][,<backend>:<model>...]"   tried in order until one works;
-        default openrouter:anthropic/claude-haiku-5.5,claude:claude-haiku-5-5>claude:claude-opus-5-5,
-        codex:gpt-5.6-terra+high (an API backend whose key isn't set is skipped, so without OPENROUTER_API_KEY it's
-        Haiku then Opus through the CLI), or "off"
+        default claude:claude-haiku-5-5>claude:claude-opus-5-5,openrouter:anthropic/claude-haiku-5.5,
+        codex:gpt-5.6-terra+high: the subscription first, OpenRouter if the claude CLI isn't installed or fails (e.g.
+        its usage limit), codex last; a CLI that isn't installed and an API backend without a key are skipped; or
+        "off"
         codex flags: minimal / low / medium / high / xhigh (reasoning effort; without one, ~/.codex/config.toml's),
         fast / priority / flex / default (service tier); e.g. codex:gpt-6.1-sol+low+fast
         claude flags: low / medium / high / xhigh / max (--effort), fast (fast mode); e.g. claude:claude-opus-5-5+fast
@@ -46,8 +47,10 @@ import tempfile
 import threading
 import time
 
-SEGMENTER = os.environ.get("MIMI_HUB_SEGMENTER", "openrouter:anthropic/claude-haiku-5.5,"
-                           "claude:claude-haiku-5-5>claude:claude-opus-5-5,codex:gpt-5.6-terra+high")
+# the subscription first (a logged-in claude CLI: no cost per episode), then OpenRouter (the server's key or the
+# client's X-OpenRouter-Key), then codex; ones not installed / without a key are skipped (_choices)
+SEGMENTER = os.environ.get("MIMI_HUB_SEGMENTER", "claude:claude-haiku-5-5>claude:claude-opus-5-5,"
+                           "openrouter:anthropic/claude-haiku-5.5,codex:gpt-5.6-terra+high")
 CHUNK_CHARS = 90_000  # agy takes the prompt as one argv string (Linux caps those at 128 KiB)
 OVERLAP_CUES = 40
 TIMEOUT_S = 600
@@ -328,12 +331,18 @@ def _merge(segs, cues):
     return out
 
 
+def _usable(choice):
+    backend = choice.partition(":")[0]
+    if backend in _OPENAI_COMPAT:
+        return bool(_key(_OPENAI_COMPAT[backend][1]))
+    return shutil.which(backend, path=_PATH) is not None  # an agent CLI: installed here
+
+
 def _choices(segmenter):
-    """The [segmenter] list's entries, without API backends whose key isn't set (unless that leaves none)."""
+    """The [segmenter] list's entries, without API backends whose key isn't set or CLIs that aren't installed
+    (unless that leaves none)."""
     every = [c.strip() for c in segmenter.split(",") if c.strip()]
-    keyed = [c for c in every if c.partition(":")[0] not in _OPENAI_COMPAT
-             or _key(_OPENAI_COMPAT[c.partition(":")[0]][1])]
-    return keyed or every
+    return [c for c in every if _usable(c)] or every
 
 
 def _ask(segmenter, lines, log, prompt=None):
