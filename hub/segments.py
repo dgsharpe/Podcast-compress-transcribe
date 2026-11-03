@@ -54,6 +54,8 @@ SEGMENTER = os.environ.get("MIMI_HUB_SEGMENTER", "claude:claude-haiku-5-5>claude
 CHUNK_CHARS = 90_000  # agy takes the prompt as one argv string (Linux caps those at 128 KiB)
 OVERLAP_CUES = 40
 TIMEOUT_S = 600
+EXCERPT_TIMEOUT_S = 180  # a refine request (excerpts: a few thousand tokens); one of 1,125 Opus ones hung for 600 s
+ATTEMPTS = 2  # an agent CLI's timeout or empty reply is tried again once; other failures go to the next backend
 GAP_CUES, GAP_S = 2, 10.0  # ads this close together are one break (the gap is "Uh-huh." / a jingle)
 MIN_S = 6.0  # shorter plugs mid-conversation aren't worth a jarring skip
 
@@ -183,7 +185,40 @@ EFFORTS = ("minimal", "low", "medium", "high", "xhigh", "max")
 TIERS = ("fast", "priority", "flex", "default")
 
 
-def _run(backend, model, prompt):
+class _Retry(RuntimeError):
+    """A failure that trying again may fix: a CLI timing out or replying with nothing."""
+
+
+def _tail(text, n):
+    """The last [n] chars of a CLI's output, where the reason for a failure usually is."""
+    if isinstance(text, bytes):
+        text = text.decode(errors="replace")
+    text = (text or "").strip()
+    return text if len(text) <= n else "..." + text[-n:]
+
+
+def _run(backend, model, prompt, timeout=TIMEOUT_S, log=None):
+    """[prompt]'s reply from [backend]; a timeout or empty reply is tried again (ATTEMPTS)."""
+    for attempt in range(1, ATTEMPTS + 1):
+        try:
+            return _call(backend, model, prompt, timeout)
+        except _Retry as e:
+            if attempt == ATTEMPTS:
+                raise RuntimeError(str(e)) from None
+            (log or print)(f"segments: {backend}:{model}: {e}; trying again ({attempt + 1}/{ATTEMPTS})")
+
+
+def _call(backend, model, prompt, timeout):
+    """One request. Errors name the cause (timeout, exit code, empty reply) with the end of the CLI's stderr, never
+    its command line: agy takes the whole prompt as an argument."""
+    try:
+        return _invoke(backend, model, prompt, timeout)
+    except subprocess.TimeoutExpired as e:
+        raise _Retry(f"{backend} timed out after {timeout:.0f} s (prompt {len(prompt):,} chars); "
+                     f"stderr: {_tail(e.stderr, 300)!r}") from None
+
+
+def _invoke(backend, model, prompt, timeout):
     model, *flags = model.split("+")
     env = dict(os.environ, PATH=_PATH)
     exe = shutil.which(backend, path=_PATH) or backend
@@ -198,7 +233,7 @@ def _run(backend, model, prompt):
                     cmd += ["--effort", f]
                 else:
                     raise ValueError(f"unknown claude flag {f!r}")
-            r = subprocess.run(cmd, input=prompt, capture_output=True, text=True, cwd=tmp, env=env, timeout=TIMEOUT_S)
+            r = subprocess.run(cmd, input=prompt, capture_output=True, text=True, cwd=tmp, env=env, timeout=timeout)
             out = _claude_result(r.stdout, model)
         elif backend == "codex":
             last = os.path.join(tmp, "last.txt")
@@ -211,18 +246,20 @@ def _run(backend, model, prompt):
                 else:
                     raise ValueError(f"unknown codex flag {f!r}")
             cmd.append("-")
-            r = subprocess.run(cmd, input=prompt, capture_output=True, text=True, cwd=tmp, env=env, timeout=TIMEOUT_S)
+            r = subprocess.run(cmd, input=prompt, capture_output=True, text=True, cwd=tmp, env=env, timeout=timeout)
             out = open(last).read() if os.path.exists(last) else ""
         elif backend in _OPENAI_COMPAT:
-            return _chat(backend, model, flags, prompt)
+            return _chat(backend, model, flags, prompt, timeout)
         elif backend == "agy":
             cmd = [exe, "--model", model, "--output-format", "text", "-p", prompt]
-            r = subprocess.run(cmd, capture_output=True, text=True, cwd=tmp, env=env, timeout=TIMEOUT_S)
+            r = subprocess.run(cmd, capture_output=True, text=True, cwd=tmp, env=env, timeout=timeout)
             out = r.stdout
         else:
             raise ValueError(f"unknown segmenter backend {backend!r}")
     if r.returncode != 0:
-        raise RuntimeError(f"{backend} exited {r.returncode}: {(r.stderr or r.stdout)[-400:]}")
+        raise RuntimeError(f"{backend} exited {r.returncode}: {_tail(r.stderr or r.stdout, 400)!r}")
+    if not (out or "").strip():
+        raise _Retry(f"{backend} replied with nothing (exit 0); stderr: {_tail(r.stderr, 300)!r}")
     return out
 
 
@@ -261,7 +298,7 @@ def _key(var):
     return (getattr(_keys, "value", None) or {}).get(var) or os.environ.get(var)
 
 
-def _chat(backend, model, flags, prompt):
+def _chat(backend, model, flags, prompt, timeout=TIMEOUT_S):
     import urllib.request
     # uv's Python doesn't know NixOS's CA bundle (as hub/mimi_hub.py; this may run on its own)
     if not os.environ.get("SSL_CERT_FILE") and os.path.exists("/etc/ssl/certs/ca-certificates.crt"):
@@ -283,7 +320,7 @@ def _chat(backend, model, flags, prompt):
     import urllib.error
     for attempt in range(6):  # 429: the provider's rate limit (OpenRouter's keys share a pool); back off
         try:
-            with urllib.request.urlopen(req, timeout=TIMEOUT_S) as r:
+            with urllib.request.urlopen(req, timeout=timeout) as r:
                 out = json.load(r)
             break
         except urllib.error.HTTPError as e:
@@ -298,7 +335,7 @@ def _chat(backend, model, flags, prompt):
 def _parse(text, lo, hi):
     m = re.search(r"\{.*\}", text, re.S)
     if not m:
-        raise ValueError(f"no JSON in reply: {text[:200]!r}")
+        raise ValueError(f"no JSON in reply ({len(text):,} chars): {text[:200]!r}")
     found = []
     for s in json.loads(m[0]).get("segments", []):
         try:
@@ -355,7 +392,7 @@ def _ask(segmenter, lines, log, prompt=None):
         try:
             found = []
             for lo, hi in _windows(lines):
-                found += _parse(_run(backend, model, head + "\n".join(lines[lo:hi]) + "\n"), lo, hi)
+                found += _parse(_run(backend, model, head + "\n".join(lines[lo:hi]) + "\n", log=log), lo, hi)
             if second:
                 found = _refine(second, lines, found, head, log)
             return choice, found
@@ -400,7 +437,8 @@ def _refine(second, lines, found, head, log):
     for group in groups:
         text = "\n".join(f"### Excerpt {k + 1}\n" + "\n".join(lines[lo:hi]) for k, (lo, hi, _) in enumerate(group))
         try:
-            got = _parse(_run(backend, model, excerpts + text + "\n"), group[0][0], group[-1][1])
+            got = _parse(_run(backend, model, excerpts + text + "\n", EXCERPT_TIMEOUT_S, log), group[0][0],
+                         group[-1][1])
         except Exception as e:  # noqa: BLE001
             log(f"segments: refining with {second} failed: {e}; kept as found")
             out += [s for _, _, mine in group for s in mine]
@@ -452,7 +490,7 @@ def detect_many(episodes, segmenter=SEGMENTER, log=print):
             text = _run(backend, model, prompt)
             m = re.search(r"\{.*\}", text, re.S)
             if not m:
-                raise ValueError(f"no JSON in reply: {text[:200]!r}")
+                raise ValueError(f"no JSON in reply ({len(text):,} chars): {text[:200]!r}")
             by_ep = {int(e["episode"]): e.get("segments", []) for e in json.loads(m[0]).get("episodes", [])}
             out = []
             for k, cues in enumerate(episodes):
