@@ -47,6 +47,7 @@ def main():
     ap.add_argument("--batch", type=int, default=1, help="episodes per request (v2 rules)")
     ap.add_argument("--label", default="", help="appended to the spec's name in the output / saved file")
     ap.add_argument("--data", default="hub_data", help="the episodes' directory (fresh ones have no hub labels)")
+    ap.add_argument("--truth", default=None, help="only the episodes of this ground truth (scripts/ads_truth.py)")
     a = ap.parse_args()
     from hub import segments
     data = ROOT / a.data
@@ -58,6 +59,9 @@ def main():
         ref = [(s["start"], s["end"]) for s in json.loads(labels.read_text())["segments"]] if labels.exists() else None
         if ref is not None or a.data != "hub_data":  # hub_data: the labelled ones only, as before
             eps.append((i, rec.get("title", "")[:40], segments.read_cues(vtt.read_text()), ref or []))
+    if a.truth:  # (hub_data also holds backlogs now, with labels of their own)
+        keep = set(json.loads(Path(a.truth).read_text()))
+        eps = [e for e in eps if e[0] in keep]
     eps = sorted(eps, key=lambda e: -len(e[3]))[:a.episodes]  # the ones with the most breaks first
     print(f"{len(eps)} episodes: " + "; ".join(f"{t} ({len(r)} breaks)" for _, t, _, r in eps), flush=True)
     for spec in a.specs:

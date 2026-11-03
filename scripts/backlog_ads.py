@@ -11,6 +11,8 @@ already says segments_state "ready" are skipped, so it can be rerun.
 RESULTS: modal_backlog.py's results ([{"uuid", ...}]). Haiku 5.5 through the claude CLI found all 98 judged breaks of
 scripts/ads_truth.py's 24 episodes.
 
+    --refine claude:claude-opus-5-5   the breaks already found (by Haiku) re-read by that model, 60 s around each
+        (hub/segments.py's FIRST>SECOND, without running FIRST again): Opus's scores on the judged episodes
     --recheck 240 [--segmenter claude:claude-opus-5-5]   redo, with that model, episodes (over 20 min) whose found
         segments include one over 240 s: Haiku now and then ran a break on through the content after it (a Weeds
         episode: a 40 s break marked as the last 17 min), on 2 of the first 559 backlog episodes
@@ -91,6 +93,7 @@ def main():
     ap.add_argument("--segmenter", default="claude:claude-haiku-5-5")
     ap.add_argument("--threads", type=int, default=8)
     ap.add_argument("--recheck", type=float, default=0, help="redo episodes with a segment over this many seconds")
+    ap.add_argument("--refine", default=None, help="re-read the breaks found with this model (e.g. claude:claude-opus-5-5)")
     a = ap.parse_args()
     lib = Volume(a.volume) if a.volume else Local(a.data)
     ids = [r["uuid"] for f in a.results for r in json.loads(Path(f).read_text()) if not r.get("error")]
@@ -104,7 +107,12 @@ def main():
                 stats["failed"] += 1
             print(f"{i}: no record ({type(e).__name__})", flush=True)
             return
-        if a.recheck:
+        if a.refine:
+            if rec.get("segments_state") != "ready" or ">" in (rec.get("segments_model") or ""):
+                with lock:
+                    stats["skipped"] += 1
+                return
+        elif a.recheck:
             found = json.loads(lib.read(f"{i}.segments.json"))["segments"] if rec.get("segments_state") == "ready" else []
             if rec.get("duration_s", 0) < 20 * 60 or not any(x["end"] - x["start"] > a.recheck for x in found):
                 with lock:
@@ -117,7 +125,15 @@ def main():
             return
         t0 = time.time()
         try:
-            res = segments.detect(segments.read_cues(lib.read(f"{i}.vtt").decode()), a.segmenter, log=lambda m: None)
+            cues = segments.read_cues(lib.read(f"{i}.vtt").decode())
+            if a.refine:
+                lines = [segments._line(k, c) for k, c in enumerate(cues)]
+                found = json.loads(lib.read(f"{i}.segments.json"))["segments"]
+                got = segments._refine(a.refine, lines, found, segments.PROMPTS[segments.PROMPT_VERSION],
+                                       lambda m: print(f"{i}: {m}", flush=True))
+                res = {"model": f"{rec['segments_model']}>{a.refine}", "segments": segments._finish(got, cues)}
+            else:
+                res = segments.detect(cues, a.segmenter, log=lambda m: None)
         except Exception as e:  # noqa: BLE001 - left failed; the app's key can have the hub redo it
             with lock:
                 stats["failed"] += 1

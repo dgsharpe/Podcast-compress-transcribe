@@ -7,17 +7,23 @@ agent CLI on the server (claude / codex / agy) in print mode, from an empty temp
 per episode.
 
     MIMI_HUB_SEGMENTER = "<backend>:<model>[+<flag>...][,<backend>:<model>...]"   tried in order until one works;
-        default openrouter:anthropic/claude-haiku-5.5,claude:claude-opus-5-5,codex:gpt-5.6-terra+high (an API
-        backend whose key isn't set is skipped, so without OPENROUTER_API_KEY it's Opus through the CLI), or "off"
+        default openrouter:anthropic/claude-haiku-5.5,claude:claude-haiku-5-5>claude:claude-opus-5-5,
+        codex:gpt-5.6-terra+high (an API backend whose key isn't set is skipped, so without OPENROUTER_API_KEY it's
+        Haiku then Opus through the CLI), or "off"
         codex flags: minimal / low / medium / high / xhigh (reasoning effort; without one, ~/.codex/config.toml's),
         fast / priority / flex / default (service tier); e.g. codex:gpt-6.1-sol+low+fast
         claude flags: low / medium / high / xhigh / max (--effort), fast (fast mode); e.g. claude:claude-opus-5-5+fast
+        FIRST>SECOND (e.g. claude:claude-haiku-5-5>claude:claude-opus-5-5): FIRST reads the whole transcript, SECOND
+            only REFINE_PAD_S (60 s) around each break FIRST found, setting its boundaries (or dropping it)
         openrouter:<model id>[+<effort>] (OpenRouter's API, key in OPENROUTER_API_KEY; effort low .. xhigh as
             its reasoning.effort); e.g. openrouter:anthropic/claude-haiku-5.5, openrouter:inception/mercury-3
         inception:<model id> (Inception Labs' API, key in INCEPTION_API_KEY); e.g. inception:mercury-3
         An API key can also come with the call (detect(..., keys={"OPENROUTER_API_KEY": ...}): a client's own,
         which the hub holds in memory only); it takes precedence over the environment's.
 
+Haiku 5.5 then Opus 5.5 on 60 s around each of Haiku's breaks (one request per episode), through the claude CLI:
+50/50 breaks, nothing extra, IoU 0.999 on the 13; 47/48, one extra (a 16 s newsletter plug), 0.990 on the fresh 11:
+Opus's own scores, with Opus reading 13.5% as many tokens as Haiku (one request per excerpt instead: 26%).
 Against judged ground truths (2026-11-02; scripts/ads_truth.py): 13 episodes the v2 prompt was written from (50
 breaks) and 11 fresh shows (48), with the v2 prompt: Haiku 5.5 through OpenRouter all 98, nothing extra, edges a
 little looser (skipped-seconds IoU 0.94-0.95), ~9 s an episode, $0.097 for the 24 h of audio (high effort: no better,
@@ -40,8 +46,8 @@ import tempfile
 import threading
 import time
 
-SEGMENTER = os.environ.get("MIMI_HUB_SEGMENTER",
-                           "openrouter:anthropic/claude-haiku-5.5,claude:claude-opus-5-5,codex:gpt-5.6-terra+high")
+SEGMENTER = os.environ.get("MIMI_HUB_SEGMENTER", "openrouter:anthropic/claude-haiku-5.5,"
+                           "claude:claude-haiku-5-5>claude:claude-opus-5-5,codex:gpt-5.6-terra+high")
 CHUNK_CHARS = 90_000  # agy takes the prompt as one argv string (Linux caps those at 128 KiB)
 OVERLAP_CUES = 40
 TIMEOUT_S = 600
@@ -117,6 +123,15 @@ Transcripts:
 """
 
 PROMPTS = {"v1": PROMPT, "v2": RULES_V2 + "\n" + REPLY_ONE}
+
+# a second model's look at the first's breaks (FIRST>SECOND in the segmenter list): each with REFINE_PAD_S of
+# transcript around it, the second marking what in that excerpt is a break (its own boundaries, or none)
+REFINE_PAD_S = float(os.environ.get("MIMI_HUB_SEGMENTS_REFINE_PAD_S", "60"))
+EXCERPT = """Below are excerpts of the episode's transcript, each starting with a line "### Excerpt": the cues around a
+stretch another reader marked as a possible ad break or promo, with some of the show before and after it (cue
+indices are the episode's). Mark what in them is an ad break or promo, by the rules above, with its exact first and
+last cues; reply with no segments for an excerpt where none of it is.
+"""
 PROMPT_VERSION = os.environ.get("MIMI_HUB_SEGMENTS_PROMPT", "v2")
 
 _CUE = re.compile(
@@ -172,7 +187,7 @@ def _run(backend, model, prompt):
     with tempfile.TemporaryDirectory(prefix="mimi-seg-") as tmp:
         if backend == "claude":
             cmd = [exe, "-p", "--model", model, "--tools", "", "--no-session-persistence",
-                   "--setting-sources", "", "--strict-mcp-config", "--output-format", "text"]
+                   "--setting-sources", "", "--strict-mcp-config", "--output-format", "json"]
             for f in flags:
                 if f == "fast":
                     cmd += ["--settings", '{"fastMode": true}']
@@ -181,7 +196,7 @@ def _run(backend, model, prompt):
                 else:
                     raise ValueError(f"unknown claude flag {f!r}")
             r = subprocess.run(cmd, input=prompt, capture_output=True, text=True, cwd=tmp, env=env, timeout=TIMEOUT_S)
-            out = r.stdout
+            out = _claude_result(r.stdout, model)
         elif backend == "codex":
             last = os.path.join(tmp, "last.txt")
             cmd = [exe, "exec", "--skip-git-repo-check", "--ephemeral", "-s", "read-only", "-m", model, "-o", last]
@@ -206,6 +221,29 @@ def _run(backend, model, prompt):
     if r.returncode != 0:
         raise RuntimeError(f"{backend} exited {r.returncode}: {(r.stderr or r.stdout)[-400:]}")
     return out
+
+
+USAGE_LOG = os.environ.get("MIMI_HUB_SEGMENTS_USAGE_LOG")  # a JSON-lines file: each claude call's tokens and cost
+_usage_lock = threading.Lock()
+
+
+def _claude_result(stdout, model):
+    """The reply text of claude -p --output-format json (its tokens logged to USAGE_LOG, if set)."""
+    try:
+        j = json.loads(stdout)
+    except ValueError:
+        return stdout  # (an error message, or an older CLI's text)
+    if USAGE_LOG:
+        u = j.get("usage") or {}
+        row = {"t": time.time(), "model": model, "cost_usd": j.get("total_cost_usd"),
+               **{k: u.get(k) for k in ("input_tokens", "cache_creation_input_tokens", "cache_read_input_tokens",
+                                        "output_tokens")},
+               "by_model": {m: {k: v.get(k) for k in ("inputTokens", "outputTokens", "cacheReadInputTokens",
+                                                       "cacheCreationInputTokens", "costUSD")}
+                            for m, v in (j.get("modelUsage") or {}).items()}}
+        with _usage_lock, open(USAGE_LOG, "a") as f:
+            f.write(json.dumps(row) + "\n")
+    return j.get("result") or ""
 
 
 # OpenAI-style chat APIs: backend -> (endpoint, environment variable with the key)
@@ -260,7 +298,10 @@ def _parse(text, lo, hi):
         raise ValueError(f"no JSON in reply: {text[:200]!r}")
     found = []
     for s in json.loads(m[0]).get("segments", []):
-        first, last = int(s["first"]), int(s["last"])
+        try:
+            first, last = int(s["first"]), int(s["last"])
+        except (KeyError, TypeError, ValueError):  # a malformed entry: skipped, not the whole reply
+            continue
         kind = s.get("kind") if s.get("kind") in ("ad", "promo") else "ad"
         first, last = max(first, lo), min(last, hi - 1)
         if first <= last:
@@ -300,16 +341,65 @@ def _ask(segmenter, lines, log, prompt=None):
     errors = []
     head = PROMPTS[prompt or PROMPT_VERSION]
     for choice in _choices(segmenter):
-        backend, _, model = choice.partition(":")
+        first, _, second = choice.partition(">")
+        backend, _, model = first.partition(":")
         try:
             found = []
             for lo, hi in _windows(lines):
                 found += _parse(_run(backend, model, head + "\n".join(lines[lo:hi]) + "\n"), lo, hi)
+            if second:
+                found = _refine(second, lines, found, head, log)
             return choice, found
         except Exception as e:  # expired login, timeout, unparseable reply: try the next one
             log(f"segments: {choice} failed: {e}")
             errors.append(f"{choice}: {e}")
     raise RuntimeError("; ".join(errors) or "no segmenter configured")
+
+
+def _cue_s(line):
+    m = re.match(r"\[\d+\] (\d+):(\d+)", line)
+    return int(m[1]) * 60 + int(m[2])
+
+
+def _refine(second, lines, found, head, log):
+    """[found]'s breaks re-read by [second]: excerpts of REFINE_PAD_S around each (overlapping ones merged), the
+    second's segments in them kept instead. A failed excerpt keeps the first's segments there."""
+    backend, _, model = second.partition(":")
+    spans = []
+    for s in sorted(found, key=lambda s: s["first"]):
+        t0, t1 = _cue_s(lines[s["first"]]) - REFINE_PAD_S, _cue_s(lines[s["last"]]) + REFINE_PAD_S
+        lo = next(k for k in range(s["first"], -1, -1) if k == 0 or _cue_s(lines[k - 1]) < t0)
+        hi = next((k for k in range(s["last"] + 1, len(lines)) if _cue_s(lines[k]) > t1), len(lines))
+        if spans and lo <= spans[-1][1]:
+            spans[-1] = (spans[-1][0], max(hi, spans[-1][1]), spans[-1][2] + [s])
+        else:
+            spans.append((lo, hi, [s]))
+    # all of an episode's excerpts in one request (each request also carries the rules and the CLI's own prompt:
+    # one per excerpt, Opus read 26% as many tokens as Haiku on the judged episodes), CHUNK_CHARS at most
+    groups, size = [[]], 0
+    for sp in spans:
+        n = sum(len(x) + 1 for x in lines[sp[0]:sp[1]])
+        if groups[-1] and size + n > CHUNK_CHARS:
+            groups.append([])
+            size = 0
+        groups[-1].append(sp)
+        size += n
+    out = []
+    excerpts = head.replace("Transcript:\n", EXCERPT + "\nTranscripts:\n")
+    for group in groups:
+        text = "\n".join(f"### Excerpt {k + 1}\n" + "\n".join(lines[lo:hi]) for k, (lo, hi, _) in enumerate(group))
+        try:
+            got = _parse(_run(backend, model, excerpts + text + "\n"), group[0][0], group[-1][1])
+        except Exception as e:  # noqa: BLE001
+            log(f"segments: refining with {second} failed: {e}; kept as found")
+            out += [s for _, _, mine in group for s in mine]
+            continue
+        for s in got:  # each into the excerpt its first cue is in (cues between excerpts: not marked by this)
+            for lo, hi, _ in group:
+                if lo <= s["first"] < hi:
+                    out.append(dict(s, last=min(s["last"], hi - 1)))
+                    break
+    return out
 
 
 def _finish(found, cues):
