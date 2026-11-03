@@ -1,21 +1,25 @@
 """Ad / self-promotion detection for mimi-hub transcripts.
 
 An LLM reads the episode's cues (index, time, speaker, text) and returns cue ranges that are ads or the show's
-self-promotion; those become time ranges a player can skip. The LLM runs through a subscription-logged-in agent
-CLI on the server (claude / codex / agy) in print mode, from an empty temp dir with tools off, so it costs nothing
-per episode and needs no API key in the hub.
+self-promotion; those become time ranges a player can skip. The LLM is either an API (OpenRouter: Claude Haiku 5.5,
+~$0.004 per hour of audio, needing only OPENROUTER_API_KEY, so a hub anywhere can run it) or a subscription-logged-in
+agent CLI on the server (claude / codex / agy) in print mode, from an empty temp dir with tools off, costing nothing
+per episode.
 
     MIMI_HUB_SEGMENTER = "<backend>:<model>[+<flag>...][,<backend>:<model>...]"   tried in order until one works;
-        default claude:claude-opus-5-5,codex:gpt-5.6-terra+high (also agy:gemini-4-argon-high), or "off"
+        default openrouter:anthropic/claude-haiku-5.5,claude:claude-opus-5-5,codex:gpt-5.6-terra+high (an API
+        backend whose key isn't set is skipped, so without OPENROUTER_API_KEY it's Opus through the CLI), or "off"
         codex flags: minimal / low / medium / high / xhigh (reasoning effort; without one, ~/.codex/config.toml's),
         fast / priority / flex / default (service tier); e.g. codex:gpt-6.1-sol+low+fast
         claude flags: low / medium / high / xhigh / max (--effort), fast (fast mode); e.g. claude:claude-opus-5-5+fast
-        openrouter:<model id> (OpenRouter's API, key in OPENROUTER_API_KEY); e.g. openrouter:inception/mercury-3
+        openrouter:<model id>[+<effort>] (OpenRouter's API, key in OPENROUTER_API_KEY; effort low .. xhigh as
+            its reasoning.effort); e.g. openrouter:anthropic/claude-haiku-5.5, openrouter:inception/mercury-3
         inception:<model id> (Inception Labs' API, key in INCEPTION_API_KEY); e.g. inception:mercury-3
 
 Against judged ground truths (2026-11-02; scripts/ads_truth.py): 13 episodes the v2 prompt was written from (50
-breaks) and 11 fresh shows (48), with the v2 prompt: Opus 5.5 97 of 98, nothing extra, ~5 s an episode;
-gpt-5.6-terra at high effort (the fallback) 98, ~8 s; Sol at high effort, the previous default, 96 with 3 extra.
+breaks) and 11 fresh shows (48), with the v2 prompt: Haiku 5.5 through OpenRouter all 98, nothing extra, edges a
+little looser (skipped-seconds IoU 0.94-0.95), ~9 s an episode, $0.097 for the 24 h of audio (high effort: no better,
+~20% more); Opus 5.5 97, IoU 0.99, ~5 s; gpt-5.6-terra at high effort 98, ~8 s; Sol at high effort, the previous default, 96 with 3 extra.
 Several transcripts per request (--many) found 1-2 fewer of the short self-promos. scripts/ads_bench.py compares.
 
 CLI: python -m hub.segments <episode.vtt> [backend:model]   (prints the segments JSON)
@@ -33,7 +37,8 @@ import sys
 import tempfile
 import time
 
-SEGMENTER = os.environ.get("MIMI_HUB_SEGMENTER", "claude:claude-opus-5-5,codex:gpt-5.6-terra+high")
+SEGMENTER = os.environ.get("MIMI_HUB_SEGMENTER",
+                           "openrouter:anthropic/claude-haiku-5.5,claude:claude-opus-5-5,codex:gpt-5.6-terra+high")
 CHUNK_CHARS = 90_000  # agy takes the prompt as one argv string (Linux caps those at 128 KiB)
 OVERLAP_CUES = 40
 TIMEOUT_S = 600
@@ -188,7 +193,7 @@ def _run(backend, model, prompt):
             r = subprocess.run(cmd, input=prompt, capture_output=True, text=True, cwd=tmp, env=env, timeout=TIMEOUT_S)
             out = open(last).read() if os.path.exists(last) else ""
         elif backend in _OPENAI_COMPAT:
-            return _chat(backend, model, prompt)
+            return _chat(backend, model, flags, prompt)
         elif backend == "agy":
             cmd = [exe, "--model", model, "--output-format", "text", "-p", prompt]
             r = subprocess.run(cmd, capture_output=True, text=True, cwd=tmp, env=env, timeout=TIMEOUT_S)
@@ -205,7 +210,7 @@ _OPENAI_COMPAT = {"openrouter": ("https://openrouter.ai/api/v1/chat/completions"
                   "inception": ("https://api.inceptionlabs.ai/v1/chat/completions", "INCEPTION_API_KEY")}
 
 
-def _chat(backend, model, prompt):
+def _chat(backend, model, flags, prompt):
     import urllib.request
     # uv's Python doesn't know NixOS's CA bundle (as hub/mimi_hub.py; this may run on its own)
     if not os.environ.get("SSL_CERT_FILE") and os.path.exists("/etc/ssl/certs/ca-certificates.crt"):
@@ -214,7 +219,14 @@ def _chat(backend, model, prompt):
     key = os.environ.get(var)
     if not key:
         raise RuntimeError(f"{var} not set")
-    body = json.dumps({"model": model, "messages": [{"role": "user", "content": prompt}], "temperature": 0})
+    body = {"model": model, "messages": [{"role": "user", "content": prompt}]}
+    if not model.startswith("anthropic/"):  # Claude 5.5 models reject non-default sampling
+        body["temperature"] = 0
+    for f in flags:
+        if f not in EFFORTS or backend != "openrouter":
+            raise ValueError(f"unknown {backend} flag {f!r}")
+        body["reasoning"] = {"effort": f}
+    body = json.dumps(body)
     req = urllib.request.Request(url, data=body.encode(),
                                  headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"})
     import urllib.error
@@ -265,11 +277,19 @@ def _merge(segs, cues):
     return out
 
 
+def _choices(segmenter):
+    """The [segmenter] list's entries, without API backends whose key isn't set (unless that leaves none)."""
+    every = [c.strip() for c in segmenter.split(",") if c.strip()]
+    keyed = [c for c in every if c.partition(":")[0] not in _OPENAI_COMPAT
+             or os.environ.get(_OPENAI_COMPAT[c.partition(":")[0]][1])]
+    return keyed or every
+
+
 def _ask(segmenter, lines, log, prompt=None):
     """Cue ranges from the first backend in the comma-separated [segmenter] list that answers."""
     errors = []
     head = PROMPTS[prompt or PROMPT_VERSION]
-    for choice in [c.strip() for c in segmenter.split(",") if c.strip()]:
+    for choice in _choices(segmenter):
         backend, _, model = choice.partition(":")
         try:
             found = []
@@ -310,7 +330,7 @@ def detect_many(episodes, segmenter=SEGMENTER, log=print):
               for k, cues in enumerate(episodes)]
     prompt = RULES_V2 + "\n" + REPLY_MANY.format(n=len(episodes)) + "\n\n".join(blocks) + "\n"
     errors = []
-    for choice in [c.strip() for c in segmenter.split(",") if c.strip()]:
+    for choice in _choices(segmenter):
         backend, _, model = choice.partition(":")
         try:
             text = _run(backend, model, prompt)

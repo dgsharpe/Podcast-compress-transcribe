@@ -40,8 +40,9 @@ hub/fetch_models.sh        # CPU speaker diarization models (sherpa-onnx), into 
 - **Models:** Mimi, Parakeet and Silero VAD download from Hugging Face on first use. The GPU diarizer, pyannote
   speaker-diarization-community-1, is gated: accept its conditions on huggingface.co, then run once
   `HF_TOKEN=... hf download pyannote/speaker-diarization-community-1`. Without it the hub uses the CPU diarizer.
-- **Ad detection** runs an agent CLI in print mode with your own login: install and sign in to `codex` and/or `claude`
-  on the server (`MIMI_HUB_SEGMENTER`, below), or set `MIMI_HUB_SEGMENTER=off`.
+- **Ad detection** needs either an OpenRouter API key in `OPENROUTER_API_KEY` (Claude Haiku 5.5, ~$0.004 per hour of
+  audio) or an agent CLI signed in on the server (`claude` and/or `codex`, run in print mode with your own login);
+  see `MIMI_HUB_SEGMENTER` below, or set `MIMI_HUB_SEGMENTER=off`.
 - **Try it:** `hub/serve.sh --host 127.0.0.1 --port 8765`, then
   `curl -X POST localhost:8765/v1/convert -H 'Content-Type: application/json' -d '{"url": "<episode audio URL or pca.st link>"}'`
   and poll `GET /v1/episodes/<id>`. `hub/serve.sh` uses `.venv-rocm` or `.venv-cuda` if present, else the uv `.venv`.
@@ -71,7 +72,7 @@ Environment variables, e.g. `Environment=` lines in the unit:
 |---|---|---|
 | `MIMI_HUB_COMPRESS` | `1` | `0`: no `.mimi` at all, only transcripts and ad marks (the app then plays originals via the hub) |
 | `MIMI_HUB_SOURCES` | `fetch` | originals for transcript-only episodes: `fetch` = not stored, re-fetched from the publisher when asked (409 if the publisher's file changed); `keep` = stored on disk |
-| `MIMI_HUB_SEGMENTER` | `claude:claude-opus-5-5,codex:gpt-5.6-terra+high` | ad detection, tried in order: logged-in agent CLIs (`claude:` / `codex:` / `agy:`, `+effort` / `+fast` flags) or APIs (`openrouter:` / `inception:`); `off` to disable. Prompt `MIMI_HUB_SEGMENTS_PROMPT` (`v2`). A backlog: `python -m hub.segments --many 4 *.vtt`. `scripts/ads_bench.py` compares models against `scripts/ads_truth.py`'s judged breaks |
+| `MIMI_HUB_SEGMENTER` | `openrouter:anthropic/claude-haiku-5.5,claude:claude-opus-5-5,codex:gpt-5.6-terra+high` | ad detection, tried in order: APIs (`openrouter:` / `inception:`, key in `OPENROUTER_API_KEY` / `INCEPTION_API_KEY`; skipped when it isn't set) or logged-in agent CLIs (`claude:` / `codex:` / `agy:`, `+effort` / `+fast` flags); `off` to disable. With only an OpenRouter key, Haiku 5.5 found all 98 judged breaks in 24 episodes for ~$0.004 per hour of audio; without one it's Opus through the `claude` CLI. Prompt `MIMI_HUB_SEGMENTS_PROMPT` (`v2`). A backlog: `python -m hub.segments --many 4 *.vtt`. `scripts/ads_bench.py` compares models against `scripts/ads_truth.py`'s judged breaks |
 | `MIMI_HUB_DEVICE` | `auto` | `cuda` / `cpu` |
 | `MIMI_HUB_DIARIZER` | `auto` | `pyannote` (GPU; gated HF model, fetch once with a token) / `sherpa` (CPU) |
 | `MIMI_HUB_ASR_ENCODER` | `native` | `onnx2torch` for the converted ONNX encoder |
