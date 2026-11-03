@@ -83,6 +83,29 @@ In the app, Settings > Advanced > Mimi server: `https://<workspace>--mimi-hub-se
   `HF_TOKEN` in the secret (or keep its snapshot in `data/modal_pyannote`); otherwise the CPU diarizer.
 - `scripts/remote_episode.py <url>/t/<token>` times a cold start and one episode against a running server.
 
+### Or both: a home server with Modal as its spare GPU
+
+The app talks only to your home server, which keeps the library, answers every status check (free, always on) and
+runs the ad detection with its own LLM logins; jobs it can't start right away go to the Modal server and come back:
+
+```sh
+cat >> ~/.config/mimi-hub/hub.env <<'END'     # read by the hub at start; the environment wins
+MIMI_HUB_REMOTE=https://<workspace>--mimi-hub-serve.<region>.modal.run
+MIMI_HUB_REMOTE_TOKEN_FILE=~/.config/mimi-hub/modal-token   # the Modal server's MIMI_HUB_TOKEN
+MIMI_HUB_REMOTE_WHEN=busy                     # busy (every local worker busy) | priority | always | off
+END
+```
+
+A job on Modal is converted there without ad detection, copied back (~2 MB per hour of audio) and its ads found at
+home; while it's being made the home server relays its `.mimi`, so the app can stream it. One Modal can't do is
+redone at home. Uploads and episodes that keep their source stay home. On halo (2026-11-02): three episodes at once,
+two converted at home and the third on Modal, all with Opus's ad marks.
+
+A backlog: `scripts/modal_backlog.py` converts a list of episodes in bulk on a Modal H100 into the Modal library
+(1,131 episodes, 912 h of Revolutions, The Weeds and The Ezra Klein Show in ~45 min at ~1,350x real time, ~$5),
+`scripts/import_modal_library.py` copies them home, and `scripts/backlog_ads.py` finds their ads with the home
+server's `claude` login (Haiku 5.5).
+
 ### Run it as a service
 
 `hub/mimi-hub.service` is a systemd user unit:

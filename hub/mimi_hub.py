@@ -45,6 +45,12 @@ then keeps its source); records say "compressed": false.
                                                 while the work it started in the background runs.
 Files live in $MIMI_HUB_DATA (default neural_audio/hub_data/): <id>.mimi, <id>.vtt, <id>.segments.json, <id>.json.
 
+A remote GPU (MIMI_HUB_REMOTE: another hub's URL, e.g. hub/modal_app.py's, with /t/<token> or its token in
+MIMI_HUB_REMOTE_TOKEN_FILE): jobs this hub can't start
+right away (MIMI_HUB_REMOTE_WHEN=busy, the default: every local worker busy; priority: also every priority-0 job;
+always) are converted there and copied back; this hub keeps the library, the clients and the ad detection (its own
+LLM logins), and relays the remote's .mimi while it's being made. A job the remote fails is redone here.
+
 GPU: run in .venv-rocm (hub/setup_rocm.sh; hub/serve.sh picks it) and the Mimi encoder and Parakeet's encoder run on
 the Radeon 8060S (MIMI_HUB_DEVICE=auto | cuda | cpu). Diarization and Parakeet's decoding loop stay on the CPU.
 """
@@ -77,6 +83,16 @@ from pydantic import BaseModel
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "scripts"))
+
+# Settings from a file too (KEY=value a line, # comments; the environment wins): MIMI_HUB_ENV_FILE, default
+# ~/.config/mimi-hub/hub.env. For a service whose unit is generated (home-manager) or settings kept out of it.
+_env_file = Path(os.environ.get("MIMI_HUB_ENV_FILE", Path.home() / ".config/mimi-hub/hub.env"))
+if _env_file.is_file():
+    for _ln in _env_file.read_text().splitlines():
+        _k, _eq, _v = _ln.strip().partition("=")
+        if _eq and _k and not _k.startswith("#"):
+            os.environ.setdefault(_k.strip(), _v.strip())
+
 import mimi_file  # noqa: E402
 
 from hub import segments  # noqa: E402
@@ -1287,7 +1303,7 @@ def _take_key(i, key):
 
 def queue_segments(i, cues=None):
     """Detect [i]'s ads / self-promotion from [cues] ([(start_s, end_s, speaker or None, text)]), else its VTT."""
-    if segments.SEGMENTER.strip().lower() in ("", "off"):
+    if segments.SEGMENTER.strip().lower() in ("", "off") or (load(i) or {}).get("no_segments"):
         _client_keys.pop(i, None)
         update(i, segments_state="off")
         return
@@ -1362,20 +1378,180 @@ def _requeue(i):
 def _take_job():
     """The next queued job's id (highest priority first), marked starting."""
     while True:
-        _, _, i = jobs.get()
+        prio, _, i = jobs.get()
         with lock:
             r = load(i)
             if not r or r["state"] != "queued":
                 continue  # duplicate entry (re-queued at a higher priority) or already handled
-            save(dict(r, state="starting"))
+            if _for_remote(prio, r):  # the remote GPU's (MIMI_HUB_REMOTE_WHEN always / priority)
+                jobs.put((prio, next(_seq), i))
+                claimed = True
+            else:
+                save(dict(r, state="starting"))
+                claimed = False
+        if claimed:
+            time.sleep(0.5)
+            continue
         return i
+
+
+def _for_remote(prio, r):
+    return (bool(REMOTE) and (REMOTE_WHEN == "always" or (REMOTE_WHEN == "priority" and prio == 0))
+            and bool(_remote_ok(r)))
+
+
+_local_jobs = [0]  # local workers running a job (the remote takes jobs when they're all busy)
 
 
 def worker():
     while True:
         i = _take_job()
-        with _working():
-            run(i)
+        with _active_lock:
+            _local_jobs[0] += 1
+        try:
+            with _working():
+                run(i)
+        finally:
+            with _active_lock:
+                _local_jobs[0] -= 1
+
+
+# ---------- a remote GPU (MIMI_HUB_REMOTE: another hub, e.g. hub/modal_app.py on Modal) ----------
+
+REMOTE = os.environ.get("MIMI_HUB_REMOTE", "").strip().rstrip("/")  # with /t/<token> if it has one, or:
+if REMOTE and os.environ.get("MIMI_HUB_REMOTE_TOKEN_FILE"):  # its token from a file (not in the settings)
+    REMOTE += "/t/" + Path(os.environ["MIMI_HUB_REMOTE_TOKEN_FILE"]).expanduser().read_text().strip()
+REMOTE_WHEN = os.environ.get("MIMI_HUB_REMOTE_WHEN", "busy")  # busy | priority | always | off
+REMOTE_JOBS = int(os.environ.get("MIMI_HUB_REMOTE_JOBS", "2"))  # at once (Modal's hub: one container, 2 workers)
+# POST /v1/warm passed on to the remote: by default only when it takes jobs a client may be waiting for
+REMOTE_WARM = os.environ.get("MIMI_HUB_REMOTE_WARM", "1" if REMOTE_WHEN in ("priority", "always") else "0") != "0"
+_remote_jobs = [0]
+
+
+def _remote_ok(r):
+    """Jobs the remote can do: an episode by URL, compressed (uploads and kept sources stay here)."""
+    return (r and not r.get("upload") and not r.get("keep_source") and r.get("compressed", COMPRESS)
+            and not r.get("remote_failed"))
+
+
+def _remote_wants():
+    if not REMOTE or REMOTE_WHEN == "off" or _remote_jobs[0] >= REMOTE_JOBS:
+        return False
+    with jobs.mutex:
+        head = jobs.queue[0] if jobs.queue else None
+    if head is None:
+        return False
+    return (REMOTE_WHEN == "always" or (REMOTE_WHEN == "priority" and head[0] == 0)
+            or _local_jobs[0] >= WORKERS)
+
+
+def _remote_open(path, body=None, headers=None, timeout=60):
+    """urllib (not httpx: its versions' APIs differ between the hub's environments)."""
+    data = None if body is None else json.dumps(body).encode()
+    h = {"Content-Type": "application/json", **UA, **(headers or {})}
+    return urllib.request.urlopen(urllib.request.Request(REMOTE + path, data=data, headers=h), timeout=timeout)
+
+
+def _remote(method, path, body=None, timeout=60):
+    try:
+        with _remote_open(path, {} if method == "POST" and body is None else body, timeout=timeout) as r:
+            return json.load(r)
+    except urllib.error.HTTPError as e:
+        if e.code == 404:
+            return None
+        raise
+
+
+def remote_worker():
+    while True:
+        if not _remote_wants():
+            time.sleep(0.5)
+            continue
+        try:
+            prio, _, i = jobs.get(timeout=1)
+        except queue.Empty:
+            continue
+        with lock:
+            r = load(i)
+            if not r or r["state"] != "queued":
+                continue
+            if not _remote_ok(r):  # back for a local worker
+                jobs.put((prio, next(_seq), i))
+                time.sleep(1)
+                continue
+            save(dict(r, state="starting", remote=REMOTE.split("/t/")[0]))
+        with _active_lock:
+            _remote_jobs[0] += 1
+        try:
+            with _working():
+                run_remote(i)
+        finally:
+            with _active_lock:
+                _remote_jobs[0] -= 1
+
+
+def run_remote(i):
+    """Job [i] converted by the remote and copied here, then its ads found here; redone locally if that fails."""
+    r = load(i)
+    t0 = time.time()
+    update(i, timing_start=t0, timing={})
+    try:
+        _remote("POST", "/v1/convert", {"url": r.get("audio_url") or r["url"], "id": i, "title": r.get("title"),
+                                        "priority": r.get("priority", 1), "segments": False})
+        last = None
+        while True:
+            s = _remote("GET", f"/v1/episodes/{i}")
+            if s is None:
+                raise RuntimeError("the remote lost the job")
+            if s["state"] == "failed":
+                raise RuntimeError(f"remote: {s.get('error')}")
+            if s["state"] == "ready":
+                break
+            mirror = (s["state"], s.get("progress"))
+            if mirror != last:  # its progress, for clients polling this hub
+                fields = {k: s[k] for k in ("duration_s", "mimi_bytes") if s.get(k)}
+                update(i, state=s["state"] if s["state"] != "queued" else "starting", progress=s.get("progress", 0.0),
+                       remote_state=s["state"], **fields)
+                last = mirror
+            time.sleep(1)
+        for ext in ("vtt", "mimi"):  # the .mimi last: once it's a plain file here, it's served from here
+            tmp = DATA / f"{i}.{ext}.remote"
+            with _remote_open(f"/v1/episodes/{i}.{ext}", timeout=300) as resp, open(tmp, "wb") as f:
+                shutil.copyfileobj(resp, f, 1 << 20)
+            tmp.replace(DATA / f"{i}.{ext}")
+        with lock:
+            rec = load(i)
+            save(dict(rec, state="ready", progress=1.0, remote_state="ready", asr=s.get("asr"),
+                      device=f"remote: {s.get('device')}", duration_s=s.get("duration_s"),
+                      mimi_bytes=(DATA / f"{i}.mimi").stat().st_size, speakers=s.get("speakers"),
+                      diarization=s.get("diarization"), compressed=True,
+                      timing={**(s.get("timing") or {}), "copied": round(time.time() - t0, 2)}))
+        queue_segments(i)
+    except Exception as e:
+        traceback.print_exc()
+        for ext in ("vtt", "mimi"):
+            (DATA / f"{i}.{ext}.remote").unlink(missing_ok=True)
+        print(f"[{i}] remote failed ({type(e).__name__}: {e}); converting here", flush=True)
+        with lock:
+            rec = load(i)
+            save(dict(rec, state="queued", progress=0.0, remote_failed=True, remote_error=f"{type(e).__name__}: {e}"[:300]))
+        jobs.put((rec.get("priority", 1), next(_seq), i))
+
+
+def proxy_remote(i, rng):
+    """The remote's .mimi for job [i] while it's being made there, passed through (Range and all)."""
+    try:
+        resp = _remote_open(f"/v1/episodes/{i}.mimi", headers={"Range": rng} if rng else None, timeout=120)
+    except urllib.error.HTTPError as e:
+        raise HTTPException(e.code, "remote: not ready") from None
+    keep = ("content-range", "content-length", "accept-ranges", "content-type")
+    headers = {k: v for k, v in resp.headers.items() if k.lower() in keep}
+
+    def body():
+        with resp:
+            while chunk := resp.read1(1 << 16):
+                yield chunk
+    return StreamingResponse(body(), status_code=resp.status, headers=headers)
 
 
 # ---------- worker processes (MIMI_HUB_PROCS > 1) ----------
@@ -1522,6 +1698,9 @@ def start():
     else:
         for k in range(WORKERS):
             threading.Thread(target=worker, daemon=True, name=f"mimi-worker-{k}").start()
+    if REMOTE and REMOTE_WHEN != "off":
+        for k in range(REMOTE_JOBS):
+            threading.Thread(target=remote_worker, daemon=True, name=f"mimi-remote-{k}").start()
     threading.Thread(target=segment_worker, daemon=True, name="mimi-segments").start()
     if PRELOAD:
         threading.Thread(target=warm, daemon=True, name="mimi-warm").start()
@@ -1571,6 +1750,7 @@ class ConvertRequest(BaseModel):
     title: str | None = None
     priority: int = 1  # 0: a client is about to stream it
     keep_source: bool = False  # also keep and serve the original audio (GET .src)
+    segments: bool = True  # False: no ad detection here (a hub using this one as its remote GPU does its own)
 
 
 @app.post("/v1/convert", status_code=202)
@@ -1585,8 +1765,9 @@ def convert(req: ConvertRequest, authorization: str | None = Header(None),
         check_id(req.id)
         i = req.id
     _take_key(i, x_openrouter_key)
+    extra = {} if req.segments else {"no_segments": True}
     r = enqueue(i, priority=min(1, max(0, req.priority)), keep_source=req.keep_source, url=req.url,
-                audio_url=audio, title=req.title or title)
+                audio_url=audio, title=req.title or title, **extra)
     return _retry_segments(r, x_openrouter_key)
 
 
@@ -1625,6 +1806,8 @@ def warm_up(authorization: str | None = Header(None)):
     _linger_until[0] = max(_linger_until[0], time.time() + WARM_LINGER_S)
     if _warm["models"] in ("cold", "failed"):
         threading.Thread(target=warm, daemon=True, name="mimi-warm").start()
+    if REMOTE and REMOTE_WARM:  # (fire and forget: it may be cold-starting)
+        threading.Thread(target=lambda: _remote("POST", "/v1/warm", {}, timeout=90), daemon=True).start()
     return {"models": "loading" if _warm["models"] == "cold" else _warm["models"]}
 
 
@@ -1747,14 +1930,22 @@ def episode(name: str, request: Request, authorization: str | None = Header(None
             raise HTTPException(404, "no segments yet")
         return FileResponse(p, media_type="application/json")
     if ext == "mimi":
-        deadline = time.time() + 30  # a just-requested job writes its header within a few seconds
-        while (L := live.get(stem)) is None and time.time() < deadline:
+        # a just-requested job writes its header within a few seconds; one on the remote GPU after its start (a
+        # cold one on Modal: up to a minute or so)
+        t0 = time.time()
+        while (L := live.get(stem)) is None:
             r = load(stem)
             if not r or r["state"] not in ("queued", "starting", "downloading"):
+                break
+            if time.time() - t0 > (120 if r.get("remote") and not r.get("remote_failed") else 30):
                 break
             time.sleep(0.25)
         if L is not None:
             return stream_live(L, request.headers.get("range"))
+        r = load(stem)
+        if (REMOTE and r and r.get("remote") and not r.get("remote_failed") and r["state"] not in ("ready", "failed")
+                and r.get("remote_state") not in (None, "queued", "starting", "ready")):
+            return proxy_remote(stem, request.headers.get("range"))  # being made on the remote GPU
     if ext == "src":
         r = load(stem)
         p = DATA / f"{stem}.src"

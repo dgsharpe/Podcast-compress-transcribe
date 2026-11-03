@@ -1,6 +1,7 @@
 """Batch conversion: many episodes on one GPU at once, each model's work batched across episodes.
 
     python -m hub.bulk OUT_DIR AUDIO [AUDIO ...] [--prep N]      (files or URLs; ffmpeg on PATH)
+    python -m hub.bulk OUT_DIR --manifest episodes.json          ([{"id", "url"}, ...]: outputs named <id>)
 
 The hub (hub/mimi_hub.py) runs one episode per job, so its GPU batches are one episode's: Mimi one stream (batch
 1), Parakeet up to 16 segments, pyannote 32 windows; filling a fast GPU took many processes, each with its own copy
@@ -127,9 +128,9 @@ def _busy(name, t0):
     BUSY[name] = BUSY.get(name, 0.0) + time.perf_counter() - t0
 
 class Episode:
-    def __init__(self, src, out_dir, prep):
+    def __init__(self, src, out_dir, prep, name=None):
         import numpy as np
-        self.src, self.name = src, Path(str(src)).stem
+        self.src, self.name = src, name or Path(str(src)).stem
         self.out_dir, self.p = Path(out_dir), prep
         buf = np.load(prep["spool"], mmap_mode="r")
         self.w24, self.w16 = buf[:prep["n24"]], buf[prep["n24"]:]
@@ -406,8 +407,10 @@ def write_outputs(models, ep):
     ep.release()
 
 
-def convert(sources, out_dir, prep_workers=None, models=None, log=print):
-    """Convert [sources] into [out_dir]; returns per-episode stats. [models]: a loaded Models (reused)."""
+def convert(sources, out_dir, prep_workers=None, models=None, log=print, names=None):
+    """Convert [sources] into [out_dir]; returns per-episode stats. [models]: a loaded Models (reused); [names]:
+    {source: output name} (default: the source's file name without its extension)."""
+    names = names or {}
     import multiprocessing
     import tempfile
     out_dir = Path(out_dir)
@@ -441,11 +444,11 @@ def convert(sources, out_dir, prep_workers=None, models=None, log=print):
             while src not in futures:
                 time.sleep(0.01)
             try:
-                ep = Episode(src, out_dir, futures[src].result())
+                ep = Episode(src, out_dir, futures[src].result(), names.get(src))
             except Exception as e:  # noqa: BLE001 - e.g. a file ffmpeg can't read: skip it
                 slots.release()
                 log(f"{src}: {type(e).__name__}: {e}")
-                stats.append({"name": Path(str(src)).stem, "error": f"{type(e).__name__}: {e}"})
+                stats.append({"name": names.get(src) or Path(str(src)).stem, "error": f"{type(e).__name__}: {e}"[:500]})
                 continue
             for k in range(ep.n_pieces):
                 pieces.put((ep, k))
@@ -504,10 +507,16 @@ def convert(sources, out_dir, prep_workers=None, models=None, log=print):
 def main():
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     ap.add_argument("out_dir")
-    ap.add_argument("sources", nargs="+")
+    ap.add_argument("sources", nargs="*")
     ap.add_argument("--prep", type=int, default=None, help="CPU worker processes (default: half the cores)")
+    ap.add_argument("--manifest", default=None, help='JSON list of {"id", "url"}: outputs named <id>')
     a = ap.parse_args()
-    summary, stats = convert(a.sources, a.out_dir, a.prep)
+    sources, names = list(a.sources), {}
+    if a.manifest:
+        for e in json.loads(Path(a.manifest).read_text()):
+            sources.append(e["url"])
+            names[e["url"]] = e["id"]
+    summary, stats = convert(sources, a.out_dir, a.prep, names=names)
     for s in stats:
         print("EPISODE " + json.dumps({k: v for k, v in s.items() if k != "turns"}), flush=True)
     print("BULK " + json.dumps(summary), flush=True)
