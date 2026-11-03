@@ -374,6 +374,8 @@ def _refine(second, lines, found, head, log):
             spans[-1] = (spans[-1][0], max(hi, spans[-1][1]), spans[-1][2] + [s])
         else:
             spans.append((lo, hi, [s]))
+    if not spans:  # nothing found: nothing to re-read
+        return []
     # all of an episode's excerpts in one request (each request also carries the rules and the CLI's own prompt:
     # one per excerpt, Opus read 26% as many tokens as Haiku on the judged episodes), CHUNK_CHARS at most
     groups, size = [[]], 0
