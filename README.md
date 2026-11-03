@@ -1,5 +1,8 @@
 # neural_audio: podcasts as Mimi, with transcripts and ad skipping
 
+`AGENTS.md` is a short guide to the repository and to setting up a server (at home, on Modal, or both), for AI
+coding agents and people.
+
 A podcast pipeline. A server (**mimi-hub**) re-encodes episodes with Kyutai's
 [Mimi](https://huggingface.co/kyutai/mimi) neural codec (32 codebooks, 4.4 kb/s, about 2 MB per hour), transcribes
 them with speaker labels (Parakeet TDT 0.6B v2 + pyannote) and marks ads and self-promotion with an LLM. A patched
@@ -40,13 +43,71 @@ hub/fetch_models.sh        # CPU speaker diarization models (sherpa-onnx), into 
 - **Models:** Mimi, Parakeet and Silero VAD download from Hugging Face on first use. The GPU diarizer, pyannote
   speaker-diarization-community-1, is gated: accept its conditions on huggingface.co, then run once
   `HF_TOKEN=... hf download pyannote/speaker-diarization-community-1`. Without it the hub uses the CPU diarizer.
-- **Ad detection** runs an agent CLI in print mode with your own login: install and sign in to `codex` and/or `claude`
-  on the server (`MIMI_HUB_SEGMENTER`, below), or set `MIMI_HUB_SEGMENTER=off`.
+- **Ad detection** needs either an OpenRouter API key in `OPENROUTER_API_KEY` (Claude Haiku 5.5, ~$0.004 per hour of
+  audio) or an agent CLI signed in on the server (`claude` and/or `codex`, run in print mode with your own login);
+  see `MIMI_HUB_SEGMENTER` below, or set `MIMI_HUB_SEGMENTER=off`.
 - **Try it:** `hub/serve.sh --host 127.0.0.1 --port 8765`, then
   `curl -X POST localhost:8765/v1/convert -H 'Content-Type: application/json' -d '{"url": "<episode audio URL or pca.st link>"}'`
   and poll `GET /v1/episodes/<id>`. `hub/serve.sh` uses `.venv-rocm` or `.venv-cuda` if present, else the uv `.venv`.
-- **Network:** the patched app sends no token, so bind the hub to a private address (a Tailscale IP works well)
-  rather than the internet.
+- **Network:** bind the hub to a private address (a Tailscale IP works well) rather than the internet, or set
+  `MIMI_HUB_TOKEN` and give the app the URL with the token in it, `https://<server>/t/<token>` (the app sends no
+  header of its own).
+
+### Or: your own server on Modal
+
+No machine of your own: `hub/modal_app.py` runs the hub on a [Modal](https://modal.com) GPU that's only up (and
+billed) while it works, with ad detection through an OpenRouter key.
+
+```sh
+pip install modal && modal setup
+modal secret create mimi-hub MIMI_HUB_TOKEN=$(python3 -c 'import secrets; print(secrets.token_urlsafe(32))') \
+  [OPENROUTER_API_KEY=<your key>] [HF_TOKEN=<token>]   # both optional: below
+modal deploy hub/modal_app.py       # prints https://<workspace>--mimi-hub-serve.<region>.modal.run
+```
+
+In the app, Settings > Advanced > Mimi server: `https://<workspace>--mimi-hub-serve.<region>.modal.run/t/<token>`
+(`modal secret` doesn't show the token again: keep it). The app wakes the server when it comes to the foreground.
+
+- **Ad detection:** either the server's own `OPENROUTER_API_KEY` (in the secret), or none there and the app's
+  Settings > Advanced > Mimi server > OpenRouter key, sent with each conversion (`X-OpenRouter-Key`) and held only
+  in the server's memory until that episode's ads are found. Episodes whose detection failed for want of a key are
+  redone when one arrives.
+
+- **First start:** converts the models and compiles their kernels, ~5-10 min, kept on the `mimi-hub-models` Volume.
+  The next few cold starts (~1 min each) also make Modal's memory snapshots of the loaded container.
+- **Cold start after that** (L40S, the default; an H100 when no L40S is free): restored from a snapshot, the server
+  has its models ready ~8 s after the request. A 43 min episode then plays after ~2-3 s and is fully transcribed
+  after ~13 s (+ ~10 s for ads). An H100 was no faster.
+- **Cost:** Modal bills while the container is up: an L40S with 16 cores ~$3 an hour. A launch, restored and
+  scaling down 20 s after its last request or job, ~$0.02 (~$0.05 when the app wakes it, which holds it 30 s for
+  you to pick an episode; at most every 15 min), plus ~$0.02 per hour of audio. Modal's free plan includes $30 a
+  month. `MIMI_MODAL_GPU` / `MIMI_MODAL_CPU` at deploy pick others (see `hub/modal_app.py`).
+- **Speaker labels:** pyannote's community-1 model is gated: accept its conditions on huggingface.co and put
+  `HF_TOKEN` in the secret (or keep its snapshot in `data/modal_pyannote`); otherwise the CPU diarizer.
+- `scripts/remote_episode.py <url>/t/<token>` times a cold start and one episode against a running server.
+
+### Or both: a home server with Modal as its spare GPU
+
+The app talks only to your home server, which keeps the library, answers every status check (free, always on) and
+runs the ad detection with its own LLM logins; jobs it can't start right away go to the Modal server and come back:
+
+```sh
+cat >> ~/.config/mimi-hub/hub.env <<'END'     # read by the hub at start; the environment wins
+MIMI_HUB_REMOTE=https://<workspace>--mimi-hub-serve.<region>.modal.run
+MIMI_HUB_REMOTE_TOKEN_FILE=~/.config/mimi-hub/modal-token   # the Modal server's MIMI_HUB_TOKEN
+MIMI_HUB_REMOTE_WHEN=busy                     # busy (every local worker busy) | priority | always | off
+END
+```
+
+A job on Modal is converted there without ad detection, copied back (~2 MB per hour of audio) and its ads found at
+home; while it's being made the home server relays its `.mimi`, so the app can stream it. One Modal can't do is
+redone at home. Uploads and episodes that keep their source stay home. On halo (2026-11-02): three episodes at once,
+two converted at home and the third on Modal, all with Opus's ad marks.
+
+A backlog: `scripts/modal_backlog.py` converts a list of episodes in bulk on a Modal H100 into the Modal library
+(1,131 episodes, 912 h of Revolutions, The Weeds and The Ezra Klein Show in ~45 min at ~1,350x real time, ~$5),
+`scripts/import_modal_library.py` copies them home, and `scripts/backlog_ads.py` finds their ads with the home
+server's `claude` login (Haiku 5.5).
 
 ### Run it as a service
 
@@ -71,7 +132,7 @@ Environment variables, e.g. `Environment=` lines in the unit:
 |---|---|---|
 | `MIMI_HUB_COMPRESS` | `1` | `0`: no `.mimi` at all, only transcripts and ad marks (the app then plays originals via the hub) |
 | `MIMI_HUB_SOURCES` | `fetch` | originals for transcript-only episodes: `fetch` = not stored, re-fetched from the publisher when asked (409 if the publisher's file changed); `keep` = stored on disk |
-| `MIMI_HUB_SEGMENTER` | `codex:gpt-6.1-sol,claude:claude-haiku-5-5` | ad detection via logged-in agent CLIs, tried in order; `off` to disable |
+| `MIMI_HUB_SEGMENTER` | `claude:claude-haiku-5-5>claude:claude-opus-5-5,openrouter:anthropic/claude-haiku-5.5,codex:gpt-5.6-terra+high` | ad detection, tried in order (the subscription first; a CLI that isn't installed or an API without a key is skipped): APIs (`openrouter:` / `inception:`, key in `OPENROUTER_API_KEY` / `INCEPTION_API_KEY` or the app's `X-OpenRouter-Key`) or logged-in agent CLIs (`claude:` / `codex:` / `agy:`, `+effort` / `+fast` flags); `A>B`: B re-reads 60 s around each break A found (Haiku then Opus scored as Opus does, Opus reading 13.5% as much); `off` to disable. With only an OpenRouter key, Haiku 5.5 found all 98 judged breaks in 24 episodes for ~$0.004 per hour of audio; without one it's Opus through the `claude` CLI. Prompt `MIMI_HUB_SEGMENTS_PROMPT` (`v2`). A backlog: `python -m hub.segments --many 4 *.vtt`. `scripts/ads_bench.py` compares models against `scripts/ads_truth.py`'s judged breaks |
 | `MIMI_HUB_DEVICE` | `auto` | `cuda` / `cpu` |
 | `MIMI_HUB_DIARIZER` | `auto` | `pyannote` (GPU; gated HF model, fetch once with a token) / `sherpa` (CPU) |
 | `MIMI_HUB_ASR_ENCODER` | `native` | `onnx2torch` for the converted ONNX encoder |
@@ -106,6 +167,13 @@ of a batch). The process is still limited by Python launching GPU work, so it ru
 free-threaded environment is built in `scripts/modal_hub_bench.py`'s image: uv's `cpython-3.14.10+freethreaded`,
 torch 2.14.1+cu130 (`cp314t`), protobuf's C extensions removed (they segfault without the GIL) and
 `PYTHON_GIL=0`. On the Radeon 8060S it makes no difference (~90x vs ~80x for the hub; GPU-bound).
+
+Since then, on an H100 (1,024 five-minute episodes, 5 s diarization step): AOTInductor for Parakeet's encoder and
+the ResNet (`MIMI_HUB_COMPILE`), ~1,750–1,900x; the TDT search as CUDA graphs (`MIMI_BULK_ASR_GRAPH`, on by default
+on NVIDIA; each graph set captured on a stream of its own, `hub/graph_stream.py`: two graph sets sharing a cuBLAS
+workspace used to hang the GPU), 2,083x; Mimi's SEANet as a TensorRT engine (`MIMI_BULK_MIMI_TRT`,
+`hub/trt_seanet.py`; needs `tensorrt-cu13` and `libnvinfer-headers-dev`, built on first use), 2,165x. Its Mimi codes
+differ from cuDNN's in ~20% of entries but decode to audio as close to the original (log-mel L1 0.585 either way).
 Settings: `MIMI_BULK_*` at the top of `hub/bulk.py`. `scripts/bulk_bench.py` measures it and checks it against the
 hub.
 

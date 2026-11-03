@@ -6,7 +6,7 @@ a backlog of 8 x 5 min clips, then variants of how it's run.
 
 Each plan entry is one throughput_server.py run (fresh process, so env settings apply) in the same container.
 Needs locally: data/ref/ref_24k.wav, data/modal_pyannote/ (the gated community-1 snapshot, cp -rL out of the HF
-cache). Results: outputs/modal_hub_bench.jsonl (one line per run).
+cache); both optional for scripts/modal_backlog.py, which uses this image. Results: outputs/modal_hub_bench.jsonl.
 """
 
 import json
@@ -81,10 +81,12 @@ image = (
         "wget -q https://developer.download.nvidia.com/compute/cuda/repos/debian$(. /etc/os-release; echo $VERSION_ID)"
         "/x86_64/cuda-keyring_1.1-1_all.deb && dpkg -i cuda-keyring_1.1-1_all.deb && rm cuda-keyring_1.1-1_all.deb",
         "apt-get update -q && apt-get install -y -q cuda-nvcc-13-0 cuda-cudart-dev-13-0 cuda-driver-dev-13-0",
+        # TensorRT's C++ headers, for hub/trt_seanet.py's shim (the pip package's libnvinfer, same version)
+        "apt-get install -y -q libnvinfer-headers-dev=11.4.0.106-1+cuda13.4",
     )
+    # TensorRT and the ONNX exporter (the standard Python only), for scripts/trt_mimi_check.py
+    .pip_install("tensorrt-cu13", "onnx", "onnxscript")
     .env({**ENV, "CUDA_HOME": "/usr/local/cuda-13.0"})
-    .add_local_dir(ROOT / "data/modal_pyannote", "/models/pyannote")
-    .add_local_file(ROOT / "data/ref/ref_24k.wav", f"{NA}/data/ref/ref_24k.wav")
     .add_local_dir(ROOT / "hub", f"{NA}/hub", ignore=["__pycache__", "*.pyc"])
     .add_local_file(ROOT / "scripts/mimi_file.py", f"{NA}/scripts/mimi_file.py")
     .add_local_file(ROOT / "scripts/throughput_server.py", f"{NA}/scripts/throughput_server.py")
@@ -99,7 +101,15 @@ image = (
     .add_local_file(ROOT / "scripts/seg_profile.py", f"{NA}/scripts/seg_profile.py")
     .add_local_file(ROOT / "scripts/compile_check.py", f"{NA}/scripts/compile_check.py")
     .add_local_file(ROOT / "scripts/aoti_check.py", f"{NA}/scripts/aoti_check.py")
+    .add_local_file(ROOT / "scripts/trt_mimi_check.py", f"{NA}/scripts/trt_mimi_check.py")
+    .add_local_file(ROOT / "scripts/episode_timeline.py", f"{NA}/scripts/episode_timeline.py")
 )
+# local files that aren't in git, if there: the gated pyannote snapshot (without it, no speaker labels) and the
+# benchmarks' reference clip (scripts/modal_backlog.py needs neither)
+if (ROOT / "data/modal_pyannote").exists():
+    image = image.add_local_dir(ROOT / "data/modal_pyannote", "/models/pyannote")
+if (ROOT / "data/ref/ref_24k.wav").exists():
+    image = image.add_local_file(ROOT / "data/ref/ref_24k.wav", f"{NA}/data/ref/ref_24k.wav")
 app = modal.App("mimi-hub-bench", image=image)
 
 FT_PYTHON = "/ft/bin/python"
@@ -419,6 +429,134 @@ PLANS = {
          {**FT_ENV, "BULK_WATCHDOG_S": "880", "MIMI_BULK_IN_FLIGHT": "96", "MIMI_HUB_DIAR_STEP": "0.5",
           "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True"}),
     ],
+    # where bulk mode's GPU time goes now (AOT models, 5 s step): 5 s of kernels per stage, 40 s into the run
+    "prof1": [
+        (["bulk_bench.py", "--clips", "512", "--check", "0", "--prep", "32", "--subtype", "PCM_16", "--profile",
+          "40:5"],
+         {**FT_ENV, "BULK_WATCHDOG_S": "880", "MIMI_BULK_IN_FLIGHT": "96", "MIMI_HUB_DIAR_STEP": "0.5",
+          "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True"}),
+    ],
+    # fbank in the ResNet batcher, 128-window calls and a 10 ms merge wait; then Mimi at batch 32; then its profile
+    "opt1": [
+        (["bulk_bench.py", "--clips", "1024", "--check", "0", "--prep", "32", "--subtype", "PCM_16"],
+         {**FT_ENV, "BULK_WATCHDOG_S": "880", "MIMI_BULK_IN_FLIGHT": "96", "MIMI_HUB_DIAR_STEP": "0.5",
+          "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True"}),
+        (["bulk_bench.py", "--clips", "1024", "--check", "0", "--prep", "32", "--subtype", "PCM_16"],
+         {**FT_ENV, "BULK_WATCHDOG_S": "880", "MIMI_BULK_IN_FLIGHT": "96", "MIMI_HUB_DIAR_STEP": "0.5",
+          "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True", "MIMI_BULK_MIMI_BATCH": "32"}),
+        (["bulk_bench.py", "--clips", "512", "--check", "0", "--prep", "32", "--subtype", "PCM_16", "--profile",
+          "40:5"],
+         {**FT_ENV, "BULK_WATCHDOG_S": "880", "MIMI_BULK_IN_FLIGHT": "96", "MIMI_HUB_DIAR_STEP": "0.5",
+          "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True", "MIMI_BULK_MIMI_BATCH": "32"}),
+    ],
+    # the ASR loop is the limit: its streams at high priority (the new default), then with 3 and 4 ASR workers
+    "asr1": [
+        (["bulk_bench.py", "--clips", "1024", "--check", "0", "--prep", "32", "--subtype", "PCM_16"],
+         {**FT_ENV, "BULK_WATCHDOG_S": "880", "MIMI_BULK_IN_FLIGHT": "96", "MIMI_HUB_DIAR_STEP": "0.5",
+          "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True"}),
+        (["bulk_bench.py", "--clips", "1024", "--check", "0", "--prep", "32", "--subtype", "PCM_16"],
+         {**FT_ENV, "BULK_WATCHDOG_S": "880", "MIMI_BULK_IN_FLIGHT": "96", "MIMI_HUB_DIAR_STEP": "0.5",
+          "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True", "MIMI_BULK_ASR_WORKERS": "3"}),
+        (["bulk_bench.py", "--clips", "1024", "--check", "0", "--prep", "32", "--subtype", "PCM_16"],
+         {**FT_ENV, "BULK_WATCHDOG_S": "880", "MIMI_BULK_IN_FLIGHT": "96", "MIMI_HUB_DIAR_STEP": "0.5",
+          "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True", "MIMI_BULK_ASR_WORKERS": "4"}),
+    ],
+    # one bulk process stops scaling (bigger batches, more ASR workers: slower): 2 and 4 under MPS, the episodes in
+    # flight split between them
+    "mp1": [
+        (["bulk_bench.py", "--clips", "1024", "--check", "0", "--prep", "32", "--subtype", "PCM_16", "--procs", "2"],
+         {**FT_ENV, "MPS": "1", "BULK_WATCHDOG_S": "880", "MIMI_HUB_DIAR_STEP": "0.5",
+          "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True", "MIMI_BULK_IN_FLIGHT": "48"}),
+        (["bulk_bench.py", "--clips", "1024", "--check", "0", "--prep", "32", "--subtype", "PCM_16", "--procs", "4"],
+         {**FT_ENV, "MPS": "1", "BULK_WATCHDOG_S": "880", "MIMI_HUB_DIAR_STEP": "0.5",
+          "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True", "MIMI_BULK_IN_FLIGHT": "24"}),
+    ],
+    # every setup tops out at 1,900-1,970x, and more parallel work inside a process makes it slower: the CPU? (run
+    # with --cpu 64): one bulk process with more prep workers, two under MPS, and the 16 hub processes
+    "cpu1": [
+        (["bulk_bench.py", "--clips", "1024", "--check", "0", "--prep", "48", "--subtype", "PCM_16"],
+         {**FT_ENV, "BULK_WATCHDOG_S": "880", "MIMI_BULK_IN_FLIGHT": "96", "MIMI_HUB_DIAR_STEP": "0.5",
+          "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True"}),
+        (["bulk_bench.py", "--clips", "1024", "--check", "0", "--prep", "48", "--subtype", "PCM_16", "--procs", "2"],
+         {**FT_ENV, "BULK_WATCHDOG_S": "880", "MIMI_BULK_IN_FLIGHT": "96", "MIMI_HUB_DIAR_STEP": "0.5",
+          "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True", "MPS": "1", "MIMI_BULK_IN_FLIGHT": "48"}),
+        (["--clips", "64", "--workers", "1", "--procs", "16"], {**MPS_ENV, "MIMI_HUB_DIAR_STEP": "0.5"}),
+    ],
+    # Mimi's SEANet as a TensorRT engine vs eager: 32 x 20 s (the ceiling test's shape) and 16 x 20 s (bulk's batch)
+    "trt1": [
+        (["trt_mimi_check.py", "32", "20"], {}),
+        (["trt_mimi_check.py", "16", "20"], {}),
+    ],
+    # one episode at a time, warm (the on-demand case): a real podcast URL and the 43.8 min reference as an upload,
+    # stage times from the request; no ad detection (no LLM here); diarization at the 2 s and 5 s step
+    "lat1": [
+        # each its own data dir: the hub would serve the episodes the run before converted
+        (["episode_timeline.py"], {"MIMI_HUB_SEGMENTER": "off", "MIMI_HUB_DATA": "/tmp/hub_data_lat_a"}),
+        (["episode_timeline.py"], {"MIMI_HUB_SEGMENTER": "off", "MIMI_HUB_DIAR_STEP": "0.5",
+                                   "MIMI_HUB_DATA": "/tmp/hub_data_lat_b"}),
+    ],
+    # the TDT search: eager, as CUDA graphs captured on demand, and captured up front then replayed from a worker
+    # thread (bulk mode's way, which got stuck before): tokens vs onnx_asr's loop and decode time
+    "dec1": [
+        (["parakeet_decoder_check.py"], {}),
+        (["parakeet_decoder_check.py"], {"DECODER_GRAPH": "1"}),
+        (["parakeet_decoder_check.py"], {"DECODER_GRAPH": "1", "DECODER_PRECAPTURE": "1"}),
+    ],
+    # the TDT search as CUDA graphs in bulk mode (captured at load; replays matched onnx_asr 548/548 and decoded
+    # 2.7x faster on their own), against the same run without
+    "dec2": [
+        (["bulk_bench.py", "--clips", "1024", "--check", "0", "--prep", "32", "--subtype", "PCM_16"],
+         {**FT_ENV, "BULK_WATCHDOG_S": "880", "MIMI_BULK_IN_FLIGHT": "96", "MIMI_HUB_DIAR_STEP": "0.5",
+          "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True", "MIMI_BULK_ASR_GRAPH": "1"}),
+        (["bulk_bench.py", "--clips", "1024", "--check", "0", "--prep", "32", "--subtype", "PCM_16"],
+         {**FT_ENV, "BULK_WATCHDOG_S": "880", "MIMI_BULK_IN_FLIGHT": "96", "MIMI_HUB_DIAR_STEP": "0.5",
+          "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True"}),
+    ],
+    # where bulk mode's decoder graphs hang (both ASR threads stuck in a GPU sync; alone they matched and ran 2.7x
+    # faster): one ASR worker / no expandable segments (free-threaded), and the GIL Python
+    "dec3a": [
+        (["bulk_bench.py", "--clips", "128", "--check", "0", "--prep", "32", "--subtype", "PCM_16"],
+         {**FT_ENV, "BULK_WATCHDOG_S": "600", "MIMI_BULK_IN_FLIGHT": "96", "MIMI_HUB_DIAR_STEP": "0.5",
+          "MIMI_BULK_ASR_GRAPH": "1", "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True",
+          "MIMI_BULK_ASR_WORKERS": "1"}),
+        (["bulk_bench.py", "--clips", "128", "--check", "0", "--prep", "32", "--subtype", "PCM_16"],
+         {**FT_ENV, "BULK_WATCHDOG_S": "600", "MIMI_BULK_IN_FLIGHT": "96", "MIMI_HUB_DIAR_STEP": "0.5",
+          "MIMI_BULK_ASR_GRAPH": "1"}),
+    ],
+    "dec3b": [
+        (["bulk_bench.py", "--clips", "128", "--check", "0", "--prep", "32", "--subtype", "PCM_16"],
+         {"BULK_WATCHDOG_S": "600", "MIMI_BULK_IN_FLIGHT": "96", "MIMI_HUB_DIAR_STEP": "0.5",
+          "MIMI_BULK_ASR_GRAPH": "1", "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True"}),
+    ],
+    # one episode, warm, with the hub's order and in latency mode (MIMI_HUB_LATENCY), at the 2 s and 5 s step
+    "lat2": [
+        (["episode_timeline.py"], {"MIMI_HUB_SEGMENTER": "off", "MIMI_HUB_DATA": "/tmp/hub_data_l0"}),
+        (["episode_timeline.py"], {"MIMI_HUB_SEGMENTER": "off", "MIMI_HUB_LATENCY": "1",
+                                   "MIMI_HUB_DATA": "/tmp/hub_data_l1"}),
+        (["episode_timeline.py"], {"MIMI_HUB_SEGMENTER": "off", "MIMI_HUB_LATENCY": "1", "MIMI_HUB_DIAR_STEP": "0.5",
+                                   "MIMI_HUB_DATA": "/tmp/hub_data_l2"}),
+    ],
+    # decoder graphs with their replays serialized across ASR workers (bulk, 1,024 episodes), and one episode in
+    # latency mode with sharded VAD (MIMI_HUB_VAD_SHARDS 16, latency mode's default)
+    "dec4": [
+        (["bulk_bench.py", "--clips", "1024", "--check", "0", "--prep", "32", "--subtype", "PCM_16"],
+         {**FT_ENV, "BULK_WATCHDOG_S": "600", "MIMI_BULK_IN_FLIGHT": "96", "MIMI_HUB_DIAR_STEP": "0.5",
+          "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True", "MIMI_BULK_ASR_GRAPH": "1"}),
+        (["episode_timeline.py"], {"MIMI_HUB_SEGMENTER": "off", "MIMI_HUB_LATENCY": "1", "MIMI_HUB_DIAR_STEP": "0.5",
+                                   "MIMI_HUB_DATA": "/tmp/hub_data_l3"}),
+    ],
+    # decoder graphs, one set shared by the ASR workers (a second slot's set hung): 128 then 1,024 episodes; then one
+    # episode in latency mode with sharded VAD
+    "dec5": [
+        (["bulk_bench.py", "--clips", "128", "--check", "0", "--prep", "32", "--subtype", "PCM_16"],
+         {**FT_ENV, "BULK_WATCHDOG_S": "600", "MIMI_BULK_IN_FLIGHT": "96", "MIMI_HUB_DIAR_STEP": "0.5",
+          "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True", "MIMI_BULK_ASR_GRAPH": "1"}),
+        (["bulk_bench.py", "--clips", "1024", "--check", "0", "--prep", "32", "--subtype", "PCM_16"],
+         {**FT_ENV, "BULK_WATCHDOG_S": "600", "MIMI_BULK_IN_FLIGHT": "96", "MIMI_HUB_DIAR_STEP": "0.5",
+          "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True", "MIMI_BULK_ASR_GRAPH": "1"}),
+        (["episode_timeline.py"], {"MIMI_HUB_SEGMENTER": "off", "MIMI_HUB_LATENCY": "1", "MIMI_HUB_DIAR_STEP": "0.5",
+                                   "MIMI_HUB_DATA": "/tmp/hub_data_l4"}),
+    ],
     # AOTInductor prototype: Parakeet (one bucket) and the ResNet as packages, with the GIL and free-threaded
     "aot1": [
         (["aoti_check.py"], {"MIMI_HUB_COMPILE": "0"}),
@@ -551,7 +689,7 @@ def main(gpus: str = "L40S,H100", plan: str = "baseline", cpu: float = 16.0, mem
                     for r in rows:
                         r["plan"], r["cpu"], r["mem_gib"] = plan, cpu, mem
                         f.write(json.dumps(r) + "\n")
-                        if "error" in r:
+                        if r.get("error"):  # (TIMELINE rows carry "error": null)
                             print(f"{g:6s} ERROR {r.get('args')} {r['error'][-300:]}", flush=True)
                             continue
                         if r.get("tag") != "RESULT":

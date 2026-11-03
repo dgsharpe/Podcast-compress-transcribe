@@ -134,8 +134,10 @@ class NativeEncoder:
                 for t in buckets:
                     x = torch.zeros(2, t, encoder.config.num_mel_bins, device=device)
                     mask = torch.ones(2, t, dtype=torch.bool, device=device)
+                    # one runner: encode() calls it under self._lock anyway (more only load more copies: ~7 s for
+                    # 4 buckets x 4 runners on a cold Modal start)
                     self.aot[t] = aoti.load(f"parakeet-encoder-{t}", module, (x, mask), ({0: batch}, {0: batch}),
-                                            num_runners=4)
+                                            num_runners=1)
             else:
                 if torch.version.hip:
                     import torch._inductor.config as inductor
@@ -229,13 +231,25 @@ def convert_decoder(asr_model, out_dir):
     return out
 
 
+# The decoder's precision, MIMI_HUB_DECODER_DTYPE: (prediction LSTM and its state, joint network). In fp32 its small
+# matmuls run on CUDA cores, not tensor cores (pyannote turns TF32 off for the whole process on every call); fp16 /
+# bf16 use tensor cores. Against onnx_asr's fp32 loop on the reference episode (548 segments): fp32 548 identical,
+# fp16 529, bf16 462 (fp16 rounding carried through the LSTM's state adds and drops words). "mixed": the joint (no
+# recurrence; the larger matmuls) in fp16, the LSTM in fp32. The log-probabilities are computed in fp32.
+DECODER_DTYPES = {"fp32": (torch.float32, torch.float32), "fp16": (torch.float16, torch.float16),
+                  "bf16": (torch.bfloat16, torch.bfloat16), "mixed": (torch.float32, torch.float16)}
+DECODER_DTYPE = __import__("os").environ.get("MIMI_HUB_DECODER_DTYPE", "fp32")
+
+
 class NativeTdtDecoder:
     """Stands in for onnx_asr's _AsrWithTransducerDecoding._decoding (greedy TDT, same rules: a token is emitted if
     the argmax isn't blank; the duration head's argmax moves t, else blank or [max_symbols] emissions move it 1)."""
 
-    def __init__(self, path, device, blank, vocab_size, durations=(0, 1, 2, 3, 4), max_symbols=10):
+    def __init__(self, path, device, blank, vocab_size, durations=(0, 1, 2, 3, 4), max_symbols=10, dtype=None):
         from safetensors.torch import load_file
         w = {k: v.to(device) for k, v in load_file(str(path)).items()}
+        self.precision = dtype or DECODER_DTYPE
+        self.dtype, self.jdtype = DECODER_DTYPES[self.precision]  # the LSTM and its state, the joint
         p = "decoder.prediction."
         self.H = w[p + "dec_rnn.lstm.weight_hh_l0"].shape[1]
         b0 = w[p + "dec_rnn.lstm.bias_ih_l0"] + w[p + "dec_rnn.lstm.bias_hh_l0"]
@@ -248,6 +262,10 @@ class NativeTdtDecoder:
         self.pred_w, self.pred_b = w["joint.pred.weight"].T.contiguous(), w["joint.pred.bias"]
         self.enc_w, self.enc_b = w["joint.enc.weight"].T.contiguous(), w["joint.enc.bias"]
         self.out_w, self.out_b = w["joint.joint_net.2.weight"].T.contiguous(), w["joint.joint_net.2.bias"]
+        for k in ("x0", "whh0", "wih1", "whh1", "b1"):  # (x0 computed in fp32 first)
+            setattr(self, k, getattr(self, k).to(self.dtype))
+        for k in ("pred_w", "pred_b", "enc_w", "enc_b", "out_w", "out_b"):
+            setattr(self, k, getattr(self, k).to(self.jdtype))
         self.device, self.blank, self.V, self.max_symbols = device, blank, vocab_size, max_symbols
         self.durations = torch.tensor(durations, device=device)
 
@@ -268,19 +286,19 @@ class NativeTdtDecoder:
         need_logprobs = kwargs.get("need_logprobs")
         with torch.inference_mode():
             if torch.is_tensor(encoder_out):  # straight from NativeEncoder.encode, still on the GPU
-                enc, encoder_out_lens = encoder_out.to(self.device, torch.float32), encoder_out_lens.cpu().numpy()
+                enc, encoder_out_lens = encoder_out.to(self.device, self.jdtype), encoder_out_lens.cpu().numpy()
             else:
-                enc = torch.from_numpy(np.ascontiguousarray(encoder_out)).to(self.device)  # (B, T, D)
+                enc = torch.from_numpy(np.ascontiguousarray(encoder_out)).to(self.device, self.jdtype)  # (B, T, D)
             B, T = enc.shape[:2]
             f_all = torch.addmm(self.enc_b, enc.reshape(B * T, -1), self.enc_w).reshape(B, T, -1)
             lens = torch.from_numpy(np.asarray(encoder_out_lens)).to(self.device)
             rows = torch.arange(B, device=self.device)
             t = torch.zeros(B, dtype=torch.long, device=self.device)
             emitted = torch.zeros_like(t)
-            h = torch.zeros(2, B, self.H, device=self.device)
+            h = torch.zeros(2, B, self.H, device=self.device, dtype=self.dtype)
             c = torch.zeros_like(h)
             g, h, c = self._lstm(torch.full((B,), self.blank, device=self.device), h, c)
-            pred = torch.addmm(self.pred_b, g, self.pred_w)
+            pred = torch.addmm(self.pred_b, g.to(self.jdtype), self.pred_w)
             active = t < lens
             toks, times, emits, lps = [], [], [], []
             step = 0
@@ -293,9 +311,9 @@ class NativeTdtDecoder:
                 times.append(t)
                 emits.append(emit)
                 if need_logprobs:
-                    lps.append(torch.log_softmax(logits[:, :self.V], -1).gather(1, tok[:, None])[:, 0])
+                    lps.append(torch.log_softmax(logits[:, :self.V].float(), -1).gather(1, tok[:, None])[:, 0])
                 g2, h2, c2 = self._lstm(tok, h, c)
-                pred = torch.where(emit[:, None], torch.addmm(self.pred_b, g2, self.pred_w), pred)
+                pred = torch.where(emit[:, None], torch.addmm(self.pred_b, g2.to(self.jdtype), self.pred_w), pred)
                 h = torch.where(emit[None, :, None], h2, h)
                 c = torch.where(emit[None, :, None], c2, c)
                 emitted = emitted + emit
@@ -314,6 +332,9 @@ class NativeTdtDecoder:
 
     GRAPH_STEPS = 16  # decoding steps per graph replay (one host check for "any segment still active" per replay)
     _capture_lock = __import__("threading").Lock()  # one capture at a time, across threads
+    # Each slot's graphs are captured on a stream of the slot's own, for a cuBLAS workspace no graph that may replay
+    # at the same time shares (two workers', Mimi's in hub/bulk.py: on a shared one they hung the GPU;
+    # hub/graph_stream.py).
 
     GRAPH_SIZES = (8, 16, 32, 64)  # batch sizes (segments; a batch pads to the next)
     GRAPH_FRAMES = 64  # lengths pad to a multiple of this many encoder frames
@@ -339,9 +360,12 @@ class NativeTdtDecoder:
         dev, H = self.device, self.H
         with torch.inference_mode():
             g = types.SimpleNamespace(
-                f=torch.zeros(B, T, self.enc_w.shape[1], device=dev), lens=torch.zeros(B, dtype=torch.long, device=dev),
-                h=torch.zeros(2, B, H, device=dev), c=torch.zeros(2, B, H, device=dev),
-                pred=torch.zeros(B, self.pred_w.shape[1], device=dev), t=torch.zeros(B, dtype=torch.long, device=dev),
+                f=torch.zeros(B, T, self.enc_w.shape[1], device=dev, dtype=self.jdtype),
+                lens=torch.zeros(B, dtype=torch.long, device=dev),
+                h=torch.zeros(2, B, H, device=dev, dtype=self.dtype),
+                c=torch.zeros(2, B, H, device=dev, dtype=self.dtype),
+                pred=torch.zeros(B, self.pred_w.shape[1], device=dev, dtype=self.jdtype),
+                t=torch.zeros(B, dtype=torch.long, device=dev),
                 emitted=torch.zeros(B, dtype=torch.long, device=dev),
                 active=torch.zeros(B, dtype=torch.bool, device=dev),
                 s=torch.zeros((), dtype=torch.long, device=dev), rows=torch.arange(B, device=dev))
@@ -362,7 +386,11 @@ class NativeTdtDecoder:
             g.s.zero_()
             g.graph = torch.cuda.CUDAGraph()
             # its own memory pool: graphs sharing one must replay in their capture order, batches don't
-            with torch.cuda.graph(g.graph, capture_error_mode="thread_local"):
+            from hub.graph_stream import capture_stream
+            streams = self.__dict__.setdefault("_capture_streams", {})  # one per slot (see above)
+            if key[0] not in streams:
+                streams[key[0]] = capture_stream()
+            with torch.cuda.graph(g.graph, stream=streams[key[0]], capture_error_mode="thread_local"):
                 steps()
         self._graphs = {**getattr(self, "_graphs", {}), key: g}
         return g
@@ -378,7 +406,7 @@ class NativeTdtDecoder:
         g.times.index_copy_(0, at, g.t[None])
         g.emits.index_copy_(0, at, emit[None])
         g2, h2, c2 = self._lstm(tok, g.h, g.c)
-        g.pred.copy_(torch.where(emit[:, None], torch.addmm(self.pred_b, g2, self.pred_w), g.pred))
+        g.pred.copy_(torch.where(emit[:, None], torch.addmm(self.pred_b, g2.to(self.jdtype), self.pred_w), g.pred))
         g.h.copy_(torch.where(emit[None, :, None], h2, g.h))
         g.c.copy_(torch.where(emit[None, :, None], c2, g.c))
         emitted = g.emitted + emit
@@ -397,18 +425,18 @@ class NativeTdtDecoder:
         T = -(-T0 // self.GRAPH_FRAMES) * self.GRAPH_FRAMES
         g = self._graph_state(slot, B, T)
         with torch.inference_mode():
-            enc = encoder_out.to(self.device, torch.float32)
+            enc = encoder_out.to(self.device, self.jdtype)
             g.f.zero_()
             g.f[:B0, :T0] = torch.addmm(self.enc_b, enc.reshape(B0 * T0, -1), self.enc_w).reshape(B0, T0, -1)
             g.lens.zero_()
             g.lens[:B0] = encoder_out_lens.to(self.device)
             for x in (g.t, g.emitted, g.s):
                 x.zero_()
-            zeros = torch.zeros(2, B, self.H, device=self.device)
+            zeros = torch.zeros(2, B, self.H, device=self.device, dtype=self.dtype)
             first, h, c = self._lstm(torch.full((B,), self.blank, device=self.device), zeros, zeros.clone())
             g.h.copy_(h)
             g.c.copy_(c)
-            g.pred.copy_(torch.addmm(self.pred_b, first, self.pred_w))
+            g.pred.copy_(torch.addmm(self.pred_b, first.to(self.jdtype), self.pred_w))
             g.active.copy_(g.t < g.lens)
             for _ in range(g.toks.shape[0] // self.GRAPH_STEPS):  # the most steps a batch can take
                 g.graph.replay()

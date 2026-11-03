@@ -157,10 +157,23 @@ def _coreml_frames(resnet, fbank_shape):
     return ct.models.MLModel(str(path), compute_units=ct.ComputeUnit.CPU_AND_NE)
 
 
-FRAMES_FN = None  # replaces resnet_frames in get_embeddings when set
+# (windows, 1, samples) -> the ResNet's frames: replaces get_embeddings' fbank + resnet_frames when set (hub/bulk.py's
+# batcher: fbank, many small kernels, once per merged batch instead of per thread; 11% of its GPU time had been fbank)
+WAVE_FRAMES_FN = None
 # WeSpeaker's compute_fbank runs torchaudio's kaldi.fbank under torch.vmap, whose state is shared: entered from many
 # threads at once (hub/bulk.py's diarization threads on free-threaded Python, no GIL to take turns) it deadlocked
 _FBANK_LOCK = threading.Lock()
+
+
+def _fbank(model, chunks):
+    # vmap inside: not safe to enter from several threads at once (label: scripts/bulk_bench.py --profile)
+    with _FBANK_LOCK, torch.profiler.record_function("stage:fbank"):
+        return model.compute_fbank(chunks)
+
+
+def wave_frames(model, chunks, mode):
+    """The ResNet's frames of (windows, 1, samples) audio: fbank + resnet_frames."""
+    return resnet_frames(model, _fbank(model, chunks), mode)
 
 
 def resnet_frames(model, fbank, mode):
@@ -208,20 +221,19 @@ def get_embeddings(self, file, binary_segmentations, exclude_overlap=False, hook
         for k, c0 in enumerate(range(0, num_chunks, BATCH_CHUNKS), 1):
             c1 = min(num_chunks, c0 + BATCH_CHUNKS)
             chunks = w[starts[c0:c1, None] + offsets][:, None]  # (batch, 1, samples)
-            with _FBANK_LOCK:  # vmap inside: not safe to enter from several threads at once
-                fbank = model.compute_fbank(chunks)
             mode = _frames_mode(device)
-            if mode == "coreml":  # fixed batch: the last one is zero-padded
+            if WAVE_FRAMES_FN is not None and mode != "coreml":  # e.g. hub/bulk.py's batcher, shared by episodes
+                frames = WAVE_FRAMES_FN(chunks)
+            elif mode == "coreml":  # fixed batch: the last one is zero-padded
+                fbank = _fbank(model, chunks)
                 shape = (BATCH_CHUNKS, *fbank.shape[1:])
                 if getattr(self, "_coreml", (None,))[0] != shape:
                     self._coreml = (shape, _coreml_frames(model.resnet, shape))
                 x = np.zeros(shape, dtype=np.float32)
                 x[:len(fbank)] = fbank.float().cpu().numpy()
                 frames = torch.from_numpy(self._coreml[1].predict({"fbank": x})["frames"][:len(fbank)]).to(device)
-            elif FRAMES_FN is not None:  # e.g. hub/bulk.py's batcher, shared by many episodes' pipelines
-                frames = FRAMES_FN(fbank)
             else:
-                frames = resnet_frames(model, fbank, mode)
+                frames = wave_frames(model, chunks, mode)
             frames = frames.float()
             emb = model.resnet.forward_embedding(frames, weights=weights[c0:c1].to(device))[1]
             out.append(emb.float().cpu().numpy())  # (batch, speakers, dimension)
