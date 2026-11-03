@@ -34,6 +34,14 @@ then keeps its source); records say "compressed": false.
                                                 "label"}]}, seconds); the record's "segments_state" says
                                                 pending | ready | failed | off. See hub/segments.py.
   POST /v1/episodes/{id}/segments               re-run that detection
+  GET  /v1/episodes/{id}.summary.json           an executive summary (MIMI_HUB_SUMMARIZER; off by default), made after
+                                                the ad detection by a request of its own (Haiku 5.5): {"model",
+                                                "summary": HTML of <h4> <p> <ul> <ol> <li> <strong> <em> only}; the
+                                                record's "summary_state" says pending | ready | failed (absent: none
+                                                asked for). .summary.html: the HTML (no scripts: CSP); .summary.txt:
+                                                its text.
+  POST /v1/episodes/{id}/summary                make (or remake) it, e.g. for an episode from before summaries
+  GET  /v1/features                             what this hub does: {"compress", "segments", "summaries", "remote"}
   GET  /v1/episodes                             all jobs, newest first
   POST /v1/warm                                 load the models now (in the background) and run each once, so the
                                                 next episode starts at full speed: {"models": cold | loading | ready
@@ -151,7 +159,7 @@ def rec_path(i):
 
 
 def record_paths():
-    return [p for p in DATA.glob("*.json") if not p.name.endswith(".segments.json")]
+    return [p for p in DATA.glob("*.json") if not p.name.endswith((".segments.json", ".summary.json"))]
 
 
 def load(i):
@@ -1373,8 +1381,10 @@ def _take_key(i, key):
 def queue_segments(i, cues=None):
     """Detect [i]'s ads / self-promotion from [cues] ([(start_s, end_s, speaker or None, text)]), else its VTT."""
     if segments.SEGMENTER.strip().lower() in ("", "off") or (load(i) or {}).get("no_segments"):
-        _client_keys.pop(i, None)
+        key = _client_keys.pop(i, None)
         update(i, segments_state="off")
+        if not (load(i) or {}).get("no_segments"):  # (no ad detection here: a summary of the whole transcript)
+            queue_summary(i, key, [], cues)
         return
     update(i, segments_state="pending")
     if _events is not None:  # in a worker process: the main process runs the (one) segment worker
@@ -1398,10 +1408,44 @@ def _working():
             _active[0] -= 1
 
 
+# ---------- executive summaries (MIMI_HUB_SUMMARIZER: a request of their own after the ads, at low priority) ----------
+
+sum_jobs: "queue.Queue" = queue.Queue()
+
+
+def queue_summary(i, key=None, found=None, cues=None):
+    """[i]'s summary, after its ads ([found]; else its .segments.json) are known. [key]: the client's OpenRouter key,
+    kept in memory until it's made (for the fallback after the claude login)."""
+    if not segments.SUMMARIES:
+        return
+    update(i, summary_state="pending", summary_error=None)
+    sum_jobs.put((i, key, found, cues))
+
+
+def summary_worker():
+    while True:
+        i, key, found, cues = sum_jobs.get()
+        with _working():
+            try:
+                cues = cues or segments.read_cues((DATA / f"{i}.vtt").read_text())
+                if found is None and (DATA / f"{i}.segments.json").exists():
+                    found = json.loads((DATA / f"{i}.segments.json").read_text())["segments"]
+                res = segments.summarize(cues, found, log=lambda m: print(f"[{i}] {m}", flush=True),
+                                         keys={"OPENROUTER_API_KEY": key} if key else None)
+                tmp = DATA / f"{i}.summary.json.tmp"
+                tmp.write_text(json.dumps(res, indent=1))
+                tmp.replace(DATA / f"{i}.summary.json")
+                update(i, summary_state="ready", summary_model=res["model"], summary_error=None)
+            except Exception as e:
+                traceback.print_exc()
+                update(i, summary_state="failed", summary_error=f"{type(e).__name__}: {e}"[:500])
+
+
 def busy():
     """Anything converting, detecting ads, warming up or waiting to, or a client that has just woken the server
     (GET /v1/hold)."""
-    return (_active[0] > 0 or not jobs.empty() or not seg_jobs.empty() or _warm["models"] == "loading"
+    return (_active[0] > 0 or not jobs.empty() or not seg_jobs.empty() or not sum_jobs.empty()
+            or _warm["models"] == "loading"
             or time.time() < _linger_until[0])
 
 
@@ -1419,6 +1463,7 @@ def _segment(i, cues):
         key = _client_keys.pop(i, None)
         res = segments.detect(cues, log=lambda m: print(f"[{i}] {m}", flush=True),
                               keys={"OPENROUTER_API_KEY": key} if key else None)
+        queue_summary(i, key, res["segments"], cues)
         tmp = DATA / f"{i}.segments.json.tmp"
         tmp.write_text(json.dumps(res, indent=1))
         tmp.replace(DATA / f"{i}.segments.json")
@@ -1759,6 +1804,8 @@ def start():
                 queue_source(r["id"])
         elif r["state"] == "ready" and r.get("segments_state") not in ("ready", "failed", "off"):
             queue_segments(r["id"])  # converted before segment detection existed, or interrupted
+        elif r["state"] == "ready" and r.get("summary_state") == "pending":
+            queue_summary(r["id"])  # interrupted (episodes from before summaries: POST /v1/episodes/{id}/summary)
     global _procs
     if PROCS > 1:
         _procs = _Procs(PROCS)
@@ -1773,6 +1820,7 @@ def start():
         for k in range(REMOTE_JOBS):
             threading.Thread(target=remote_worker, daemon=True, name=f"mimi-remote-{k}").start()
     threading.Thread(target=segment_worker, daemon=True, name="mimi-segments").start()
+    threading.Thread(target=summary_worker, daemon=True, name="mimi-summaries").start()
     for k in range(2):
         threading.Thread(target=source_worker, daemon=True, name=f"mimi-source-{k}").start()
     if PRELOAD:
@@ -1896,6 +1944,26 @@ async def hold(s: float = 60, authorization: str | None = Header(None)):
     return {"busy": busy()}
 
 
+@app.post("/v1/episodes/{i}/summary", status_code=202)
+def make_summary(i: str, authorization: str | None = Header(None), x_openrouter_key: str | None = Header(None)):
+    auth(authorization)
+    check_id(i)
+    if not segments.SUMMARIES:
+        raise HTTPException(409, "summaries are off on this hub (MIMI_HUB_SUMMARIZER)")
+    r = load(i)
+    if not r or r["state"] != "ready" or r.get("segments_state") == "pending":
+        raise HTTPException(409, "episode not ready")
+    queue_summary(i, (x_openrouter_key or "").strip() or None)
+    return load(i)
+
+
+@app.get("/v1/features")
+def features(authorization: str | None = Header(None)):
+    auth(authorization)
+    return {"compress": COMPRESS, "segments": segments.SEGMENTER.strip().lower() not in ("", "off"),
+            "summaries": segments.SUMMARIES, "remote": bool(REMOTE) and REMOTE_WHEN != "off"}
+
+
 @app.post("/v1/episodes/{i}/segments", status_code=202)
 def redo_segments(i: str, authorization: str | None = Header(None), x_openrouter_key: str | None = Header(None)):
     auth(authorization)
@@ -2002,6 +2070,19 @@ def episode(name: str, request: Request, authorization: str | None = Header(None
         if not p.exists():
             raise HTTPException(404, "no segments yet")
         return FileResponse(p, media_type="application/json")
+    if ext in ("summary.json", "summary.html", "summary.txt"):
+        p = DATA / f"{stem}.summary.json"
+        if not p.exists():
+            raise HTTPException(404, "no summary yet")
+        if ext == "summary.json":
+            return FileResponse(p, media_type="application/json")
+        html = segments.sanitize_html(json.loads(p.read_text())["summary"])  # (again: whatever wrote the file)
+        if ext == "summary.txt":
+            import html as h
+            text = h.unescape(re.sub(r"<(/(p|h4|li|ul|ol)|br)>", "\n", html))
+            return Response(re.sub(r"<[^>]+>", "", text).strip() + "\n", media_type="text/plain")
+        return Response(html, media_type="text/html", headers={
+            "Content-Security-Policy": "default-src 'none'; style-src 'unsafe-inline'", "X-Content-Type-Options": "nosniff"})
     if ext == "mimi":
         # a just-requested job writes its header within a few seconds; one on the remote GPU after its start (a
         # cold one on Modal: up to a minute or so)
