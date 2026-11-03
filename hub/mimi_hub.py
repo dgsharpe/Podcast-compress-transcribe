@@ -129,6 +129,7 @@ os.environ.setdefault("TORCHINDUCTOR_CACHE_DIR", str(Path(os.environ.get("MIMI_H
 DATA = Path(os.environ.get("MIMI_HUB_DATA", ROOT / "hub_data"))
 DEVICE = os.environ.get("MIMI_HUB_DEVICE", "auto")
 SOURCES = os.environ.get("MIMI_HUB_SOURCES", "fetch")  # fetch | keep (the originals of keep_source episodes)
+MAX_BYTES = int(float(os.environ.get("MIMI_HUB_DATA_MAX_GB", "0")) * 1e9)  # 0: no cap (trim_sources)
 COMPRESS = os.environ.get("MIMI_HUB_COMPRESS", "1") != "0"  # 0: no .mimi, transcripts + ad segments only
 TOKEN = os.environ.get("MIMI_HUB_TOKEN", "")
 ASR_MODEL = os.environ.get("MIMI_HUB_ASR", "nemo-parakeet-tdt-0.6b-v2")  # -v3 for multilingual
@@ -252,7 +253,60 @@ def get_source(i, r):
     ctype = fetch_source(u, i)
     path = DATA / f"{i}.src"
     update(i, source_ready=True, source_type=ctype, source_bytes=path.stat().st_size, source_url=u)
+    trim_sources()
     return str(path)
+
+
+# MIMI_HUB_DATA_MAX_GB caps the data directory. When a new original takes it over the cap, the kept originals (.src)
+# of finished episodes are deleted, the least recently served first. Their transcripts, ad marks and summaries stay,
+# and a client asking for the original again gets the publisher's file passed through if it's unchanged, as with
+# MIMI_HUB_SOURCES=fetch (proxy_source). Originals still needed for processing are never deleted, nor .mimi files.
+_trim_lock = threading.Lock()
+
+
+def _data_bytes():
+    total = 0
+    for f in DATA.rglob("*"):
+        try:
+            if f.is_file():
+                total += f.stat().st_size
+        except OSError:  # deleted meanwhile
+            pass
+    return total
+
+
+def trim_sources():
+    if not MAX_BYTES or not _trim_lock.acquire(blocking=False):  # already trimming
+        return
+    try:
+        used = _data_bytes()
+        if used <= MAX_BYTES:
+            return
+        kept = []
+        for f in record_paths():
+            try:
+                r = json.loads(f.read_text())
+            except (OSError, ValueError):
+                continue
+            if r.get("state") == "ready" and (DATA / f"{r['id']}.src").exists():
+                kept.append((r.get("source_served") or r.get("created") or 0, r["id"]))
+        n = freed = 0
+        for _, i in sorted(kept):
+            if used <= MAX_BYTES:
+                break
+            src = DATA / f"{i}.src"
+            with lock:  # still finished (not re-queued since)
+                r = load(i)
+                if not r or r.get("state") != "ready" or not src.exists():
+                    continue
+                size = src.stat().st_size
+                src.unlink()
+            used, freed, n = used - size, freed + size, n + 1
+        print(f"disk: data over the {MAX_BYTES / 1e9:g} GB cap; deleted {n} kept originals ({freed / 1e9:.1f} GB), "
+              f"now {used / 1e9:.1f} GB" + ("" if used <= MAX_BYTES else
+                                             ": still over (the rest are queued or being processed)"), flush=True)
+    finally:
+        _trim_lock.release()
 
 
 # A client about to download an episode (priority 0) waits a few minutes for its source, and processing may be hours
@@ -1835,6 +1889,7 @@ def start():
     backlog.start()
     for k in range(2):
         threading.Thread(target=source_worker, daemon=True, name=f"mimi-source-{k}").start()
+    threading.Thread(target=trim_sources, daemon=True, name="mimi-trim").start()  # e.g. the cap was just lowered
     if PRELOAD:
         threading.Thread(target=warm, daemon=True, name="mimi-warm").start()
 
@@ -2191,6 +2246,8 @@ def episode(name: str, request: Request, authorization: str | None = Header(None
         r = load(stem)
         p = DATA / f"{stem}.src"
         if r and p.exists():  # kept, or still being processed
+            if MAX_BYTES and time.time() - (r.get("source_served") or 0) > 3600:  # for trim_sources' order
+                update(stem, source_served=time.time())
             return FileResponse(p, media_type=r.get("source_type") or "audio/mpeg", filename=f"{stem}.src")
         if not r or not r.get("source_ready") or not r.get("source_url"):
             raise HTTPException(404, "no source")
