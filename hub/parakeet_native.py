@@ -134,8 +134,10 @@ class NativeEncoder:
                 for t in buckets:
                     x = torch.zeros(2, t, encoder.config.num_mel_bins, device=device)
                     mask = torch.ones(2, t, dtype=torch.bool, device=device)
+                    # one runner: encode() calls it under self._lock anyway (more only load more copies: ~7 s for
+                    # 4 buckets x 4 runners on a cold Modal start)
                     self.aot[t] = aoti.load(f"parakeet-encoder-{t}", module, (x, mask), ({0: batch}, {0: batch}),
-                                            num_runners=4)
+                                            num_runners=1)
             else:
                 if torch.version.hip:
                     import torch._inductor.config as inductor

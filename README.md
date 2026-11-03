@@ -71,13 +71,14 @@ In the app, Settings > Advanced > Mimi server: `https://<workspace>--mimi-hub-se
   redone when one arrives.
 
 - **First start:** converts the models and compiles their kernels, ~5-10 min, kept on the `mimi-hub-models` Volume.
-- **Cold start after that** (L40S, the default): the server answers in ~8 s and has its models loaded at ~45 s. A
-  43 min episode then plays after ~2 s and is fully transcribed after ~13 s (+ a few seconds for ads); requested
-  with no warm-up, the first audio comes after ~33 s (the app streams the original meanwhile). An H100 was no
-  faster.
-- **Cost:** Modal bills while the container is up: an L40S with 16 cores ~$3 an hour, about $0.10 per episode or
-  warm-up (it stays up 60 s after the last request; the app wakes it at most every 15 min). Modal's free plan
-  includes $30 a month. `MIMI_MODAL_GPU` / `MIMI_MODAL_CPU` at deploy pick others (see `hub/modal_app.py`).
+  The next few cold starts (~1 min each) also make Modal's memory snapshots of the loaded container.
+- **Cold start after that** (L40S, the default; an H100 when no L40S is free): restored from a snapshot, the server
+  has its models ready ~8 s after the request. A 43 min episode then plays after ~2-3 s and is fully transcribed
+  after ~13 s (+ ~10 s for ads). An H100 was no faster.
+- **Cost:** Modal bills while the container is up: an L40S with 16 cores ~$3 an hour. A launch, restored and
+  scaling down 20 s after its last request or job, ~$0.02 (~$0.05 when the app wakes it, which holds it 30 s for
+  you to pick an episode; at most every 15 min), plus ~$0.02 per hour of audio. Modal's free plan includes $30 a
+  month. `MIMI_MODAL_GPU` / `MIMI_MODAL_CPU` at deploy pick others (see `hub/modal_app.py`).
 - **Speaker labels:** pyannote's community-1 model is gated: accept its conditions on huggingface.co and put
   `HF_TOKEN` in the secret (or keep its snapshot in `data/modal_pyannote`); otherwise the CPU diarizer.
 - `scripts/remote_episode.py <url>/t/<token>` times a cold start and one episode against a running server.

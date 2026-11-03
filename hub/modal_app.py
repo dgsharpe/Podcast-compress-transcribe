@@ -5,9 +5,12 @@ OpenRouter key; no machine or subscription of your own.
     modal deploy hub/modal_app.py              -> https://<workspace>--mimi-hub-serve.<region>.modal.run
 
 then in the app, Settings > Advanced > Mimi server: that URL followed by /t/<the token> (the app sends no header;
-hub/mimi_hub.py takes the token from the path). The server refuses to start without one: its URL is public. The first start converts the models and compiles their kernels (several minutes, kept on
-the mimi-hub-models Volume); a cold start after that loads them, and the client's POST /v1/warm when it opens hides
-most of it. Episodes, transcripts and .mimi files live on the mimi-hub-data Volume. Without OPENROUTER_API_KEY in
+hub/mimi_hub.py takes the token from the path). The server refuses to start without one: its URL is public.
+
+The first start converts the models and compiles their kernels (several minutes, kept on the mimi-hub-models
+Volume). Then Modal snapshots the container with its models loaded (2-3 snapshots per GPU type, each made on a cold
+start of ~1 min), and a cold start restores one: models ready ~8 s after the request, against ~45 s loading them
+(2026-11-02, L40S; transcripts after a restore agreed with a fresh load's as well as two fresh loads did). Episodes, transcripts and .mimi files live on the mimi-hub-data Volume. Without OPENROUTER_API_KEY in
 the secret, ad detection uses the key the app sends with each conversion (X-OpenRouter-Key; held in memory only).
 
 Diarization (speaker labels): pyannote's community-1 on the GPU if it's available: it's gated, so accept its
@@ -15,11 +18,13 @@ conditions on huggingface.co and put HF_TOKEN in the secret (downloaded once to 
 in data/modal_pyannote (cp -rL of its HF cache snapshot), which is baked into the image. Otherwise the CPU
 diarizer (sherpa-onnx).
 
-Settings, from the environment at deploy time: MIMI_MODAL_GPU (L40S; any Modal GPU, e.g. H100), MIMI_MODAL_CPU
-(16 cores: latency mode's sharded VAD), MIMI_MODAL_MEMORY_GIB (32), MIMI_MODAL_IDLE_S (60: how long the container
-stays up after the last request or job), MIMI_MODAL_MAX_BUSY_S (7200: a hung job is let go after this),
+Settings, from the environment at deploy time: MIMI_MODAL_GPU (L40S,H100: Modal GPU types in order of preference,
+the next when one has no capacity), MIMI_MODAL_CPU
+(16 cores: latency mode's sharded VAD), MIMI_MODAL_MEMORY_GIB (32), MIMI_MODAL_IDLE_S (20: how long the container
+stays up after the last request or job; after a warm-up, 30 s more), MIMI_MODAL_MAX_BUSY_S (7200: a hung job is let go after this),
 MIMI_MODAL_APP (mimi-hub; another name deploys a second server with its own data Volume). Modal bills while the
-container is up: an L40S with 16 cores is ~$3 an hour, ~$0.10 per episode or warm-up. Hub settings (MIMI_HUB_*, see
+container is up: an L40S with 16 cores is ~$3 an hour; a launch restored from its snapshot ~$0.02-0.05, plus ~$0.02
+per hour of audio. Hub settings (MIMI_HUB_*, see
 hub/mimi_hub.py) can go in the secret.
 
 Background work outlives the request that started it: while the hub is busy, the container keeps a request to its
@@ -39,10 +44,14 @@ NA = "/root/na"  # the repository's layout inside the container (hub/, scripts/m
 APP = os.environ.get("MIMI_MODAL_APP", "mimi-hub")  # (another name: a second server, with its own data Volume)
 # an L40S matched the H100 (cold start, warm-up, then a 43 min episode: first audio 1.8 vs 2.7 s, ready 13 s) at half
 # the price; L4s were often unavailable (scripts/remote_episode.py, 2026-11-02)
-GPU = os.environ.get("MIMI_MODAL_GPU", "L40S")
+# a list, tried in order: one type alone can be out of capacity for many minutes (L40S, 2026-11-02: 9 min); each
+# type builds its own kernel packages on its first start (H100's are made, L40S's too)
+GPU = [g.strip() for g in os.environ.get("MIMI_MODAL_GPU", "L40S,H100").split(",") if g.strip()]
 CPU = float(os.environ.get("MIMI_MODAL_CPU", "16"))
 MEMORY_GIB = int(os.environ.get("MIMI_MODAL_MEMORY_GIB", "32"))
-IDLE_S = int(os.environ.get("MIMI_MODAL_IDLE_S", "60"))
+# short: an episode's work holds the container (GET /v1/hold), the app checks on ads every 15 s and its transcript
+# every 10 s until they're ready, and after POST /v1/warm the hub holds it MIMI_HUB_WARM_LINGER_S (30)
+IDLE_S = int(os.environ.get("MIMI_MODAL_IDLE_S", "20"))
 # a hung job mustn't keep a GPU billing: after this long busy without a break, the container is let go
 MAX_BUSY_S = int(os.environ.get("MIMI_MODAL_MAX_BUSY_S", "7200"))
 PYANNOTE_LOCAL = ROOT / "data/modal_pyannote"
@@ -164,23 +173,49 @@ def _keepalive(hub, base):
         time.sleep(2)
 
 
-@app.function(gpu=GPU, cpu=CPU, memory=MEMORY_GIB * 1024, volumes={"/data": data, "/models": models},
-              secrets=[modal.Secret.from_name("mimi-hub")], timeout=3600, scaledown_window=IDLE_S,
-              max_containers=1)
+# MIMI_MODAL_SNAPSHOT=gpu (default): the models are loaded onto the GPU once and the container's memory, GPU memory
+# included, is snapshotted (Modal's GPU memory snapshots, alpha); later cold starts restore it instead of loading.
+# off: every cold start loads them.
+SNAPSHOT = os.environ.get("MIMI_MODAL_SNAPSHOT", "gpu")
+
+
+@app.cls(gpu=GPU, cpu=CPU, memory=MEMORY_GIB * 1024, volumes={"/data": data, "/models": models},
+         secrets=[modal.Secret.from_name("mimi-hub")], timeout=3600, scaledown_window=IDLE_S, max_containers=1,
+         enable_memory_snapshot=SNAPSHOT == "gpu",
+         experimental_options={"enable_gpu_snapshot": True} if SNAPSHOT == "gpu" else None)
 @modal.concurrent(max_inputs=200)
-@modal.asgi_app()
-def serve():
-    import sys
-    _prepare()
-    sys.path.insert(0, NA)
-    from hub import mimi_hub
-    base = [None]  # the public URL, from the first request (a self-request reaches this container: there's one)
+class Hub:
+    @modal.enter(snap=True)
+    def load(self):
+        """Settings, the hub and (with a snapshot) its models: what a snapshot keeps."""
+        import sys
+        t0 = time.time()
+        _prepare()
+        t1 = time.time()
+        sys.path.insert(0, NA)
+        from hub import mimi_hub
+        print(f"startup: settings {t1 - t0:.1f} s, hub imported {time.time() - t1:.1f} s", flush=True)
+        if SNAPSHOT == "gpu":
+            mimi_hub.warm(vad_workers=False)  # (worker processes and threads: after the restore)
+        self.hub = mimi_hub
 
-    @mimi_hub.app.middleware("http")
-    async def own_url(request, call_next):
-        if base[0] is None and request.headers.get("host"):
-            base[0] = f"https://{request.headers['host']}"
-        return await call_next(request)
+    @modal.enter(snap=False)
+    def started(self):
+        """After a restore (or the first start): what a snapshot can't hold."""
+        t0 = time.time()
+        if SNAPSHOT == "gpu":
+            self.hub.models()  # the VAD worker processes
+        self.base = [None]  # the public URL, from the first request (a self-request reaches this container)
+        threading.Thread(target=_keepalive, args=(self.hub, self.base), daemon=True, name="modal-keepalive").start()
+        print(f"startup: after restore {time.time() - t0:.1f} s", flush=True)
 
-    threading.Thread(target=_keepalive, args=(mimi_hub, base), daemon=True, name="modal-keepalive").start()
-    return mimi_hub.app
+    @modal.asgi_app(label=f"{APP}-serve")
+    def serve(self):
+        base, app = self.base, self.hub.app
+
+        @app.middleware("http")
+        async def own_url(request, call_next):
+            if base[0] is None and request.headers.get("host"):
+                base[0] = f"https://{request.headers['host']}"
+            return await call_next(request)
+        return app

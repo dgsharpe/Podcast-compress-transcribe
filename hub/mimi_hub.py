@@ -38,7 +38,8 @@ then keeps its source); records say "compressed": false.
   POST /v1/warm                                 load the models now (in the background) and run each once, so the
                                                 next episode starts at full speed: {"models": cold | loading | ready
                                                 | failed}. A client calls it when it opens; MIMI_HUB_PRELOAD=1 does
-                                                it at startup (hub/modal_app.py, a server that scales to zero).
+                                                it at startup (hub/modal_app.py, a server that scales to zero),
+                                                which then stays up MIMI_HUB_WARM_LINGER_S (30) for the client.
   GET  /v1/hold?s=60                            returns once nothing is converting or waiting (or after s seconds):
                                                 a request in flight keeps a serverless container (Modal) alive
                                                 while the work it started in the background runs.
@@ -237,20 +238,35 @@ _models = {}
 _models_lock = threading.Lock()
 
 
-def models():
+def models(vad_workers=True):
+    """The loaded models; [vad_workers]: also start MIMI_HUB_VAD_SHARDS' processes (not before a memory snapshot,
+    hub/modal_app.py: started after its restore)."""
     with _models_lock:  # jobs starting together on a fresh hub must not see half-loaded models
         if not _models:
             _models.update(_load_models())
+        if vad_workers and _vad_pool is None:
+            t = time.time()
             _vad_workers()  # (MIMI_HUB_VAD_SHARDS) started with the models, not by the first episode
+            _stage("VAD worker processes", t)
     return _models
+
+
+def _stage(what, t0):
+    """A startup stage's time, logged (where a cold start goes)."""
+    print(f"startup: {what} {time.time() - t0:.1f} s", flush=True)
+    return time.time()
 
 
 _warm = {"models": "cold"}  # cold | loading | ready | failed (POST /v1/warm)
 _warm_lock = threading.Lock()
 PRELOAD = os.environ.get("MIMI_HUB_PRELOAD", "0") == "1"
+# after POST /v1/warm, busy() for this long: a server that scales to zero (hub/modal_app.py) stays up while the client
+# that woke it picks an episode, though it otherwise scales down seconds after its last job
+WARM_LINGER_S = float(os.environ.get("MIMI_HUB_WARM_LINGER_S", "30"))
+_linger_until = [0.0]
 
 
-def warm():
+def warm(vad_workers=True):
     """Load the models and run the lazily loaded and first-call-slow parts once (pyannote, ASR) on noise."""
     with _warm_lock:
         if _warm["models"] in ("loading", "ready"):
@@ -259,10 +275,13 @@ def warm():
     t0 = time.time()
     try:
         import numpy as np
-        m = models()
+        m = models(vad_workers)
+        t = _stage("models", t0)
         noise = (0.05 * np.random.default_rng(0).standard_normal(16000 * 30)).astype(np.float32)
         diarize(noise)
+        t = _stage("diarizer loaded and run", t)
         list(m["asr"].recognize(noise, sample_rate=16000))
+        _stage("ASR run", t)
         _warm["models"] = "ready"
         print(f"warm: models ready in {time.time() - t0:.1f} s", flush=True)
     except Exception:
@@ -272,6 +291,7 @@ def warm():
 
 def _load_models():
     m = {}
+    t = time.time()
     import onnx_asr
     import onnxruntime as ort
     import threadpoolctl
@@ -288,16 +308,19 @@ def _load_models():
     else:  # Apple silicon: the GPU through Metal
         dev = "mps" if torch.backends.mps.is_available() else "cpu"
     m["device"] = dev
+    t = _stage("imports", t)
     m["mimi"] = mimi_file.load_model(dev)
     if MIMI_FP16 and dev != "cpu":  # the encoder's conv / linear weights as autocast uses them: the same codes
         from hub.autocast_weights import half_weights
         half_weights(m["mimi"].encoder)
+    t = _stage("Mimi", t)
     # onnxruntime's default spin-waiting threads starve torch's: on a 15 min clip (scripts/bench_overlap.py)
     # ASR alone went 50 -> 31 s with spinning off, and encode || ASR 87 -> 39 s
     so = ort.SessionOptions()
     so.intra_op_num_threads = THREADS
     so.add_session_config_entry("session.intra_op.allow_spinning", "0")
     asr = onnx_asr.load_model(ASR_MODEL, sess_options=so)
+    t = _stage("onnx_asr Parakeet (ONNX sessions)", t)
     if dev != "cpu":
         try:
             # hub/parakeet_native.py. Checked against NVIDIA's NeMo encoder on real batches: native matches to
@@ -308,10 +331,12 @@ def _load_models():
                 model_dir = parakeet_native.convert(ASR_MODEL, MODELS_DIR / f"{ASR_MODEL}-hf")
                 # its linear / conv weights in fp16, as autocast uses them: identical output, 1.2 GB less GPU memory
                 encoder = parakeet_native.load(model_dir, dev, half=True)
+                t = _stage("Parakeet encoder (native, to the GPU)", t)
                 # compiled ahead of time (hub/aoti.py, fixed-length buckets): 1.7x on an H100; with the ResNet's
                 # (hub/pyannote_gpu.py) torch.compile took the server's pipeline 86 -> 99x. MIMI_HUB_COMPILE.
                 from hub import aoti
                 asr.asr._encoder = parakeet_native.NativeEncoder(encoder, compile=aoti.mode(dev))
+                t = _stage("Parakeet encoder AOT packages", t)
                 # identical tokens and timestamps to onnx_asr's loop (548/548 segments of a 43.8 min episode;
                 # scripts/parakeet_decoder_check.py). It frees the CPU: on Modal's L40S (CPU-bound) pipeline
                 # throughput went 214 -> 268x, on an M5 Mac 43 -> 47x; the server (ROCm) is GPU-bound and ~3%
@@ -321,6 +346,7 @@ def _load_models():
                     asr.asr._decoding = parakeet_native.NativeTdtDecoder(
                         path, dev, asr.asr._blank_idx, asr.asr._vocab_size,
                         max_symbols=asr.asr._max_tokens_per_step)
+                    t = _stage("Parakeet decoder", t)
             elif dev == "cuda":
                 asr.asr._encoder = TorchEncoder(parakeet_encoder())
         except Exception:
@@ -343,6 +369,7 @@ def _load_models():
     if ASR_BUCKET > 1:
         vad.recognize_batch = types.MethodType(_bucketed_recognize_batch, vad)
     m["asr"] = asr.with_vad(vad).with_timestamps()
+    _stage("VAD", t)
     return m
 
 
@@ -1287,8 +1314,10 @@ def _working():
 
 
 def busy():
-    """Anything converting, detecting ads, warming up or waiting to (GET /v1/hold)."""
-    return _active[0] > 0 or not jobs.empty() or not seg_jobs.empty() or _warm["models"] == "loading"
+    """Anything converting, detecting ads, warming up or waiting to, or a client that has just woken the server
+    (GET /v1/hold)."""
+    return (_active[0] > 0 or not jobs.empty() or not seg_jobs.empty() or _warm["models"] == "loading"
+            or time.time() < _linger_until[0])
 
 
 def segment_worker():
@@ -1593,6 +1622,7 @@ def upload(file: UploadFile = File(...), title: str = "", authorization: str | N
 @app.post("/v1/warm", status_code=202)
 def warm_up(authorization: str | None = Header(None)):
     auth(authorization)
+    _linger_until[0] = max(_linger_until[0], time.time() + WARM_LINGER_S)
     if _warm["models"] in ("cold", "failed"):
         threading.Thread(target=warm, daemon=True, name="mimi-warm").start()
     return {"models": "loading" if _warm["models"] == "cold" else _warm["models"]}
