@@ -37,6 +37,7 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(ROOT / "scripts"))
 os.environ.setdefault("HF_HUB_OFFLINE", "1")
+os.environ["MIMI_HUB_COMPRESS"] = "1"  # (it makes .mimi files: a hub setting of transcripts only doesn't apply)
 
 PIECE_FRAMES = int(os.environ.get("MIMI_BULK_PIECE_FRAMES", "3750"))  # 5 min of 12.5 Hz frames
 WARMUP_FRAMES = 250  # Mimi's transformer context (20 s)

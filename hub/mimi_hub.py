@@ -325,8 +325,9 @@ def _load_models():
         dev = "mps" if torch.backends.mps.is_available() else "cpu"
     m["device"] = dev
     t = _stage("imports", t)
-    m["mimi"] = mimi_file.load_model(dev)
-    if MIMI_FP16 and dev != "cpu":  # the encoder's conv / linear weights as autocast uses them: the same codes
+    if COMPRESS:  # (MIMI_HUB_COMPRESS=0: transcripts and ad marks only, no .mimi: no Mimi either)
+        m["mimi"] = mimi_file.load_model(dev)
+    if "mimi" in m and MIMI_FP16 and dev != "cpu":  # the encoder's conv / linear weights as autocast uses them: the same codes
         from hub.autocast_weights import half_weights
         half_weights(m["mimi"].encoder)
     t = _stage("Mimi", t)
@@ -1218,7 +1219,9 @@ def run(i):
                 update(i, source_ready=True, source_type=ctype, source_bytes=os.path.getsize(src), source_url=url)
         mark("probed")
         n_frames = int(dur * FPS) + 13  # + ~1 s: ffprobe estimates can run short; the tail is padded
-        compress = r.get("compressed", COMPRESS)
+        # (a job queued while the hub compressed, resumed after a restart with MIMI_HUB_COMPRESS=0: not compressed now,
+        # as there's no Mimi loaded)
+        compress = COMPRESS and r.get("compressed", True)
         # transcription and diarization start once the whole episode is decoded (ffmpeg is far ahead of the
         # encoder) and run alongside the encode
         tx = {"mark": mark}
@@ -1430,7 +1433,7 @@ _remote_jobs = [0]
 
 def _remote_ok(r):
     """Jobs the remote can do: an episode by URL, compressed (uploads and kept sources stay here)."""
-    return (r and not r.get("upload") and not r.get("keep_source") and r.get("compressed", COMPRESS)
+    return (r and not r.get("upload") and not r.get("keep_source") and COMPRESS and r.get("compressed", True)
             and not r.get("remote_failed"))
 
 
