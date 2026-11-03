@@ -8,6 +8,9 @@ already says segments_state "ready" are skipped, so it can be rerun.
         mimi-hub-data --segmenter openrouter:anthropic/claude-haiku-5.5
         (a Modal hub's library, read and written through Modal's API without starting a container)
 
+    --summaries [--summarizer ...]   executive summaries (hub/segments.py summarize: Haiku via the claude login
+        by default), for a backlog converted before the hub made them
+
 RESULTS: modal_backlog.py's results ([{"uuid", ...}]). Haiku 5.5 through the claude CLI found all 98 judged breaks of
 scripts/ads_truth.py's 24 episodes.
 
@@ -40,10 +43,10 @@ class Local:
     def read(self, name):
         return (self.data / name).read_bytes()
 
-    def update(self, i, seg_json, change):
-        tmp = self.data / f"{i}.segments.json.tmp"
-        tmp.write_text(seg_json)
-        tmp.replace(self.data / f"{i}.segments.json")
+    def update(self, i, body, change, name="segments.json"):
+        tmp = self.data / f"{i}.{name}.tmp"
+        tmp.write_text(body)
+        tmp.replace(self.data / f"{i}.{name}")
         fd = os.open(self.data / ".records.lock", os.O_RDWR | os.O_CREAT, 0o644)
         try:
             fcntl.flock(fd, fcntl.LOCK_EX)
@@ -70,17 +73,17 @@ class Volume:
     def read(self, name):
         return b"".join(self.vol.read_file(name))
 
-    def update(self, i, seg_json, change):
+    def update(self, i, body, change, name="segments.json"):
         rec = json.loads(self.read(f"{i}.json"))
         rec.update(change)
-        (self.out / f"{i}.segments.json").write_text(seg_json)
+        (self.out / f"{i}.{name}").write_text(body)
         (self.out / f"{i}.json").write_text(json.dumps(rec, indent=1))
-        self.done.append(i)
+        self.done.append((i, name))
 
     def flush(self):
         with self.vol.batch_upload(force=True) as b:
-            for i in self.done:
-                b.put_file(str(self.out / f"{i}.segments.json"), f"/{i}.segments.json")
+            for i, name in self.done:
+                b.put_file(str(self.out / f"{i}.{name}"), f"/{i}.{name}")
                 b.put_file(str(self.out / f"{i}.json"), f"/{i}.json")
 
 
@@ -94,6 +97,8 @@ def main():
     ap.add_argument("--threads", type=int, default=8)
     ap.add_argument("--recheck", type=float, default=0, help="redo episodes with a segment over this many seconds")
     ap.add_argument("--refine", default=None, help="re-read the breaks found with this model (e.g. claude:claude-opus-5-5)")
+    ap.add_argument("--summaries", action="store_true", help="executive summaries instead (hub/segments.py summarize)")
+    ap.add_argument("--summarizer", default=None, help="for --summaries (default: claude Haiku, then OpenRouter)")
     a = ap.parse_args()
     lib = Volume(a.volume) if a.volume else Local(a.data)
     ids = [r["uuid"] for f in a.results for r in json.loads(Path(f).read_text()) if not r.get("error")]
@@ -106,6 +111,28 @@ def main():
             with lock:
                 stats["failed"] += 1
             print(f"{i}: no record ({type(e).__name__})", flush=True)
+            return
+        if a.summaries:  # (as the hub's summary worker: the transcript without the ads found)
+            if rec.get("summary_state") == "ready":
+                with lock:
+                    stats["skipped"] += 1
+                return
+            try:
+                cues = segments.read_cues(lib.read(f"{i}.vtt").decode())
+                found = json.loads(lib.read(f"{i}.segments.json"))["segments"] if rec.get("segments_state") == "ready" else []
+                res = segments.summarize(cues, found, a.summarizer or segments.SUMMARIZER_DEFAULT, log=lambda m: None)
+            except Exception as e:  # noqa: BLE001
+                with lock:
+                    stats["failed"] += 1
+                print(f"{i}: {type(e).__name__}: {e}"[:300], flush=True)
+                return
+            lib.update(i, json.dumps(res, indent=1), dict(summary_state="ready", summary_model=res["model"],
+                                                          summary_error=None, updated=time.time()), "summary.json")
+            with lock:
+                stats["ads"] += 1  # (here: summaries made)
+                n = stats["ads"] + stats["skipped"] + stats["failed"]
+                if n % 50 == 0:
+                    print(f"{n}/{len(ids)} {json.dumps({k: round(v) for k, v in stats.items()})}", flush=True)
             return
         if a.refine:
             if rec.get("segments_state") != "ready" or ">" in (rec.get("segments_model") or ""):
