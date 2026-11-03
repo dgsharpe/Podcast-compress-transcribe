@@ -2,6 +2,8 @@
 
     python -m hub.bulk OUT_DIR AUDIO [AUDIO ...] [--prep N]      (files or URLs; ffmpeg on PATH)
     python -m hub.bulk OUT_DIR --manifest episodes.json          ([{"id", "url"}, ...]: outputs named <id>)
+        [--no-compress]   no .mimi (and no Mimi at all): transcripts only, for the ad marks and the original audio
+        [--keep-source]   also the original audio as <id>.src, exactly the bytes processed
 
 The hub (hub/mimi_hub.py) runs one episode per job, so its GPU batches are one episode's: Mimi one stream (batch
 1), Parakeet up to 16 segments, pyannote 32 windows; filling a fast GPU took many processes, each with its own copy
@@ -37,7 +39,9 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(ROOT / "scripts"))
 os.environ.setdefault("HF_HUB_OFFLINE", "1")
-os.environ["MIMI_HUB_COMPRESS"] = "1"  # (it makes .mimi files: a hub setting of transcripts only doesn't apply)
+# .mimi files or not (--no-compress / MIMI_BULK_COMPRESS=0: transcripts only, no Mimi loaded): its own setting, not
+# the hub's MIMI_HUB_COMPRESS, which it sets to match before loading the hub's models
+COMPRESS = os.environ.get("MIMI_BULK_COMPRESS", "1") != "0"
 
 PIECE_FRAMES = int(os.environ.get("MIMI_BULK_PIECE_FRAMES", "3750"))  # 5 min of 12.5 Hz frames
 WARMUP_FRAMES = 250  # Mimi's transformer context (20 s)
@@ -88,14 +92,52 @@ def _prep_init():
     _prep_models["features"] = NemoPreprocessorNumpy("nemo128")  # Parakeet TDT 0.6B v2's
 
 
-def _prep(src, spool):
+def _fetch(src, path):
+    """[src] (a URL) downloaded to [path], its tracking hops tried as the hub does: (url, MIME type, bytes)."""
+    import re
+    import shutil
+    import urllib.request
+    # as hub/mimi_hub.py's candidates() (not imported: a prep process doesn't load the hub): for a tracking-prefix
+    # chain (podtrac/pdst/pscrb/... URLs ending in .../real.host/path) the real host first, then the outer ones
+    parts = src.split("://", 1)[-1].split("/")
+    inner = ["https://" + "/".join(parts[k:]) for k in range(len(parts) - 2, 0, -1)
+             if "." in parts[k] and not re.search(r"\.(mp3|m4a|aac|ogg|opus|wav)$", parts[k], re.I)]
+    UA = {"User-Agent": "Mozilla/5.0 (mimi-hub)"}
+    err = None
+    for u in inner + [src]:
+        tmp = Path(f"{path}.part")
+        try:
+            with urllib.request.urlopen(urllib.request.Request(u, headers=UA), timeout=60) as r, open(tmp, "wb") as f:
+                ctype = r.headers.get_content_type()
+                shutil.copyfileobj(r, f, 1 << 20)
+            tmp.replace(path)
+            return u, ctype if ctype.startswith("audio/") else "audio/mpeg", Path(path).stat().st_size
+        except Exception as e:  # noqa: BLE001 - the next hop
+            tmp.unlink(missing_ok=True)
+            err = e
+    raise RuntimeError(f"cannot download {src}: {err}")
+
+
+def _prep(src, spool, keep=None):
     """Decode [src] to 24 kHz, resample to 16 kHz, find its speech (Silero VAD) and Parakeet's features of each
-    segment, as the hub does. The audio goes back in a spool file in [spool], the rest pickled."""
+    segment, as the hub does. The audio goes back in a spool file in [spool], the rest pickled. [keep]: download
+    the original there first and decode that (without a .mimi the app plays the original, and the hub serves or
+    re-fetches it, checking it's the same file by its size); None: ffmpeg reads [src] itself."""
     import uuid
     import numpy as np
     import soxr
     import mimi_file
     t = time.perf_counter()
+    source = {}
+    if keep is not None:
+        if str(src).startswith("http"):
+            url, ctype, n = _fetch(src, keep)
+        else:  # a local file
+            import shutil
+            shutil.copyfile(src, keep)
+            url, ctype, n = str(src), "audio/mpeg", Path(keep).stat().st_size
+        source = {"source_url": url, "source_type": ctype, "source_bytes": n, "source_path": str(keep)}
+        src = keep
     http = ["-user_agent", "Mozilla/5.0 (mimi-hub)"] if str(src).startswith("http") else []
     raw = subprocess.run(["ffmpeg", "-v", "error", *http, "-i", str(src), "-map", "0:a:0", "-ac", "1", "-ar",
                           str(mimi_file.SR), "-f", "f32le", "-"], capture_output=True, check=True).stdout
@@ -116,7 +158,7 @@ def _prep(src, spool):
         f, n = _prep_models["features"](w16[None, s:e].copy(), np.array([e - s]))
         feats.append((f[0], int(n[0])))  # (128, frames), valid frames
     return {"spool": str(path), "n24": n_frames * mimi_file.SPF, "n16": len(w16), "frames": n_frames,
-            "duration_s": len(w24) / mimi_file.SR, "segments": segments,
+            "duration_s": len(w24) / mimi_file.SR, "segments": segments, **source,
             "feats": feats, "prep_s": time.perf_counter() - t}
 
 
@@ -135,8 +177,8 @@ class Episode:
         self.out_dir, self.p = Path(out_dir), prep
         buf = np.load(prep["spool"], mmap_mode="r")
         self.w24, self.w16 = buf[:prep["n24"]], buf[prep["n24"]:]
-        self.codes = np.zeros((prep["frames"], 32), np.int64)
-        self.n_pieces = math.ceil(prep["frames"] / PIECE_FRAMES)
+        self.codes = np.zeros((prep["frames"], 32), np.int64) if COMPRESS else None
+        self.n_pieces = math.ceil(prep["frames"] / PIECE_FRAMES) if COMPRESS else 0
         self.asr = [None] * len(prep["segments"])
         self.lock = threading.Lock()
         self.left = {"mimi": self.n_pieces, "asr": len(self.asr)}
@@ -145,6 +187,8 @@ class Episode:
         self.turns, self.errors = [], []
         if not self.asr:
             self.done["asr"].set()
+        if not self.n_pieces:
+            self.done["mimi"].set()
 
     def fail(self, stage, e):
         """[stage] failed for this episode: it won't be written, and nothing waits on it."""
@@ -224,12 +268,13 @@ class Batcher:
 class Models:
     def __init__(self):
         import torch
+        os.environ["MIMI_HUB_COMPRESS"] = "1" if COMPRESS else "0"  # (the hub loads Mimi only when it compresses)
         from hub import mimi_hub, pyannote_gpu
         self.torch, self.hub = torch, mimi_hub
         m = mimi_hub.models()  # the hub's models and settings (fp16 weights, native encoder / decoder, ...)
         self.device = m["device"]
         assert self.device == "cuda", "hub/bulk.py needs a CUDA (or ROCm) GPU"
-        self.mimi, self.asr = m["mimi"], m["asr"].asr
+        self.mimi, self.asr = m.get("mimi"), m["asr"].asr
         from hub import parakeet_native
         if not isinstance(self.asr._decoding, parakeet_native.NativeTdtDecoder):
             # on ROCm the hub decodes on the CPU (it's GPU-bound); here that would all fall on this one process
@@ -253,7 +298,7 @@ class Models:
                 self.asr._decoding.capture_graphs(k, max_batch=ASR_BATCH)
         self.mimi_static = []
         # one set per Mimi worker, captured now, before any worker runs on the GPU
-        if MIMI_GRAPH == "1" or (MIMI_GRAPH == "auto" and not torch.version.hip):
+        if COMPRESS and (MIMI_GRAPH == "1" or (MIMI_GRAPH == "auto" and not torch.version.hip)):
             from hub.mimi_static import StaticMimiEncoder
             L = PIECE_FRAMES + WARMUP_FRAMES
             assert L % CHUNK_FRAMES == 0, f"a piece ({L} frames) must be whole chunks of {CHUNK_FRAMES} for the graph"
@@ -398,9 +443,10 @@ def write_outputs(models, ep):
         ep.cues = 0
         ep.release()
         raise RuntimeError("; ".join(ep.errors))
-    meta = dict(title=ep.name, source=str(ep.src), id=ep.name, encoder="transformers MimiModel (hub/bulk.py)",
-                duration_s=ep.p["duration_s"])
-    mimi_file.write(ep.out_dir / f"{ep.name}.mimi", ep.codes, 32, meta)
+    if COMPRESS:
+        meta = dict(title=ep.name, source=str(ep.src), id=ep.name, encoder="transformers MimiModel (hub/bulk.py)",
+                    duration_s=ep.p["duration_s"])
+        mimi_file.write(ep.out_dir / f"{ep.name}.mimi", ep.codes, 32, meta)
     cues = [c for seg in ep.asr for c in hub.cues(seg)]
     hub.write_vtt(ep.out_dir / f"{ep.name}.vtt", cues, ep.turns)
     ep.t["written"] = time.perf_counter()
@@ -408,9 +454,10 @@ def write_outputs(models, ep):
     ep.release()
 
 
-def convert(sources, out_dir, prep_workers=None, models=None, log=print, names=None):
+def convert(sources, out_dir, prep_workers=None, models=None, log=print, names=None, keep_source=False):
     """Convert [sources] into [out_dir]; returns per-episode stats. [models]: a loaded Models (reused); [names]:
-    {source: output name} (default: the source's file name without its extension)."""
+    {source: output name} (default: the source's file name without its extension); [keep_source]: also the
+    original as <name>.src (without COMPRESS it's downloaded first anyway, and dropped unless kept)."""
     names = names or {}
     import multiprocessing
     import tempfile
@@ -419,7 +466,7 @@ def convert(sources, out_dir, prep_workers=None, models=None, log=print, names=N
     spool = tempfile.mkdtemp(prefix="mimi-bulk-spool-", dir=os.environ.get("MIMI_BULK_SPOOL"))
     models = models or Models()
     pieces, segments = queue.Queue(), queue.Queue()
-    for k in range(MIMI_WORKERS):
+    for k in range(MIMI_WORKERS if COMPRESS else 0):
         threading.Thread(target=mimi_worker, args=(models, pieces, f"mimi{k}", k), daemon=True,
                          name=f"bulk-mimi{k}").start()
     for k in range(ASR_WORKERS):
@@ -435,7 +482,9 @@ def convert(sources, out_dir, prep_workers=None, models=None, log=print, names=N
                              mp_context=multiprocessing.get_context("spawn"), initializer=_prep_init) as pool:
         def submit(src):
             slots.acquire()  # bounds the episodes held in memory
-            return pool.submit(_prep, src, spool)
+            name = names.get(src) or Path(str(src)).stem
+            keep = (out_dir / f"{name}.src") if keep_source else (Path(spool) / f"{name}.src") if not COMPRESS else None
+            return pool.submit(_prep, src, spool, keep)
 
         futures = {}
         feeder = threading.Thread(target=lambda: [futures.setdefault(s, submit(s)) for s in sources], daemon=True)
@@ -468,7 +517,11 @@ def convert(sources, out_dir, prep_workers=None, models=None, log=print, names=N
             if w.exception():
                 stats.append({"name": ep.name, "error": "; ".join(ep.errors) or repr(w.exception())})
                 continue
+            if not keep_source and ep.p.get("source_path"):  # (downloaded for its size only)
+                Path(ep.p["source_path"]).unlink(missing_ok=True)
             stats.append({"name": ep.name, "duration_s": round(ep.p["duration_s"], 1), "errors": ep.errors,
+                          "compressed": COMPRESS, "source_kept": bool(keep_source and ep.p.get("source_path")),
+                          **{k: ep.p[k] for k in ("source_url", "source_type", "source_bytes") if k in ep.p},
                           "prep_s": round(ep.p["prep_s"], 2), "cues": ep.cues,
                           "speakers": len({t[2] for t in ep.turns}), "turns": ep.turns,
                           **{k: round(v - ep.t["start"], 2) for k, v in ep.t.items() if k != "start"}})
@@ -511,13 +564,17 @@ def main():
     ap.add_argument("sources", nargs="*")
     ap.add_argument("--prep", type=int, default=None, help="CPU worker processes (default: half the cores)")
     ap.add_argument("--manifest", default=None, help='JSON list of {"id", "url"}: outputs named <id>')
+    ap.add_argument("--no-compress", action="store_true", help="no .mimi: transcripts only (no Mimi loaded)")
+    ap.add_argument("--keep-source", action="store_true", help="also the original audio as <id>.src")
     a = ap.parse_args()
+    global COMPRESS
+    COMPRESS = COMPRESS and not a.no_compress
     sources, names = list(a.sources), {}
     if a.manifest:
         for e in json.loads(Path(a.manifest).read_text()):
             sources.append(e["url"])
             names[e["url"]] = e["id"]
-    summary, stats = convert(sources, a.out_dir, a.prep, names=names)
+    summary, stats = convert(sources, a.out_dir, a.prep, names=names, keep_source=a.keep_source)
     for s in stats:
         print("EPISODE " + json.dumps({k: v for k, v in s.items() if k != "turns"}), flush=True)
     print("BULK " + json.dumps(summary), flush=True)

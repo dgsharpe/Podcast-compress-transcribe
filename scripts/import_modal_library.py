@@ -1,5 +1,5 @@
 """Copy episodes from a Modal hub's library (hub/modal_app.py's data Volume) into this hub's, e.g. a backlog
-converted there by scripts/modal_backlog.py: each episode's .mimi, .vtt, .segments.json and record, read from the
+converted there by scripts/modal_backlog.py: each episode's .mimi, .src (if kept), .vtt, .segments.json and record, read from the
 Volume directly (no container started), the record written last. Episodes this hub already has are skipped.
 
     uvx --python 3.12 --with modal python scripts/import_modal_library.py RESULTS.json [...] [--data hub_data]
@@ -33,10 +33,10 @@ def main():
         if (data / f"{i}.json").exists():
             stats["skipped"] += 1
             return
-        if not {f"{i}.json", f"{i}.mimi", f"{i}.vtt"} <= have:
+        if not {f"{i}.json", f"{i}.vtt"} <= have:  # (a .mimi too, unless converted without compression)
             stats["missing"] += 1
             return
-        for ext in ("mimi", "vtt", "segments.json", "json"):  # the record last
+        for ext in ("mimi", "src", "vtt", "segments.json", "json"):  # the record last
             if f"{i}.{ext}" not in have:
                 continue
             body = b"".join(vol.read_file(f"{i}.{ext}"))

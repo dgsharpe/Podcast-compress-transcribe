@@ -3,6 +3,7 @@
 finds it ready. Ad detection is left to scripts/backlog_ads.py (run locally, with your own key).
 
     uvx --from modal modal run scripts/modal_backlog.py --manifest episodes.json [--limit 8] [--chunk 300]
+        [--no-compress] [--keep-source]   (hub/bulk.py's: transcripts only / also the originals, as <id>.src)
 
 The manifest: [{"uuid", "url", "title", "duration_s"}, ...] (e.g. from Pocket Casts' podcast/full API). Episodes the
 library already has are skipped, so a stopped run resumes. It runs in chunks (one hub/bulk.py process each, on the
@@ -41,8 +42,14 @@ ASR_MODEL = "nemo-parakeet-tdt-0.6b-v2"
 
 def _record(e, stats, mimi_bytes):
     now = time.time()
+    compressed = stats.get("compressed", True)
+    # as the hub's: without a .mimi the app plays the original, which the hub serves (kept) or re-fetches from
+    # source_url (checking source_bytes)
+    source = {k: stats[k] for k in ("source_url", "source_type", "source_bytes") if k in stats}
     return {"id": e["uuid"], "state": "ready", "priority": 1, "progress": 1.0, "error": None, "created": now,
-            "updated": now, "keep_source": False, "compressed": True, "url": e["url"], "audio_url": e["url"],
+            "updated": now, "keep_source": bool(stats.get("source_kept")) or not compressed, "compressed": compressed,
+            **({"source_ready": True, **source} if source else {}),
+            "url": e["url"], "audio_url": e["url"],
             "title": e["title"], "duration_s": stats["duration_s"], "mimi_bytes": mimi_bytes, "asr": ASR_MODEL,
             "device": "cuda (hub/bulk.py)", "speakers": stats.get("speakers"),
             "diarization": "pyannote/speaker-diarization-community-1" if stats.get("speakers") else None,
@@ -53,7 +60,7 @@ def _record(e, stats, mimi_bytes):
 
 @app.function(gpu="H100", cpu=32.0, memory=96 * 1024, timeout=4 * 3600,
               volumes={"/data": DATA, "/cache": CACHE})
-def backlog(manifest: list, chunk: int = 300) -> list:
+def backlog(manifest: list, chunk: int = 300, compress: bool = True, keep_source: bool = False) -> list:
     os.environ.update({"TORCHINDUCTOR_CACHE_DIR": "/tmp/inductor-cache", "MIMI_HUB_AOTI": "/cache/aoti",
                        "MIMI_HUB_AOTI_MARCH": "x86-64-v3"})
     sys.path.insert(0, NA)
@@ -62,7 +69,7 @@ def backlog(manifest: list, chunk: int = 300) -> list:
     parakeet_native.convert(ASR_MODEL, model_dir)
     parakeet_native.convert_decoder(ASR_MODEL, model_dir)
     data = Path("/data")
-    todo = [e for e in manifest if not (data / f"{e['uuid']}.mimi").exists()]
+    todo = [e for e in manifest if not (data / f"{e['uuid']}.json").exists()]
     print(f"BACKLOG {len(manifest)} episodes, {len(manifest) - len(todo)} already in the library, {len(todo)} to do",
           flush=True)
     env = {**os.environ, **FT_ENV,
@@ -74,8 +81,9 @@ def backlog(manifest: list, chunk: int = 300) -> list:
         by_id = {e["uuid"]: e for e in part}
         out.mkdir(exist_ok=True)
         (Path("/tmp") / "chunk.json").write_text(json.dumps([{"id": e["uuid"], "url": e["url"]} for e in part]))
+        flags = (["--no-compress"] if not compress else []) + (["--keep-source"] if keep_source else [])
         proc = subprocess.Popen([FT_PYTHON, "-m", "hub.bulk", str(out), "--manifest", "/tmp/chunk.json",
-                                 "--prep", "28"], cwd=NA, env=env, stdout=subprocess.PIPE,
+                                 "--prep", "28", *flags], cwd=NA, env=env, stdout=subprocess.PIPE,
                                 stderr=subprocess.PIPE, text=True, start_new_session=True)
         try:
             stdout, stderr = proc.communicate(timeout=CHUNK_TIMEOUT_S)
@@ -88,14 +96,16 @@ def backlog(manifest: list, chunk: int = 300) -> list:
         ok = 0
         for s in rows:
             e = by_id.get(s["name"])
-            m, v = out / f"{s['name']}.mimi", out / f"{s['name']}.vtt"
-            if e is None or s.get("error") or not (m.exists() and v.exists()):
+            m, v, src = out / f"{s['name']}.mimi", out / f"{s['name']}.vtt", out / f"{s['name']}.src"
+            if e is None or s.get("error") or not v.exists() or (compress and not m.exists()):
                 results.append({"uuid": s["name"], "error": (s.get("error") or "no output")[:300]})
                 continue
-            shutil.move(v, data / v.name)
-            shutil.move(m, data / m.name)  # (the record last: a record means the files are there)
+            for f in (v, m, src):  # (the record last: a record means the files are there)
+                if f.exists():
+                    shutil.move(f, data / f.name)
             rec = data / f"{s['name']}.json"
-            rec.write_text(json.dumps(_record(e, s, (data / m.name).stat().st_size), indent=1))
+            mimi_bytes = (data / m.name).stat().st_size if compress else None
+            rec.write_text(json.dumps(_record(e, s, mimi_bytes), indent=1))
             results.append({"uuid": s["name"], "duration_s": s["duration_s"], "speakers": s.get("speakers")})
             ok += 1
         DATA.commit()
@@ -108,10 +118,11 @@ def backlog(manifest: list, chunk: int = 300) -> list:
 
 
 @app.local_entrypoint()
-def main(manifest: str, limit: int = 0, chunk: int = 300, wait_min: float = 230):
+def main(manifest: str, limit: int = 0, chunk: int = 300, wait_min: float = 230, no_compress: bool = False,
+         keep_source: bool = False):
     eps = json.loads(Path(manifest).read_text())
     eps = eps[:limit] if limit else eps
-    call = backlog.spawn(eps, chunk)
+    call = backlog.spawn(eps, chunk, not no_compress, keep_source)
 
     def stop(*_):  # stopped from outside: don't leave the GPU running
         call.cancel()

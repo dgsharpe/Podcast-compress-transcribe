@@ -103,6 +103,7 @@ at home anything Modal fails. Check: submit three episodes at once (2 local work
 ```sh
 python scripts/podcast_manifest.py "revolutions mike duncan" > /tmp/revolutions.json   # --before / --after dates
 uvx --from modal modal run scripts/modal_backlog.py --manifest /tmp/revolutions.json   # H100, ~1,350x real time
+#   --no-compress: transcripts only (no .mimi; the app plays the original); --keep-source: the originals too (.src)
 uvx --python 3.12 --with modal python scripts/import_modal_library.py /tmp/revolutions.results.json   # into hub_data/
 python scripts/backlog_ads.py /tmp/revolutions.results.json                            # ads: claude's Haiku 5.5
 python scripts/backlog_ads.py /tmp/revolutions.results.json --refine claude:claude-opus-5-5   # Opus on the edges
