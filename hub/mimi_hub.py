@@ -175,6 +175,13 @@ def update(i, **kw):
 
 
 def enqueue(i, priority=1, keep_source=False, **fields):
+    r = _enqueue(i, priority, keep_source, **fields)
+    if priority == 0 and r.get("state") == "queued":
+        queue_source(i)
+    return r
+
+
+def _enqueue(i, priority=1, keep_source=False, **fields):
     """Queue job i (priority 0 = someone is streaming it, 1 = download / background). [keep_source]: keep the
     original audio as processed and serve it (.src)."""
     keep_source = keep_source or not COMPRESS  # without a .mimi, clients play the original
@@ -200,13 +207,71 @@ def enqueue(i, priority=1, keep_source=False, **fields):
 
 def fetch_source(url, i):
     """Download [url] to <id>.src; its MIME type."""
-    path, tmp = DATA / f"{i}.src", DATA / f"{i}.src.tmp"
+    # a temporary file of its own: two fetches of one episode (processing, and an early fetch) never share one
+    path, tmp = DATA / f"{i}.src", DATA / f"{i}.src.{os.getpid()}-{threading.get_ident()}.tmp"
     req = urllib.request.Request(url, headers=UA)
-    with urllib.request.urlopen(req, timeout=60) as resp, open(tmp, "wb") as f:
-        ctype = resp.headers.get_content_type()
-        shutil.copyfileobj(resp, f, 1 << 20)
-    tmp.replace(path)
+    try:
+        with urllib.request.urlopen(req, timeout=60) as resp, open(tmp, "wb") as f:
+            ctype = resp.headers.get_content_type()
+            shutil.copyfileobj(resp, f, 1 << 20)
+        tmp.replace(path)
+    finally:
+        tmp.unlink(missing_ok=True)
     return ctype if ctype.startswith("audio/") else "audio/mpeg"
+
+
+def get_source(i, r):
+    """Download job i's audio (the first readable of its candidate URLs) to <id>.src and mark it source_ready."""
+    err = None
+    for u in candidates(r["audio_url"]):  # skip tracking hops that are unreachable
+        try:
+            probe(u)
+            break
+        except Exception as e:
+            err = e
+    else:
+        raise RuntimeError(f"cannot read source: {err}")
+    ctype = fetch_source(u, i)
+    path = DATA / f"{i}.src"
+    update(i, source_ready=True, source_type=ctype, source_bytes=path.stat().st_size, source_url=u)
+    return str(path)
+
+
+# A client about to download an episode (priority 0) waits a few minutes for its source, and processing may be hours
+# away behind a backlog. So the source is fetched as soon as the episode is queued; processing later uses that copy,
+# and the client's download lines up with the transcript and ad segments whenever they arrive.
+src_jobs: "queue.Queue" = queue.Queue()
+
+
+def queue_source(i):
+    src_jobs.put(i)
+
+
+def source_worker():
+    while True:
+        i = src_jobs.get()
+        with lock:
+            r = load(i)
+            if (not r or r["state"] != "queued" or not r.get("keep_source") or not r.get("audio_url")
+                    or r.get("source_ready") or r.get("source_fetching")):
+                continue
+            save(dict(r, source_fetching=time.time()))
+        t0 = time.time()
+        try:
+            get_source(i, r)
+            print(f"source: fetched {i} ahead of processing in {time.time() - t0:.0f} s", flush=True)
+        except Exception as e:
+            print(f"source: fetching {i} ahead of processing failed ({e}); processing will try again", flush=True)
+        finally:
+            update(i, source_fetching=None)
+
+
+def await_source_fetch(i):
+    """Wait for an in-flight early fetch of job i's source (so processing doesn't fetch a second, different copy:
+    dynamically inserted ads differ between downloads). As long as it runs: its reads time out after 60 s, it clears
+    source_fetching when it ends, and start() clears it after a restart."""
+    while (r := load(i)) and r.get("source_fetching"):
+        time.sleep(1)
 
 
 # ---------- URL resolution ----------
@@ -1202,6 +1267,12 @@ def run(i):
         update(i, state="downloading", progress=0.0)
         if upload:
             src, dur = upload, probe(upload)
+        elif r.get("keep_source"):  # process exactly the bytes the client will get
+            await_source_fetch(i)
+            r = load(i)
+            kept = DATA / f"{i}.src"
+            src = str(kept) if r.get("source_ready") and kept.exists() else get_source(i, r)
+            dur = probe(src)
         else:
             src, dur, err = None, None, None
             for u in candidates(r["audio_url"]):  # skip tracking hops that are unreachable
@@ -1212,11 +1283,6 @@ def run(i):
                     err = e
             if src is None or dur is None:
                 raise RuntimeError(f"cannot read source: {err}")
-            if r.get("keep_source"):  # process exactly the bytes the client will get
-                ctype = fetch_source(src, i)
-                url, src = src, str(DATA / f"{i}.src")
-                dur = probe(src)
-                update(i, source_ready=True, source_type=ctype, source_bytes=os.path.getsize(src), source_url=url)
         mark("probed")
         n_frames = int(dur * FPS) + 13  # + ~1 s: ffprobe estimates can run short; the tail is padded
         # (a job queued while the hub compressed, resumed after a restart with MIMI_HUB_COMPRESS=0: not compressed now,
@@ -1687,8 +1753,10 @@ def start():
         r = json.loads(p.read_text())
         if r["state"] not in ("ready", "failed"):  # resume interrupted jobs from scratch
             (DATA / f"{r['id']}.mimi").unlink(missing_ok=True)  # partial, preallocated: never serve it
-            save(dict(r, state="queued", progress=0.0))
+            save(dict(r, state="queued", progress=0.0, source_fetching=None))
             jobs.put((r.get("priority", 1), next(_seq), r["id"]))
+            if r.get("priority", 1) == 0:
+                queue_source(r["id"])
         elif r["state"] == "ready" and r.get("segments_state") not in ("ready", "failed", "off"):
             queue_segments(r["id"])  # converted before segment detection existed, or interrupted
     global _procs
@@ -1705,6 +1773,8 @@ def start():
         for k in range(REMOTE_JOBS):
             threading.Thread(target=remote_worker, daemon=True, name=f"mimi-remote-{k}").start()
     threading.Thread(target=segment_worker, daemon=True, name="mimi-segments").start()
+    for k in range(2):
+        threading.Thread(target=source_worker, daemon=True, name=f"mimi-source-{k}").start()
     if PRELOAD:
         threading.Thread(target=warm, daemon=True, name="mimi-warm").start()
 
