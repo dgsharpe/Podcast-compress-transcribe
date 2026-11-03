@@ -100,6 +100,12 @@ at home anything Modal fails. Check: submit three episodes at once (2 local work
 
 ## Backlogs: a back catalog in bulk
 
+From the app: a podcast's settings > Convert episodes on Mimi server (all, the latest N, or a date range; it shows
+the episodes, hours, where it runs and a rough cost first, then progress), or Send to Mimi server on more than 10
+selected episodes. The hub (`hub/backlog.py`, `POST /v1/backlog`) puts under 3 h of new audio in its own queue, and
+anything bigger, where the `modal` CLI is set up on it, through the steps below by itself: one Modal bulk run, each
+chunk imported as it lands, ads and summaries with the hub's own logins. By hand:
+
 ```sh
 python scripts/podcast_manifest.py "revolutions mike duncan" > /tmp/revolutions.json   # --before / --after dates
 uvx --from modal modal run scripts/modal_backlog.py --manifest /tmp/revolutions.json   # H100, ~1,350x real time

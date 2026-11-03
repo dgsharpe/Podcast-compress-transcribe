@@ -41,7 +41,17 @@ then keeps its source); records say "compressed": false.
                                                 asked for). .summary.html: the HTML (no scripts: CSP); .summary.txt:
                                                 its text.
   POST /v1/episodes/{id}/summary                make (or remake) it, e.g. for an episode from before summaries
-  GET  /v1/features                             what this hub does: {"compress", "segments", "summaries", "remote"}
+  GET  /v1/features                             what this hub does: {"compress", "segments", "summaries", "remote",
+                                                "backlog", "backlog_modal"}
+  POST /v1/backlog {"podcast_uuid"[, "latest", "after", "before"] | "episodes": [{"id", "url", "title"[,
+                   "duration_s"]}][, "title", "preview": true]}
+                                                many episodes at once (hub/backlog.py): a podcast's (all, the latest
+                                                N, published in [after, before)) or a list; preview: what it would
+                                                do ({"episodes", "new", "hours", "mode": modal | local, "usd",
+                                                "minutes"}); else a job (202): {"id", "state", "converted", "ads",
+                                                "summaries", ...}. Big ones run in bulk on Modal.
+  GET  /v1/backlogs[?podcast_uuid=]             the jobs, newest first; GET /v1/backlogs/{id}: one
+  POST /v1/backlogs/{id}/cancel                 stop it (what's converted so far stays)
   GET  /v1/episodes                             all jobs, newest first
   POST /v1/warm                                 load the models now (in the background) and run each once, so the
                                                 next episode starts at full speed: {"models": cold | loading | ready
@@ -86,7 +96,7 @@ import urllib.request
 from pathlib import Path
 
 from fastapi import FastAPI, File, Header, HTTPException, Request, UploadFile
-from fastapi.responses import FileResponse, Response, StreamingResponse
+from fastapi.responses import FileResponse, JSONResponse, Response, StreamingResponse
 from pydantic import BaseModel
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -1821,6 +1831,8 @@ def start():
             threading.Thread(target=remote_worker, daemon=True, name=f"mimi-remote-{k}").start()
     threading.Thread(target=segment_worker, daemon=True, name="mimi-segments").start()
     threading.Thread(target=summary_worker, daemon=True, name="mimi-summaries").start()
+    from hub import backlog
+    backlog.start()
     for k in range(2):
         threading.Thread(target=source_worker, daemon=True, name=f"mimi-source-{k}").start()
     if PRELOAD:
@@ -1960,8 +1972,83 @@ def make_summary(i: str, authorization: str | None = Header(None), x_openrouter_
 @app.get("/v1/features")
 def features(authorization: str | None = Header(None)):
     auth(authorization)
+    from hub import backlog
     return {"compress": COMPRESS, "segments": segments.SEGMENTER.strip().lower() not in ("", "off"),
-            "summaries": segments.SUMMARIES, "remote": bool(REMOTE) and REMOTE_WHEN != "off"}
+            "summaries": segments.SUMMARIES, "remote": bool(REMOTE) and REMOTE_WHEN != "off",
+            "backlog": True, "backlog_modal": backlog.modal_available()}
+
+
+class BacklogEpisode(BaseModel):
+    id: str
+    url: str
+    title: str | None = None
+    duration_s: float | None = None
+
+
+class BacklogRequest(BaseModel):
+    podcast_uuid: str | None = None
+    episodes: list[BacklogEpisode] | None = None  # (instead of a podcast's)
+    latest: int | None = None
+    after: str | None = None  # YYYY-MM-DD, published on or after
+    before: str | None = None  # published before
+    title: str | None = None
+    preview: bool = False
+
+
+@app.post("/v1/backlog")
+def start_backlog(req: BacklogRequest, authorization: str | None = Header(None)):
+    from hub import backlog
+    auth(authorization)
+    if req.episodes:
+        for e in req.episodes:
+            check_id(e.id)
+        n = len(req.episodes)
+        eps, title = [e.model_dump() for e in req.episodes], req.title or f"{n} episode{'' if n == 1 else 's'}"
+    elif req.podcast_uuid:
+        if not re.fullmatch(r"[0-9a-f-]{36}", req.podcast_uuid):
+            raise HTTPException(400, "bad podcast_uuid")
+        try:
+            show, eps = backlog.podcast_episodes(req.podcast_uuid)
+        except Exception as e:
+            raise HTTPException(502, f"cannot list the podcast's episodes: {e}")
+        for d in (req.after, req.before):
+            if d and not re.fullmatch(r"\d{4}-\d{2}-\d{2}", d):
+                raise HTTPException(400, "dates are YYYY-MM-DD")
+        eps, title = backlog.select(eps, req.latest, req.after, req.before), req.title or show
+    else:
+        raise HTTPException(400, "give podcast_uuid or episodes")
+    if not eps:
+        raise HTTPException(422, "no episodes in that range")
+    if req.preview:
+        return {"title": title, **backlog.plan(eps)}
+    return JSONResponse(backlog.public(backlog.create(title, eps, req.podcast_uuid)), status_code=202)
+
+
+@app.get("/v1/backlogs")
+def list_backlogs(podcast_uuid: str | None = None, authorization: str | None = Header(None)):
+    from hub import backlog
+    auth(authorization)
+    return [backlog.public(j) for j in backlog.jobs(podcast_uuid)]
+
+
+@app.get("/v1/backlogs/{job_id}")
+def backlog_status(job_id: str, authorization: str | None = Header(None)):
+    from hub import backlog
+    auth(authorization)
+    job = backlog.get(job_id)
+    if not job:
+        raise HTTPException(404, "no such backlog")
+    return backlog.public(job)
+
+
+@app.post("/v1/backlogs/{job_id}/cancel")
+def cancel_backlog(job_id: str, authorization: str | None = Header(None)):
+    from hub import backlog
+    auth(authorization)
+    job = backlog.cancel(job_id)
+    if not job:
+        raise HTTPException(404, "no such backlog")
+    return backlog.public(job)
 
 
 @app.post("/v1/episodes/{i}/segments", status_code=202)
